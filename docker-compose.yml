@@ -1,0 +1,43 @@
+services:
+  kenosis-chat:
+    build: .
+    container_name: kenosis-chat
+    restart: unless-stopped
+    ports:
+      # Expose on the LAN. If ONLY cloudflared (below) should reach it, change to "127.0.0.1:8770:8770".
+      - "8770:8770"
+    volumes:
+      - ./data:/data            # SQLite db (chat.db) persists here
+    environment:
+      KENOSIS_DB: /data/chat.db
+
+      # REQUIRED in production: a long random string. Keeps everyone logged in across restarts.
+      # Generate one:  python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+      KENOSIS_SESSION_SECRET: "CHANGE-ME-to-a-long-random-string"
+
+      # Set to 1 when served over HTTPS (Cloudflare tunnel terminates TLS at the edge, so this is correct).
+      # Set to 0 ONLY for plain-http local testing, or the session cookie will not be sent and login will loop.
+      KENOSIS_COOKIE_SECURE: "1"
+
+      # Optional bootstrap admin (created on first start if missing). Otherwise the first page
+      # visit shows a one-time setup screen to create the admin account.
+      KENOSIS_ADMIN_USER: "david"
+      KENOSIS_ADMIN_PASS: "change-this-to-a-strong-password"
+
+      # KENOSIS_SESSION_DAYS: "30"
+
+  # ----------------------------------------------------------------------------
+  # Optional: run the Cloudflare tunnel in the same stack. Create the tunnel in the
+  # Cloudflare Zero Trust dashboard, point its public hostname at http://kenosis-chat:8770,
+  # and paste the tunnel token below. Then you can drop the "ports:" mapping above so the
+  # app is reachable ONLY through Cloudflare (plus Cloudflare Access for an extra auth layer).
+  # ----------------------------------------------------------------------------
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: kenosis-tunnel
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run
+  #   environment:
+  #     TUNNEL_TOKEN: "your-cloudflare-tunnel-token"
+  #   depends_on:
+  #     - kenosis-chat

@@ -1,0 +1,17 @@
+# local state - never commit (holds accounts, chats, API keys)
+chat.db
+chat.db-wal
+chat.db-shm
+data/
+
+# python
+__pycache__/
+*.pyc
+
+# editor / dropbox / runtime cruft
+*.bak
+*.tmp.*
+*.log
+.server_pid.txt
+.tmp_pid.txt
+_page.js

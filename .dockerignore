@@ -1,0 +1,12 @@
+chat.db
+chat.db-wal
+chat.db-shm
+data/
+chat_conversations/
+*.bak
+*.tmp.*
+__pycache__/
+*.pyc
+server_out.log
+server_err.log
+test_*.py
