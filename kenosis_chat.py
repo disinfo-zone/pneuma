@@ -381,12 +381,26 @@ def character_by_id(cid):
     return db().execute("SELECT * FROM characters WHERE id=?", (cid,)).fetchone()
 
 
+def _preset_models(raw):
+    """The model column holds a JSON list of model ids; '' / [] means it applies to all models.
+    Also tolerates a legacy bare-string single model from earlier builds."""
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            return [str(m) for m in v if m]
+    except (ValueError, TypeError):
+        pass
+    return [raw]
+
+
 def visible_presets(u):
     """Sampler-parameter presets the user can see: every site-wide one plus their own."""
     rows = db().execute(
         "SELECT * FROM presets WHERE scope='site' OR owner_id=? ORDER BY scope DESC, name COLLATE NOCASE", (u["id"],)
     ).fetchall()
-    return [{"id": r["id"], "name": r["name"], "model": r["model"] or "",
+    return [{"id": r["id"], "name": r["name"], "models": _preset_models(r["model"]),
              "scope": r["scope"], "owner_id": r["owner_id"],
              "params": json.loads(r["params"]) if r["params"] else {},
              "editable": (r["owner_id"] == u["id"]) or (u["role"] == "admin")} for r in rows]
@@ -1500,12 +1514,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pid = "p-" + uuid.uuid4().hex[:8]
             params = ps.get("params") or {}
             params = {k: v for k, v in params.items() if k in PARAM_KEYS and v not in (None, "")}
+            models = ps.get("models")
+            if models is None and ps.get("model"):
+                models = [ps["model"]]
+            models = [str(m) for m in (models or []) if m]
+            model_col = json.dumps(models) if models else ""
             with db():
                 db().execute("INSERT INTO presets(id,owner_id,scope,model,name,params,created)"
                              " VALUES(?,?,?,?,?,?,?)"
                              " ON CONFLICT(id) DO UPDATE SET scope=excluded.scope,model=excluded.model,"
                              "name=excluded.name,params=excluded.params",
-                             (pid, u["id"], scope, ps.get("model") or "", ps.get("name", "Untitled"),
+                             (pid, u["id"], scope, model_col, ps.get("name", "Untitled"),
                               json.dumps(params), _now()))
             return self._json(200, {"presets": visible_presets(u), "id": pid})
 
@@ -2521,7 +2540,10 @@ PAGE_HEAD = r"""<!doctype html>
   .preset-row select{flex:1;min-width:0;background:var(--bg);color:var(--text);border:none;border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:12px;cursor:pointer;}
   .preset-row select:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
   .dlg-chk{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted);margin:8px 0 2px;cursor:pointer;}
-  .dlg-chk input{width:auto;margin:0;}
+  .dlg-models{display:flex;flex-wrap:wrap;gap:7px;max-height:170px;overflow:auto;margin:2px 0 4px;padding:2px;}
+  .dlg-models label{display:inline-flex;gap:7px;align-items:center;background:var(--surface);border-radius:20px;padding:6px 12px;font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;}
+  .dlg-models label:hover{color:var(--text);}
+  .dlg-hint{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin:0 0 6px;line-height:1.5;}
   .hintbox{font-family:var(--mono);font-size:11px;color:var(--faint);background:var(--bg);border-radius:9px;padding:10px 12px;margin-top:12px;line-height:1.6;letter-spacing:.02em;}
   .ep-card,.row-card{background:var(--bg);border-radius:11px;padding:12px;margin-bottom:10px;}
   .ep-card .ep-top{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
@@ -2563,7 +2585,7 @@ PAGE_HEAD = r"""<!doctype html>
   .dlg{background:var(--panel);border-radius:14px;box-shadow:var(--shadow);width:400px;max-width:100%;padding:22px;}
   .dlg h4{margin:0 0 8px;font-family:var(--serif);font-weight:500;font-size:19px;}
   .dlg p{margin:0 0 14px;font-family:var(--mono);font-size:12px;color:var(--muted);line-height:1.5;}
-  .dlg input,.dlg select{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:11px;font-size:14px;font-family:var(--mono);margin-bottom:6px;}
+  .dlg input:not([type=checkbox]),.dlg select{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:11px;font-size:14px;font-family:var(--mono);margin-bottom:6px;}
   .dlg input:focus,.dlg select:focus{outline:2px solid var(--accent-weak);}
   .dlg .dlg-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;}
   #toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%) translateY(8px);background:var(--surface3);padding:10px 16px;border-radius:10px;font-family:var(--mono);font-size:12px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;z-index:99;box-shadow:var(--shadow);letter-spacing:.03em;}
@@ -3307,7 +3329,7 @@ function readParamsGrid(target){const out={};target.querySelectorAll("input[data
 function fillDefaults(target){const o={};CFG.param_specs.forEach(p=>{o[p.key]=p.default;});buildParamsGrid(target,o);}
 
 // ---------------- per-model sampler presets
-function presetsForModel(model){return (CFG.presets||[]).filter(p=>!p.model||p.model===model);}
+function presetsForModel(model){return (CFG.presets||[]).filter(p=>!p.models||!p.models.length||p.models.indexOf(model)>=0);}
 function presetById(id){return (CFG.presets||[]).find(p=>p.id===id)||null;}
 function paramsEqual(a,b){a=a||{};b=b||{};const ak=Object.keys(a),bk=Object.keys(b);if(ak.length!==bk.length)return false;return ak.every(k=>b[k]!=null&&String(a[k])===String(b[k]));}
 function buildPresetSelect(selectId){
@@ -3317,10 +3339,10 @@ function buildPresetSelect(selectId){
   const def=document.createElement("option");def.value="__default__";def.textContent="server default";sel.appendChild(def);
   const list=presetsForModel(model);
   const grp=(label,items)=>{if(!items.length)return;const og=document.createElement("optgroup");og.label=label;
-    items.forEach(p=>{const o=document.createElement("option");o.value="p:"+p.id;o.textContent=p.name+(p.model?"":" · all models");og.appendChild(o);});sel.appendChild(og);};
+    items.forEach(p=>{const o=document.createElement("option");o.value="p:"+p.id;o.textContent=p.name+((!p.models||!p.models.length)?" · all models":"");og.appendChild(o);});sel.appendChild(og);};
   grp("site presets",list.filter(p=>p.scope==="site"));
   grp("my presets",list.filter(p=>p.scope!=="site"));
-  if(selectId){applyPresetById(selectId);sel.value="p:"+selectId;}
+  if(selectId){applyPresetById(selectId);sel.value="p:"+selectId;if(sel.value!=="p:"+selectId)syncPresetSelect();}
   else syncPresetSelect();
   updatePresetDel();
 }
@@ -3355,16 +3377,22 @@ async function savePresetDialog(){
   const sel=$("#d_preset"),selected=sel.value.indexOf("p:")===0?presetById(sel.value.slice(2)):null;
   const editing=selected&&selected.editable?selected:null;
   const adminBox=isAdmin()?'<label class="dlg-chk"><input type="checkbox" id="ps_site"'+(editing&&editing.scope==="site"?" checked":"")+'> site-wide (shared with all users)</label>':'';
+  const allModels=(CFG.all_models||CFG.models||[]).slice();
+  if(model&&allModels.indexOf(model)<0)allModels.unshift(model);
+  const pre=new Set(editing?(editing.models||[]):(model?[model]:[]));
+  const pills=allModels.map(m=>'<label><input type="checkbox" value="'+esc(m)+'"'+(pre.has(m)?" checked":"")+'> '+esc(m)+'</label>').join("")||'<span class="dlg-hint">no models available</span>';
   const html='<h4>'+(editing?"update preset":"save preset")+'</h4>'
     +'<p>save the current sampler parameters as a reusable preset.</p>'
     +'<input id="ps_name" placeholder="preset name" value="'+esc(editing?editing.name:"")+'">'
-    +'<select id="ps_model"><option value="'+esc(model)+'">this model ('+esc(model)+')</option><option value=""'+(editing&&!editing.model?" selected":"")+'>all models</option></select>'
+    +'<div class="dlg-hint">applies to these models — leave all unchecked for every model</div>'
+    +'<div class="dlg-models" id="ps_models">'+pills+'</div>'
     +adminBox
     +(editing?'<label class="dlg-chk"><input type="checkbox" id="ps_new"> save as a new preset instead of updating</label>':'')
     +'<div class="dlg-btns"><button class="btn-ghost" data-x>cancel</button><button class="btn-primary" data-ok>save</button></div>';
   const data=await dialog(html,(d,done)=>{
     const nm=d.querySelector("#ps_name");nm.focus();nm.select();
-    const collect=()=>({name:nm.value.trim(),model:d.querySelector("#ps_model").value,
+    const collect=()=>({name:nm.value.trim(),
+      models:Array.from(d.querySelectorAll("#ps_models input:checked")).map(i=>i.value),
       site:!!(d.querySelector("#ps_site")&&d.querySelector("#ps_site").checked),
       asNew:!!(d.querySelector("#ps_new")&&d.querySelector("#ps_new").checked)});
     nm.onkeydown=e=>{if(e.key==="Enter")done(collect());};
@@ -3373,7 +3401,7 @@ async function savePresetDialog(){
   });
   if(!data)return;
   if(!data.name){toast("a preset name is required");return;}
-  const preset={name:data.name,model:data.model,params,scope:data.site?"site":"private"};
+  const preset={name:data.name,models:data.models,params,scope:data.site?"site":"private"};
   if(editing&&!data.asNew)preset.id=editing.id;
   try{const r=await api("POST","/api/presets",{preset});CFG.presets=r.presets;buildPresetSelect(r.id);toast("preset saved");}catch(e){toast(e.message);}
 }
