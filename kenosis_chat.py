@@ -517,6 +517,25 @@ def preset_by_id(pid):
     return db().execute("SELECT * FROM presets WHERE id=?", (pid,)).fetchone()
 
 
+def _norm_params(d):
+    return {k: str(d[k]) for k in (d or {}) if k in PARAM_KEYS and d[k] not in (None, "")}
+
+
+def matching_preset_name(u, model, conv_params):
+    """Name of the visible preset whose sampler values equal the conversation's overrides for this
+    model, or None. Mirrors the client-side preset match so a recorded message can name its preset."""
+    target = _norm_params(conv_params)
+    if not target:
+        return None
+    for p in visible_presets(u):
+        models = p.get("models") or []
+        if models and model not in models:
+            continue
+        if _norm_params(p["params"]) == target:
+            return p["name"]
+    return None
+
+
 # ---------------------------------------------------------------- folders / convos
 def list_folders(u):
     rows = db().execute("SELECT * FROM folders WHERE owner_id=? ORDER BY position, name COLLATE NOCASE", (u["id"],)).fetchall()
@@ -2084,7 +2103,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not gone[0]:
                 emit({"error": "the model returned an empty response — please try again"})
             return
-        persist(collected, reply, reasoning, build_meta(t0, t_first[0] or None, time.time(), usage, reply))
+        meta = build_meta(t0, t_first[0] or None, time.time(), usage, reply)
+        meta["params"] = {k: params[k] for k in params if k in PARAM_KEYS}   # what was actually sent
+        pn = matching_preset_name(u, model, convo.get("params") or {})
+        if pn:
+            meta["preset"] = pn
+        persist(collected, reply, reasoning, meta)
 
         # On the very first exchange, summarize a short title (replacing the first-line fallback).
         if lead and parent is None and not gone[0]:
@@ -2678,6 +2702,7 @@ PAGE_HEAD = r"""<!doctype html>
   .meta{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:11px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;letter-spacing:.02em;}
   .meta .pill{background:var(--surface);border-radius:9px;padding:2px 8px;}
   .meta .pill.k{color:var(--accent2);}
+  .meta .pill.k.has-tip{cursor:help;text-decoration:underline dotted var(--faint);text-underline-offset:2px;}
   .actions{margin-top:11px;display:flex;gap:3px;flex-wrap:wrap;opacity:0;transition:opacity .12s;}
   .msg:hover .actions{opacity:1;}
   .actions button{background:none;border:none;color:var(--faint);font-size:10px;letter-spacing:.07em;text-transform:uppercase;cursor:pointer;padding:4px 8px;border-radius:7px;}
@@ -2810,7 +2835,7 @@ PAGE_HEAD = r"""<!doctype html>
   .params-foot{display:flex;gap:8px;margin-top:16px;}
   .tip-ic{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--faint);color:var(--faint);font-size:9px;font-style:normal;font-weight:600;font-family:var(--mono);line-height:1;cursor:help;margin-left:6px;flex:0 0 auto;user-select:none;-webkit-user-select:none;}
   .tip-ic:hover,.tip-ic.on{border-color:var(--accent);color:var(--accent);}
-  .tipbox{position:fixed;z-index:120;max-width:262px;background:var(--surface3);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:11px;line-height:1.55;letter-spacing:.01em;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .12s ease;}
+  .tipbox{position:fixed;z-index:120;max-width:262px;white-space:pre-line;background:var(--surface3);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:11px;line-height:1.55;letter-spacing:.01em;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .12s ease;}
   .tipbox.show{opacity:1;}
   .preset-row{display:flex;gap:8px;align-items:center;margin-top:10px;}
   .preset-row select{flex:1;min-width:0;background:var(--bg);color:var(--text);border:none;border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:12px;cursor:pointer;}
@@ -3338,6 +3363,18 @@ function renderConvo(opts){
   log.appendChild(wrap);
   if(stick){autoScroll=true;scrollDown();}else log.scrollTop=prev;
 }
+function paramsTipText(m){
+  const x=m&&m.meta;if(!x)return "";
+  const p=x.params,lines=[];
+  if(x.preset)lines.push("preset · "+x.preset);
+  if(p&&typeof p==="object"){
+    const order=(CFG.param_specs||[]).map(s=>s.key),keys=[];
+    order.forEach(k=>{if(p[k]!=null)keys.push(k);});
+    Object.keys(p).forEach(k=>{if(keys.indexOf(k)<0&&p[k]!=null)keys.push(k);});
+    if(keys.length){if(!x.preset)lines.push("sampler parameters");keys.forEach(k=>lines.push(k+": "+p[k]));}
+  }
+  return lines.join("\n");
+}
 function metaLine(m){
   if(!m.meta)return "";const x=m.meta,b=[];
   if(m.model)b.push('<span class="pill k">'+esc(m.model)+'</span>');
@@ -3373,6 +3410,8 @@ function msgEl(m,i){
     '<button data-act="edit">edit</button><button data-act="del" class="danger">delete</button></div>';
   d.querySelectorAll(".actions button").forEach(b=>b.onclick=()=>handleAction(b.dataset.act,m,d,b));
   d.querySelectorAll("[data-sib]").forEach(b=>b.onclick=()=>{if(b.disabled)return;switchSibling(m.siblings[m.sib_index+(b.dataset.sib==="next"?1:-1)]);});
+  const mk=d.querySelector(".meta .pill.k"),mtip=paramsTipText(m);
+  if(mk&&mtip){mk.classList.add("has-tip");bindTip(mk,mtip);}
   d.addEventListener("click",e=>{   // tap a message (mobile) to reveal its actions
     if(e.target.closest("button,a,input,textarea,summary,.edit-wrap"))return;
     if(String(window.getSelection?window.getSelection():"").trim())return;
