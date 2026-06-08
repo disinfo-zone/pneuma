@@ -727,6 +727,42 @@ def call_model_nonstream(ep, model, system, messages, params, tools):
             d.get("usage"), ch.get("finish_reason"))
 
 
+def clean_title(s):
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = s.splitlines()[0].strip()                                                  # first line only
+    s = re.sub(r'^(?:title|chat title|conversation title)\s*[:\-–]\s*', '', s, flags=re.I)
+    s = s.strip().strip('"\'`“”‘’').strip()                     # unwrap quotes
+    s = re.sub(r'[\s.]+$', '', s)                                                   # trailing space/period
+    words = s.split()
+    if len(words) > 8:
+        s = " ".join(words[:8])
+    return s[:64].strip()
+
+
+def generate_title(ep, model, user_text, assistant_text=""):
+    """Ask the model for a short Title-Case name. Clean (no persona) prompt + low temp so even a
+    creative model returns just a title. Returns "" on any failure (caller falls back to first line)."""
+    sys = ("You write a concise 3-5 word title in Title Case for a conversation. "
+           "Reply with ONLY the title — no quotes, no punctuation, no preamble or explanation.")
+    prompt = "Write a title for a conversation that begins with this message:\n\n" + (user_text or "")[:1500]
+    if assistant_text:
+        prompt += "\n\nThe reply began:\n" + assistant_text[:400]
+    body = {"model": model, "stream": False, "max_tokens": 24, "temperature": 0.3,
+            "messages": [{"role": "system", "content": sys}, {"role": "user", "content": prompt}]}
+    headers = {"Content-Type": "application/json"}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    try:
+        r = requests.post(ep["url"], headers=headers, json=body, timeout=25)
+        r.raise_for_status()
+        out = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return clean_title(out)
+    except Exception:
+        return ""
+
+
 def _models_data(ep):
     headers = {}
     if ep.get("key"):
@@ -1721,6 +1757,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 emit({"error": "the model returned an empty response — please try again"})
             return
         persist(collected, reply, reasoning, build_meta(t0, t_first[0] or None, time.time(), usage, reply))
+
+        # On the very first exchange, summarize a short title (replacing the first-line fallback).
+        if lead and parent is None and not gone[0]:
+            utext = lead[1]
+            atts = lead[2] or []
+            if atts and atts[0].get("text"):
+                utext = (utext + "\n\n" + atts[0]["text"]) if utext else atts[0]["text"]
+            title = generate_title(ep, model, utext, reply)
+            if title:
+                with db():
+                    db().execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
+
         if not gone[0]:
             try:
                 emit({"done": True, "convo": get_convo(cid, u)})
@@ -2629,6 +2677,7 @@ const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll
 let CFG=null, current=null, busy=false, activeController=null;
 let convoCache=[], folderCache=[], collapsed={}, selMode=false, selected=new Set();
 let pendingAtt=[];
+let autoScroll=true;   // pinned to bottom; user scrolling up unpins until they return to the bottom
 
 const ICON_SEND='<svg class="ico" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 const ICON_STOP='<svg class="ico" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></svg>';
@@ -2877,11 +2926,11 @@ function syncBar(){
   $("#submeta").textContent=bits.join("  ·  ");
   updateCtx();
 }
-function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clientHeight<100;}
+function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clientHeight<40;}
 function scrollDown(){const l=$("#log");l.scrollTop=l.scrollHeight;}
 function renderConvo(opts){
   opts=opts||{};
-  const stick=(opts.stick!==undefined)?opts.stick:nearBottom();
+  const stick=(opts.stick!==undefined)?opts.stick:autoScroll;
   const prev=$("#log").scrollTop;syncBar();
   const log=$("#log");log.innerHTML="";
   const wrap=document.createElement("div");wrap.className="wrap";
@@ -2889,7 +2938,7 @@ function renderConvo(opts){
   if(!msgs.length)wrap.innerHTML='<div class="empty"><div class="glyph">&rsaquo;_</div><h2>new conversation</h2><p>say something to begin</p></div>';
   else current.messages.forEach((m,i)=>{if(m.role==="user"||m.role==="assistant"||m.role==="tool")wrap.appendChild(msgEl(m,i));});
   log.appendChild(wrap);
-  if(stick)scrollDown();else log.scrollTop=prev;
+  if(stick){autoScroll=true;scrollDown();}else log.scrollTop=prev;
 }
 function metaLine(m){
   if(!m.meta)return "";const x=m.meta,b=[];
@@ -3029,7 +3078,7 @@ function toolResultEl(m){
 // ---------------- streaming
 function liveWrap(){let w=$("#log").querySelector(".wrap");if(!w){const l=$("#log");l.innerHTML="";w=document.createElement("div");w.className="wrap";l.appendChild(w);}const e=w.querySelector(".empty");if(e)e.remove();return w;}
 function appendLive(){
-  const stick=nearBottom();const wrap=liveWrap();
+  const stick=autoScroll;const wrap=liveWrap();
   const ch=charById(current.character_id);const role=ch?ch.name:"oracle";
   const d=document.createElement("div");d.className="msg assistant";
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div><div class="reason-live" style="display:none"></div><div class="bubble raw"><span class="typing"><i></i><i></i><i></i></span></div>';
@@ -3039,7 +3088,7 @@ function appendLive(){
 function appendThinking(){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking";
   d.innerHTML='<div class="thinkrow"><span class="thinkdot"></span><span class="tlabel">thinking…</span></div>';
-  w.appendChild(d);if(nearBottom())scrollDown();return d;
+  w.appendChild(d);if(autoScroll)scrollDown();return d;
 }
 function appendToolStep(tc){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant";
@@ -3073,16 +3122,16 @@ async function streamRequest(path,body,handlers,signal){
 async function streamTurn(body){
   let live=null,think=null,racc="";const toolEls={};
   function clearThink(){if(think){think.remove();think=null;}}
-  function showThink(t){if(live)return;if(!think)think=appendThinking();const l=think.querySelector(".tlabel");if(l&&t)l.textContent=t;if(nearBottom())scrollDown();}
+  function showThink(t){if(live)return;if(!think)think=appendThinking();const l=think.querySelector(".tlabel");if(l&&t)l.textContent=t;if(autoScroll)scrollDown();}
   function bubble(){clearThink();if(!live)live=appendLive();return live;}
   showThink("thinking…");
   const c=new AbortController();activeController=c;
   try{const res=await streamRequest("/api/conversations/"+current.id+"/stream",body,{
       onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
-      onDelta:d=>{const st=nearBottom();const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;}L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(st)scrollDown();},
-      onReason:r=>{const st=nearBottom();const L=bubble();racc+=r;L.reason.style.display="block";L.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(st)scrollDown();},
-      onToolCall:tc=>{const st=nearBottom();clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(st)scrollDown();},
-      onToolResult:tr=>{const st=nearBottom();updateToolStep(toolEls[tr.id],tr);if(st)scrollDown();}
+      onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;}L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();},
+      onReason:r=>{const L=bubble();racc+=r;L.reason.style.display="block";L.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(autoScroll)scrollDown();},
+      onToolCall:tc=>{clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(autoScroll)scrollDown();},
+      onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();}
     },c.signal);
     clearThink();
     return {res,stopped:false};
@@ -3163,7 +3212,7 @@ async function openDrawer(){
     CFG.settings.endpoints.forEach(e=>{const o=document.createElement("option");o.value=e.id;o.textContent=e.name;es.appendChild(o);});es.value=current.endpoint_id||"";
     es.onchange=()=>refreshDrawerModels(es.value,$("#d_model").value);}
   await refreshDrawerModels(current.endpoint_id,current.model);
-  cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}};
+  cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}else{$("#d_system").value="";}};
   $("#d_system").value=current.system||"";
   $("#d_tools").checked=!!current.tools;
   buildParamsGrid($("#d_params"),current.params||{});
@@ -3359,6 +3408,17 @@ $("#cw_reset").onclick=()=>applyCW(840);
 const inp=$("#input");
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();if(!busy)send();}});
 inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,230)+"px";updateCtx();});
+inp.addEventListener("paste",e=>{   // a big paste (essay, transcript, …) becomes an attachment instead of flooding the box
+  const cd=e.clipboardData||window.clipboardData;if(!cd)return;
+  const text=cd.getData("text");if(!text)return;
+  if(text.length>=1600||(text.match(/\n/g)||[]).length>=18){
+    e.preventDefault();
+    const n=pendingAtt.filter(a=>a.pasted).length+1;
+    pendingAtt.push({name:"pasted text"+(n>1?" "+n:""),text:text,tokens_est:estTok(text),pasted:true});
+    renderPending();
+    toast("Pasted text added as an attachment (~"+fmtK(estTok(text))+" tok)");
+  }
+});
 $("#attachbtn").onclick=()=>$("#fileinput").click();
 $("#fileinput").onchange=e=>{const fs=[...e.target.files];e.target.value="";if(fs.length)uploadFiles(fs);};
 (function(){const comp=$("#composer");if(!comp)return;
@@ -3369,8 +3429,15 @@ $("#fileinput").onchange=e=>{const fs=[...e.target.files];e.target.value="";if(f
   comp.addEventListener("drop",e=>{e.preventDefault();dc=0;comp.classList.remove("dragover");const fs=[...((e.dataTransfer&&e.dataTransfer.files)||[])];if(fs.length)uploadFiles(fs);});
 })();
 (function(){const log=$("#log"),btn=$("#scrolltop");if(!log||!btn)return;
-  log.addEventListener("scroll",()=>btn.classList.toggle("show",log.scrollTop>500));
-  btn.onclick=()=>log.scrollTo({top:0,behavior:"smooth"});
+  let last=0;
+  log.addEventListener("scroll",()=>{
+    const st=log.scrollTop;
+    if(st<last-2)autoScroll=false;       // user scrolled up -> stop following
+    if(nearBottom())autoScroll=true;      // back at the bottom -> resume following
+    last=st;
+    btn.classList.toggle("show",st>500);
+  });
+  btn.onclick=()=>{autoScroll=false;log.scrollTo({top:0,behavior:"smooth"});};
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){if($("#dlgwrap").classList.contains("show"))return;closeAll();}});
 
