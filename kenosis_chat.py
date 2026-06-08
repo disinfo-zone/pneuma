@@ -81,14 +81,22 @@ FALLBACK_MODELS = ["kenosistron", "kenosistron-q6", "kenosistron-mtp", "kenosis-
 # (what the per-param reset clears toward). top_k / repetition_penalty are file-only on the
 # server (need a model reload) so they are intentionally NOT exposed here.
 PARAM_SPECS = [
-    {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05},
-    {"key": "top_p",             "label": "top_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.98},
-    {"key": "min_p",             "label": "min_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.04},
-    {"key": "xtc_probability",   "label": "xtc_probability",   "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.6},
-    {"key": "xtc_threshold",     "label": "xtc_threshold",     "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.1},
-    {"key": "frequency_penalty", "label": "frequency_penalty", "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.7},
-    {"key": "presence_penalty",  "label": "presence_penalty",  "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.6},
-    {"key": "max_tokens",        "label": "max_tokens",        "type": "int",   "min": 1,             "step": 1,    "ph": str(MAX_TOKENS),  "slider": False, "default": MAX_TOKENS},
+    {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
+     "tip": "Controls randomness. Higher values (e.g. 1.2) make replies more creative and varied; lower values (e.g. 0.7) make them more focused and predictable. 0 always picks the single most likely token."},
+    {"key": "top_p",             "label": "top_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.98,
+     "tip": "Nucleus sampling. Each step only considers the most likely tokens whose probabilities add up to this fraction. 0.9 keeps the top 90% of the probability mass; lower means more focused. Often tuned instead of temperature."},
+    {"key": "min_p",             "label": "min_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.04,
+     "tip": "Minimum probability, relative to the top token. Discards any token less likely than this fraction of the most likely one. Higher values (e.g. 0.1) prune unlikely tokens harder, keeping output coherent even at high temperature."},
+    {"key": "xtc_probability",   "label": "xtc_probability",   "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.6,
+     "tip": "Exclude Top Choices: the chance, per token, of applying XTC. XTC removes the most-probable tokens (those above the threshold), always leaving at least one, to reduce clichés and boost creativity. 0 disables it."},
+    {"key": "xtc_threshold",     "label": "xtc_threshold",     "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.1,
+     "tip": "Exclude Top Choices threshold. Only tokens more probable than this are eligible to be dropped by XTC. Lower thresholds let XTC act on more tokens; a typical value is around 0.1."},
+    {"key": "frequency_penalty", "label": "frequency_penalty", "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.7,
+     "tip": "Penalizes tokens by how many times they have already appeared, discouraging the model from repeating the same words. Positive values reduce repetition; negative values encourage it. Range -2 to 2."},
+    {"key": "presence_penalty",  "label": "presence_penalty",  "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.6,
+     "tip": "Penalizes tokens that have appeared at all (regardless of how often), nudging the model toward new words and topics. Positive values increase novelty; negative values keep it on-topic. Range -2 to 2."},
+    {"key": "max_tokens",        "label": "max_tokens",        "type": "int",   "min": 1,             "step": 1,    "ph": str(MAX_TOKENS),  "slider": False, "default": MAX_TOKENS,
+     "tip": "The maximum number of tokens to generate in a single reply. Generation stops here even if the model is not finished. This does not limit the length of the prompt or conversation."},
 ]
 PARAM_KEYS = [p["key"] for p in PARAM_SPECS]
 
@@ -165,6 +173,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS characters(
                 id TEXT PRIMARY KEY, owner_id INTEGER, scope TEXT NOT NULL DEFAULT 'private',
                 name TEXT, avatar TEXT, model TEXT, params TEXT, system TEXT, created TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS presets(
+                id TEXT PRIMARY KEY, owner_id INTEGER, scope TEXT NOT NULL DEFAULT 'private',
+                model TEXT, name TEXT, params TEXT, created TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_convo_owner ON conversations(owner_id, updated);
             CREATE INDEX IF NOT EXISTS idx_msg_convo ON messages(convo_id, position);
             CREATE INDEX IF NOT EXISTS idx_folder_owner ON folders(owner_id);
@@ -368,6 +379,21 @@ def visible_characters(u):
 
 def character_by_id(cid):
     return db().execute("SELECT * FROM characters WHERE id=?", (cid,)).fetchone()
+
+
+def visible_presets(u):
+    """Sampler-parameter presets the user can see: every site-wide one plus their own."""
+    rows = db().execute(
+        "SELECT * FROM presets WHERE scope='site' OR owner_id=? ORDER BY scope DESC, name COLLATE NOCASE", (u["id"],)
+    ).fetchall()
+    return [{"id": r["id"], "name": r["name"], "model": r["model"] or "",
+             "scope": r["scope"], "owner_id": r["owner_id"],
+             "params": json.loads(r["params"]) if r["params"] else {},
+             "editable": (r["owner_id"] == u["id"]) or (u["role"] == "admin")} for r in rows]
+
+
+def preset_by_id(pid):
+    return db().execute("SELECT * FROM presets WHERE id=?", (pid,)).fetchone()
 
 
 # ---------------------------------------------------------------- folders / convos
@@ -1166,6 +1192,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = {
             "me": user_public(u), "is_admin": u["role"] == "admin",
             "models": shown_models(u), "characters": visible_characters(u),
+            "presets": visible_presets(u),
             "folders": list_folders(u), "param_specs": PARAM_SPECS, "max_tokens": MAX_TOKENS,
             "default_system": get_setting("default_system", DEFAULT_SYSTEM),
             "default_params": get_setting("default_params", {}),
@@ -1222,6 +1249,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"models": shown_models(u)})
         if path == "/api/characters":
             return self._json(200, {"characters": visible_characters(u)})
+        if path == "/api/presets":
+            return self._json(200, {"presets": visible_presets(u)})
         if path == "/api/folders":
             return self._json(200, {"folders": list_folders(u)})
         if path == "/api/conversations":
@@ -1295,6 +1324,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with db():
                 db().execute("DELETE FROM characters WHERE id=?", (m.group(1),))
             return self._json(200, {"characters": visible_characters(u)})
+
+        m = re.fullmatch(r"/api/presets/([^/]+)", path)
+        if m:
+            ps = preset_by_id(m.group(1))
+            if ps is None:
+                return self._json(404, {"error": "not found"})
+            if not (ps["owner_id"] == u["id"] or u["role"] == "admin"):
+                return self._json(403, {"error": "not yours"})
+            with db():
+                db().execute("DELETE FROM presets WHERE id=?", (m.group(1),))
+            return self._json(200, {"presets": visible_presets(u)})
 
         m = re.fullmatch(r"/api/users/([0-9]+)", path)
         if m:
@@ -1443,6 +1483,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              (cid, u["id"], scope, ch.get("name", "Untitled"), ch.get("avatar", ""), ch.get("model"),
                               json.dumps(ch["params"]) if ch.get("params") else None, ch.get("system", ""), _now()))
             return self._json(200, {"characters": visible_characters(u), "id": cid})
+
+        if path == "/api/presets":
+            ps = payload.get("preset") or payload
+            scope = ps.get("scope", "private")
+            if scope == "site" and u["role"] != "admin":
+                return self._json(403, {"error": "only admins can create site-wide presets"})
+            pid = ps.get("id")
+            if pid:
+                existing = preset_by_id(pid)
+                if existing is None:
+                    pid = None
+                elif not (existing["owner_id"] == u["id"] or u["role"] == "admin"):
+                    return self._json(403, {"error": "not yours to edit"})
+            if not pid:
+                pid = "p-" + uuid.uuid4().hex[:8]
+            params = ps.get("params") or {}
+            params = {k: v for k, v in params.items() if k in PARAM_KEYS and v not in (None, "")}
+            with db():
+                db().execute("INSERT INTO presets(id,owner_id,scope,model,name,params,created)"
+                             " VALUES(?,?,?,?,?,?,?)"
+                             " ON CONFLICT(id) DO UPDATE SET scope=excluded.scope,model=excluded.model,"
+                             "name=excluded.name,params=excluded.params",
+                             (pid, u["id"], scope, ps.get("model") or "", ps.get("name", "Untitled"),
+                              json.dumps(params), _now()))
+            return self._json(200, {"presets": visible_presets(u), "id": pid})
 
         if path == "/api/settings":
             if u["role"] != "admin":
@@ -2398,6 +2463,11 @@ PAGE_HEAD = r"""<!doctype html>
   @keyframes thinkpulse{0%,100%{opacity:.3;transform:scale(.82);}50%{opacity:1;transform:scale(1.12);}}
   .chk .chkrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);cursor:pointer;}
   .chk .chkrow code{font-family:var(--mono);font-size:11px;background:var(--code-bg);padding:.05em .3em;border-radius:4px;}
+  input[type=checkbox]{appearance:none;-webkit-appearance:none;flex:0 0 auto;width:17px;height:17px;margin:0;border:1px solid var(--line);border-radius:5px;background:var(--bg);cursor:pointer;display:inline-grid;place-content:center;transition:background .12s,border-color .12s;}
+  input[type=checkbox]:hover{border-color:var(--accent);}
+  input[type=checkbox]:focus-visible{outline:2px solid var(--accent-weak);outline-offset:1px;}
+  input[type=checkbox]:checked{background:var(--accent);border-color:var(--accent);}
+  input[type=checkbox]:checked::after{content:"";width:9px;height:9px;clip-path:polygon(14% 46%,0 60%,40% 100%,100% 18%,86% 6%,38% 70%);background:#1a1206;}
 
   /* ---------------- overlays */
   #backdrop{position:fixed;inset:0;background:rgba(8,6,3,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:50;}
@@ -2432,7 +2502,7 @@ PAGE_HEAD = r"""<!doctype html>
   .fld input:focus,.fld textarea:focus,.fld select:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
   .params-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;margin-top:10px;}
   .pg{min-width:0;}
-  .pg .pgname{font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.06em;margin-bottom:6px;}
+  .pg .pgname{display:flex;align-items:center;font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.06em;margin-bottom:6px;}
   .pg .pgrow{display:flex;align-items:center;gap:8px;}
   .pg .pgrow input[type=number]{flex:1;min-width:0;background:var(--bg);color:var(--text);border:none;border-radius:7px;padding:8px 10px;font-family:var(--mono);font-size:12.5px;}
   .pg .pgrow input:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
@@ -2443,6 +2513,15 @@ PAGE_HEAD = r"""<!doctype html>
   .pg.off input[type=range]{filter:grayscale(.7);opacity:.5;}
   .params-section{margin-top:22px;}
   .params-foot{display:flex;gap:8px;margin-top:16px;}
+  .tip-ic{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;border:1px solid var(--faint);color:var(--faint);font-size:9px;font-style:normal;font-weight:600;font-family:var(--mono);line-height:1;cursor:help;margin-left:6px;flex:0 0 auto;user-select:none;-webkit-user-select:none;}
+  .tip-ic:hover,.tip-ic.on{border-color:var(--accent);color:var(--accent);}
+  .tipbox{position:fixed;z-index:120;max-width:262px;background:var(--surface3);color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:11px;line-height:1.55;letter-spacing:.01em;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:opacity .12s ease;}
+  .tipbox.show{opacity:1;}
+  .preset-row{display:flex;gap:8px;align-items:center;margin-top:10px;}
+  .preset-row select{flex:1;min-width:0;background:var(--bg);color:var(--text);border:none;border-radius:8px;padding:9px 10px;font-family:var(--mono);font-size:12px;cursor:pointer;}
+  .preset-row select:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
+  .dlg-chk{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted);margin:8px 0 2px;cursor:pointer;}
+  .dlg-chk input{width:auto;margin:0;}
   .hintbox{font-family:var(--mono);font-size:11px;color:var(--faint);background:var(--bg);border-radius:9px;padding:10px 12px;margin-top:12px;line-height:1.6;letter-spacing:.02em;}
   .ep-card,.row-card{background:var(--bg);border-radius:11px;padding:12px;margin-bottom:10px;}
   .ep-card .ep-top{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
@@ -2576,7 +2655,9 @@ PAGE_BODY = r"""
       <label class="fld"><span class="lab">model</span><select id="d_model"></select></label>
       <label class="fld"><span class="lab">system prompt <span class="sub">this chat only</span></span><textarea id="d_system" placeholder="empty = no system prompt"></textarea></label>
       <label class="fld chk"><span class="lab">web tools <span class="sub">let the model fetch web pages</span></span><label class="chkrow"><input type="checkbox" id="d_tools"> <span>enable <code>fetch_url</code> for this chat</span></label></label>
-      <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span><div class="params-grid" id="d_params"></div>
+      <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span>
+        <div class="preset-row"><select id="d_preset"></select><button class="mini" id="d_preset_save">save preset</button><button class="mini" id="d_preset_del" style="display:none">delete</button></div>
+        <div class="params-grid" id="d_params"></div>
         <div class="params-foot"><button class="mini" id="d_defaults">server defaults</button><button class="mini" id="d_clear">clear all</button></div>
       </div>
     </div>
@@ -2668,6 +2749,7 @@ PAGE_BODY = r"""
   <div id="menu"></div>
   <div id="dlgwrap"><div class="dlg" id="dlg"></div></div>
   <div id="backdrop"></div>
+  <div id="tipbox" class="tipbox" role="tooltip"></div>
   <div id="toast"></div>
 """
 
@@ -2786,7 +2868,7 @@ function charById(id){return (CFG.characters||[]).find(c=>c.id===id)||null;}
 function endpointName(id){return ((CFG.settings&&CFG.settings.endpoints)||[]).find(e=>e.id===id);}
 async function loadConfig(){
   CFG=await api("GET","/api/config");
-  CFG.characters=CFG.characters||[];CFG.models=CFG.models||[];folderCache=CFG.folders||[];
+  CFG.characters=CFG.characters||[];CFG.models=CFG.models||[];CFG.presets=CFG.presets||[];folderCache=CFG.folders||[];
   $("#who-nm").textContent=CFG.me.username;$("#who-rl").textContent=CFG.me.role;
   if(!isAdmin())$("#d_endpoint_wrap").style.display="none";
   buildTabs();
@@ -3182,25 +3264,125 @@ function editTitle(){
 }
 
 // ---------------- param grid (sliders + defaults)
+// ---------------- tooltips (hover on desktop, tap on mobile)
+let _tipEl=null;
+function positionTip(box,el){
+  box.classList.add("show");
+  const r=el.getBoundingClientRect(),bw=box.offsetWidth,bh=box.offsetHeight,pad=8;
+  let left=r.left+r.width/2-bw/2;left=Math.max(pad,Math.min(left,innerWidth-bw-pad));
+  let top=r.top-bh-8;if(top<pad)top=r.bottom+8;
+  box.style.left=left+"px";box.style.top=top+"px";
+}
+function showTip(el){const box=$("#tipbox"),t=el.dataset.tip||"";if(!t)return;box.textContent=t;_tipEl=el;el.classList.add("on");positionTip(box,el);}
+function hideTip(){const box=$("#tipbox");box.classList.remove("show");if(_tipEl){_tipEl.classList.remove("on");_tipEl=null;}}
+function bindTip(el,text){
+  el.dataset.tip=text||"";
+  el.addEventListener("pointerenter",e=>{if(e.pointerType==="mouse")showTip(el);});
+  el.addEventListener("pointerleave",e=>{if(e.pointerType==="mouse")hideTip();});
+  el.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();if(_tipEl===el)hideTip();else{hideTip();showTip(el);}});
+}
+document.addEventListener("click",e=>{if(_tipEl&&e.target!==_tipEl)hideTip();});
+document.addEventListener("scroll",()=>{if(_tipEl)hideTip();},true);
+window.addEventListener("resize",()=>{if(_tipEl)hideTip();});
+
 function buildParamsGrid(target,values){
   target.innerHTML="";
   CFG.param_specs.forEach(p=>{
     const v=(values&&values[p.key]!=null)?values[p.key]:"";
     const pg=document.createElement("div");pg.className="pg"+(v===""?" off":"");
-    let html='<div class="pgname">'+esc(p.label)+'</div>';
+    let html='<div class="pgname">'+esc(p.label)+(p.tip?'<span class="tip-ic" aria-label="'+esc(p.label)+' help">i</span>':'')+'</div>';
     html+='<div class="pgrow"><input type="number" data-k="'+p.key+'" step="'+(p.step||"any")+'"'+(p.min!=null?' min="'+p.min+'"':'')+(p.max!=null?' max="'+p.max+'"':'')+' placeholder="'+esc(p.ph||"")+'" value="'+(v===""?"":v)+'"><button class="reset" title="reset to server default">reset</button></div>';
     if(p.slider)html+='<input type="range" data-r="'+p.key+'" min="'+p.min+'" max="'+p.max+'" step="'+(p.step||"any")+'" value="'+(v===""?p.default:v)+'">';
     pg.innerHTML=html;
-    const num=pg.querySelector("[data-k]"),rng=pg.querySelector("[data-r]"),rst=pg.querySelector(".reset");
+    const num=pg.querySelector("[data-k]"),rng=pg.querySelector("[data-r]"),rst=pg.querySelector(".reset"),tic=pg.querySelector(".tip-ic");
+    if(tic&&p.tip)bindTip(tic,p.tip);
     const sync=on=>pg.classList.toggle("off",!on);
     num.addEventListener("input",()=>{if(rng&&num.value!=="")rng.value=num.value;sync(num.value!=="");});
     if(rng)rng.addEventListener("input",()=>{num.value=rng.value;sync(true);});
-    rst.onclick=()=>{num.value="";if(rng)rng.value=p.default;sync(false);};
+    rst.onclick=()=>{num.value="";if(rng)rng.value=p.default;sync(false);num.dispatchEvent(new Event("input",{bubbles:true}));};
     target.appendChild(pg);
   });
 }
 function readParamsGrid(target){const out={};target.querySelectorAll("input[data-k]").forEach(inp=>{const raw=inp.value.trim();if(raw==="")return;const sp=CFG.param_specs.find(p=>p.key===inp.dataset.k);out[inp.dataset.k]=sp&&sp.type==="int"?parseInt(raw,10):parseFloat(raw);});return out;}
 function fillDefaults(target){const o={};CFG.param_specs.forEach(p=>{o[p.key]=p.default;});buildParamsGrid(target,o);}
+
+// ---------------- per-model sampler presets
+function presetsForModel(model){return (CFG.presets||[]).filter(p=>!p.model||p.model===model);}
+function presetById(id){return (CFG.presets||[]).find(p=>p.id===id)||null;}
+function paramsEqual(a,b){a=a||{};b=b||{};const ak=Object.keys(a),bk=Object.keys(b);if(ak.length!==bk.length)return false;return ak.every(k=>b[k]!=null&&String(a[k])===String(b[k]));}
+function buildPresetSelect(selectId){
+  const sel=$("#d_preset");if(!sel)return;
+  const model=$("#d_model").value;
+  sel.innerHTML="";
+  const def=document.createElement("option");def.value="__default__";def.textContent="server default";sel.appendChild(def);
+  const list=presetsForModel(model);
+  const grp=(label,items)=>{if(!items.length)return;const og=document.createElement("optgroup");og.label=label;
+    items.forEach(p=>{const o=document.createElement("option");o.value="p:"+p.id;o.textContent=p.name+(p.model?"":" · all models");og.appendChild(o);});sel.appendChild(og);};
+  grp("site presets",list.filter(p=>p.scope==="site"));
+  grp("my presets",list.filter(p=>p.scope!=="site"));
+  if(selectId){applyPresetById(selectId);sel.value="p:"+selectId;}
+  else syncPresetSelect();
+  updatePresetDel();
+}
+function syncPresetSelect(){
+  const sel=$("#d_preset");if(!sel)return;
+  const old=sel.querySelector('option[value="__custom__"]');if(old)old.remove();
+  const cur=readParamsGrid($("#d_params"));
+  if(Object.keys(cur).length===0){sel.value="__default__";updatePresetDel();return;}
+  const match=presetsForModel($("#d_model").value).find(p=>paramsEqual(p.params,cur));
+  if(match){sel.value="p:"+match.id;}
+  else{const o=document.createElement("option");o.value="__custom__";o.textContent="(custom)";sel.insertBefore(o,sel.firstChild);sel.value="__custom__";}
+  updatePresetDel();
+}
+function updatePresetDel(){
+  const sel=$("#d_preset"),btn=$("#d_preset_del");if(!sel||!btn)return;
+  const v=sel.value;let ok=false;
+  if(v&&v.indexOf("p:")===0){const p=presetById(v.slice(2));ok=!!(p&&p.editable);}
+  btn.style.display=ok?"":"none";
+}
+function applyPresetById(id){const p=presetById(id);if(p)buildParamsGrid($("#d_params"),p.params||{});}
+function onPresetChange(){
+  const sel=$("#d_preset"),v=sel.value;
+  if(v==="__default__")buildParamsGrid($("#d_params"),{});
+  else if(v.indexOf("p:")===0)applyPresetById(v.slice(2));
+  if(v!=="__custom__"){const c=sel.querySelector('option[value="__custom__"]');if(c)c.remove();sel.value=v;}
+  updatePresetDel();
+}
+async function savePresetDialog(){
+  const model=$("#d_model").value;
+  const params=readParamsGrid($("#d_params"));
+  if(Object.keys(params).length===0){toast("set at least one parameter first");return;}
+  const sel=$("#d_preset"),selected=sel.value.indexOf("p:")===0?presetById(sel.value.slice(2)):null;
+  const editing=selected&&selected.editable?selected:null;
+  const adminBox=isAdmin()?'<label class="dlg-chk"><input type="checkbox" id="ps_site"'+(editing&&editing.scope==="site"?" checked":"")+'> site-wide (shared with all users)</label>':'';
+  const html='<h4>'+(editing?"update preset":"save preset")+'</h4>'
+    +'<p>save the current sampler parameters as a reusable preset.</p>'
+    +'<input id="ps_name" placeholder="preset name" value="'+esc(editing?editing.name:"")+'">'
+    +'<select id="ps_model"><option value="'+esc(model)+'">this model ('+esc(model)+')</option><option value=""'+(editing&&!editing.model?" selected":"")+'>all models</option></select>'
+    +adminBox
+    +(editing?'<label class="dlg-chk"><input type="checkbox" id="ps_new"> save as a new preset instead of updating</label>':'')
+    +'<div class="dlg-btns"><button class="btn-ghost" data-x>cancel</button><button class="btn-primary" data-ok>save</button></div>';
+  const data=await dialog(html,(d,done)=>{
+    const nm=d.querySelector("#ps_name");nm.focus();nm.select();
+    const collect=()=>({name:nm.value.trim(),model:d.querySelector("#ps_model").value,
+      site:!!(d.querySelector("#ps_site")&&d.querySelector("#ps_site").checked),
+      asNew:!!(d.querySelector("#ps_new")&&d.querySelector("#ps_new").checked)});
+    nm.onkeydown=e=>{if(e.key==="Enter")done(collect());};
+    d.querySelector("[data-x]").onclick=()=>done(null);
+    d.querySelector("[data-ok]").onclick=()=>done(collect());
+  });
+  if(!data)return;
+  if(!data.name){toast("a preset name is required");return;}
+  const preset={name:data.name,model:data.model,params,scope:data.site?"site":"private"};
+  if(editing&&!data.asNew)preset.id=editing.id;
+  try{const r=await api("POST","/api/presets",{preset});CFG.presets=r.presets;buildPresetSelect(r.id);toast("preset saved");}catch(e){toast(e.message);}
+}
+async function deletePreset(){
+  const v=$("#d_preset").value;if(v.indexOf("p:")!==0)return;
+  const p=presetById(v.slice(2));if(!p)return;
+  if(!await uiConfirm("Delete preset '"+p.name+"'?",{danger:true,ok:"Delete"}))return;
+  try{const r=await api("DELETE","/api/presets/"+p.id);CFG.presets=r.presets;buildPresetSelect();toast("deleted");}catch(e){toast(e.message);}
+}
 
 // ---------------- chat-settings drawer
 async function openDrawer(){
@@ -3212,10 +3394,12 @@ async function openDrawer(){
     CFG.settings.endpoints.forEach(e=>{const o=document.createElement("option");o.value=e.id;o.textContent=e.name;es.appendChild(o);});es.value=current.endpoint_id||"";
     es.onchange=()=>refreshDrawerModels(es.value,$("#d_model").value);}
   await refreshDrawerModels(current.endpoint_id,current.model);
-  cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}else{$("#d_system").value="";}};
+  cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}else{$("#d_system").value="";}buildPresetSelect();};
+  $("#d_model").onchange=()=>buildPresetSelect();
   $("#d_system").value=current.system||"";
   $("#d_tools").checked=!!current.tools;
   buildParamsGrid($("#d_params"),current.params||{});
+  buildPresetSelect();
   showOverlay($("#drawer"));
 }
 async function refreshDrawerModels(endpointId,value){
@@ -3379,8 +3563,12 @@ $("#logoutbtn").onclick=async()=>{try{await api("POST","/api/logout");}catch(_){
 $("#modelsel").onchange=async()=>{if(current){try{current=await api("POST","/api/conversations/"+current.id+"/settings",{model:$("#modelsel").value});syncBar();toast("model: "+$("#modelsel").value);}catch(e){toast(e.message);syncBar();}}};
 $("#send").onclick=()=>busy?stopStream():send();
 $("#d_save").onclick=saveDrawer;
-$("#d_defaults").onclick=()=>fillDefaults($("#d_params"));
-$("#d_clear").onclick=()=>buildParamsGrid($("#d_params"),{});
+$("#d_defaults").onclick=()=>{fillDefaults($("#d_params"));syncPresetSelect();};
+$("#d_clear").onclick=()=>{buildParamsGrid($("#d_params"),{});syncPresetSelect();};
+$("#d_preset").onchange=onPresetChange;
+$("#d_preset_save").onclick=savePresetDialog;
+$("#d_preset_del").onclick=deletePreset;
+$("#d_params").addEventListener("input",syncPresetSelect);
 $$("[data-close-drawer]").forEach(b=>b.onclick=()=>closeOverlay($("#drawer")));
 $$("[data-close-modal]").forEach(b=>b.onclick=closeModal);
 $("#backdrop").onclick=closeAll;
