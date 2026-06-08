@@ -21,6 +21,7 @@ import uuid
 import base64
 import hmac
 import hashlib
+import glob
 import sqlite3
 import threading
 import socket
@@ -43,6 +44,24 @@ COOKIE_NAME = "ksession"
 MAX_TOKENS = 32768
 REQUEST_TIMEOUT = 1800
 PBKDF2_ITERS = 240000
+
+# Brute-force protection: after LOGIN_MAX_FAILS failed sign-ins from one client IP within
+# LOGIN_WINDOW seconds, further attempts are refused (429) until the oldest failure ages out.
+LOGIN_MAX_FAILS = int(os.environ.get("KENOSIS_LOGIN_MAX_FAILS", "8"))
+LOGIN_WINDOW = int(os.environ.get("KENOSIS_LOGIN_WINDOW", "900"))
+
+# Automated SQLite backups (VACUUM INTO). Set KENOSIS_BACKUP_HOURS=0 to disable.
+BACKUP_HOURS = float(os.environ.get("KENOSIS_BACKUP_HOURS", "24"))
+BACKUP_KEEP = int(os.environ.get("KENOSIS_BACKUP_KEEP", "7"))
+BACKUP_DIR = os.environ.get("KENOSIS_BACKUP_DIR") or os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+
+# Sent on every HTML document. Inline <script>/<style> are first-party (no user-authored scripts),
+# so 'unsafe-inline' is required; the rest locks down framing, plugins, base-uri, form targets, and
+# where the page may load/connect. Google Fonts is the only third-party origin.
+CSP = ("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+       "form-action 'self'; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; "
+       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+       "script-src 'self' 'unsafe-inline'; connect-src 'self'")
 
 # Attachments (uploaded files folded into a user turn) and the web-fetch tool.
 DEFAULT_CONTEXT = 8192               # fallback context window when /v1/models doesn't report one
@@ -316,6 +335,42 @@ def parse_session(token):
         return data.get("u") if data.get("exp", 0) >= time.time() else None
     except Exception:
         return None
+
+
+# ---- login brute-force throttle (per client IP, in-memory; resets on restart)
+_login_fails = {}
+_login_lock = threading.Lock()
+
+
+def login_retry_after(key):
+    """Seconds the caller must wait, or 0 if not currently throttled."""
+    now = time.time()
+    with _login_lock:
+        arr = [t for t in _login_fails.get(key, []) if now - t < LOGIN_WINDOW]
+        if arr:
+            _login_fails[key] = arr
+        else:
+            _login_fails.pop(key, None)
+        if len(arr) >= LOGIN_MAX_FAILS:
+            return int(LOGIN_WINDOW - (now - arr[0])) + 1
+    return 0
+
+
+def login_record_fail(key):
+    now = time.time()
+    with _login_lock:
+        arr = [t for t in _login_fails.get(key, []) if now - t < LOGIN_WINDOW]
+        arr.append(now)
+        _login_fails[key] = arr
+        # opportunistic prune so the table can't grow without bound
+        if len(_login_fails) > 4096:
+            for k in [k for k, v in _login_fails.items() if not v or now - v[-1] >= LOGIN_WINDOW]:
+                _login_fails.pop(k, None)
+
+
+def login_clear(key):
+    with _login_lock:
+        _login_fails.pop(key, None)
 
 
 def user_by_name(name):
@@ -677,6 +732,44 @@ def bootstrap_admin():
         u = create_user(name, pw, role="admin")
         print("bootstrapped admin user: %s" % name)
         import_legacy(u["id"])
+
+
+# ---------------------------------------------------------------- backups
+def backup_db():
+    """Write a consistent, defragmented copy of the DB via VACUUM INTO, then prune old copies."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, "chat-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".db")
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        con.execute("VACUUM INTO ?", (dest,))
+    finally:
+        con.close()
+    if BACKUP_KEEP > 0:
+        old = sorted(glob.glob(os.path.join(BACKUP_DIR, "chat-*.db")))[:-BACKUP_KEEP]
+        for f in old:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    return dest
+
+
+def _backup_loop():
+    while True:
+        try:
+            dest = backup_db()
+            print("backup written: %s" % dest)
+        except Exception as e:
+            print("backup failed: %s" % e)
+        time.sleep(max(0.1, BACKUP_HOURS) * 3600)
+
+
+def start_backups():
+    if BACKUP_HOURS <= 0:
+        print("automated backups disabled (KENOSIS_BACKUP_HOURS=0)")
+        return
+    threading.Thread(target=_backup_loop, daemon=True).start()
+    print("automated backups: every %gh -> %s (keep %d)" % (BACKUP_HOURS, BACKUP_DIR, BACKUP_KEEP))
 
 
 # ---------------------------------------------------------------- model calls
@@ -1186,6 +1279,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         for k, v in (extra or []):
             self.send_header(k, v)
         self.end_headers()
@@ -1198,7 +1293,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(code, "application/json; charset=utf-8", json.dumps(obj), extra)
 
     def _html(self, body):
-        self._send(200, "text/html; charset=utf-8", body)
+        self._send(200, "text/html; charset=utf-8", body,
+                   [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY")])
+
+    def _client_ip(self):
+        # Behind the documented Cloudflare tunnel the real client IP arrives in CF-Connecting-IP;
+        # fall back to X-Forwarded-For, then the socket peer. Only used for best-effort throttling.
+        for h in ("CF-Connecting-IP", "X-Forwarded-For"):
+            v = self.headers.get(h)
+            if v:
+                return v.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "?"
 
     def _redirect(self, location):
         self.send_response(302)
@@ -1444,9 +1549,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/login":
             if not self._csrf_ok():
                 return self._json(403, {"error": "bad origin"})
+            ipkey = self._client_ip()
+            retry = login_retry_after(ipkey)
+            if retry:
+                return self._json(429, {"error": "too many failed attempts; try again in %d seconds" % retry},
+                                  extra=[("Retry-After", str(retry))])
             u = user_by_name((payload.get("username") or "").strip())
             if u is None or u["disabled"] or not verify_pw(payload.get("password") or "", u["pw_hash"]):
+                login_record_fail(ipkey)
                 return self._json(401, {"error": "invalid username or password"})
+            login_clear(ipkey)
             return self._json(200, {"ok": True, "me": user_public(u)}, extra=[self._set_cookie(sign_session(u["username"]))])
 
         if path == "/api/setup":
@@ -2415,6 +2527,8 @@ PAGE_HEAD = r"""<!doctype html>
 <style>
   :root{
     --rs:1; --sbw:288px; --cw:840px; --read-font:var(--serif);
+    /* composer control height = input-shell padding (24px) + one line of text; tracks the text-size slider so attach/send always match the field */
+    --ctrl-h:calc(24px + 24.75px * var(--rs));
     --bg:#100c08; --panel:#15100a; --surface:#1b150d; --surface2:#231b10; --surface3:#2a2114;
     --line:rgba(150,124,84,.10);
     --text:#e8ddc5; --muted:#9a8c72; --faint:#6a6049; --dim:#544a38;
@@ -2590,11 +2704,11 @@ PAGE_HEAD = r"""<!doctype html>
   /* ---------------- composer */
   #composer{padding:12px 0 18px;background:var(--bg);padding-bottom:max(18px,env(safe-area-inset-bottom));}
   #composer .wrap{display:flex;gap:10px;align-items:flex-end;}
-  .input-shell{flex:1;display:flex;align-items:flex-end;background:var(--surface);border-radius:14px;padding:12px 14px;min-height:48px;}
+  .input-shell{flex:1;display:flex;align-items:flex-end;background:var(--surface);border-radius:14px;padding:12px 14px;min-height:var(--ctrl-h);}
   .input-shell:focus-within{outline:2px solid var(--accent-weak);outline-offset:-1px;}
   #input{flex:1;background:none;color:var(--text);border:none;font-size:calc(16.5px*var(--rs));font-family:var(--read-font);resize:none;max-height:230px;line-height:1.5;padding:0;}
   #input:focus{outline:none;}
-  #send{flex:0 0 auto;background:var(--accent);color:#fff;border:none;border-radius:14px;width:48px;height:48px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  #send{flex:0 0 auto;background:var(--accent);color:#fff;border:none;border-radius:14px;width:var(--ctrl-h);height:var(--ctrl-h);cursor:pointer;display:flex;align-items:center;justify-content:center;}
   #send:hover{filter:brightness(1.08);} #send.stop{background:var(--danger);color:#fff;}
   #send .ico{width:20px;height:20px;stroke-width:2.2;}
   .chint{max-width:var(--cw);margin:7px auto 0;padding:0 28px;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.03em;}
@@ -2608,7 +2722,7 @@ PAGE_HEAD = r"""<!doctype html>
   @media (max-width:620px){ #ctxmeter .ctxtxt{display:none;} }
 
   /* ---------------- composer: attach + pending files */
-  #attachbtn{flex:0 0 auto;background:var(--surface);color:var(--muted);border:none;border-radius:14px;width:48px;height:48px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  #attachbtn{flex:0 0 auto;background:var(--surface);color:var(--muted);border:none;border-radius:14px;width:var(--ctrl-h);height:var(--ctrl-h);cursor:pointer;display:flex;align-items:center;justify-content:center;}
   #attachbtn:hover{background:var(--surface2);color:var(--text);}
   #attachbtn .ico{width:19px;height:19px;stroke-width:2;}
   #pending{max-width:var(--cw);margin:0 auto 8px;padding:0 28px;display:flex;flex-wrap:wrap;gap:7px;}
@@ -2774,7 +2888,7 @@ PAGE_HEAD = r"""<!doctype html>
   }
   @media (max-width:560px){
     .params-grid{grid-template-columns:1fr;} .barbtn .t{display:none;}
-    #composer .wrap{gap:6px;} #attachbtn,#send{width:44px;height:44px;}
+    #composer .wrap{gap:6px;}
     #scrolltop{bottom:86px;right:12px;}
   }
 </style></head>
@@ -2969,7 +3083,7 @@ const ICON_THUMB='<svg class="ico" viewBox="0 0 24 24"><path d="M14 9V5a3 3 0 0 
 const ICON_MOON='<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>';
 const ICON_SUN='<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>';
 
-function esc(s){return (s==null?"":String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtNum(n){return n==null?"?":Number(n).toLocaleString();}
 function isAdmin(){return CFG&&CFG.is_admin;}
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove("show"),2600);}
@@ -3905,6 +4019,7 @@ PAGE = PAGE_HEAD + PAGE_BODY + PAGE_JS1 + PAGE_JS2 + PAGE_JS3
 if __name__ == "__main__":
     init_db()
     bootstrap_admin()
+    start_backups()
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     print("ORACLE chat on http://localhost:%d" % PORT)
     print("database: %s" % DB_PATH)
