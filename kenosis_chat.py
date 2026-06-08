@@ -176,6 +176,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS presets(
                 id TEXT PRIMARY KEY, owner_id INTEGER, scope TEXT NOT NULL DEFAULT 'private',
                 model TEXT, name TEXT, params TEXT, created TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS invites(
+                token TEXT PRIMARY KEY, created_by INTEGER, role TEXT NOT NULL DEFAULT 'user',
+                allowed_models TEXT, max_uses INTEGER, uses INTEGER NOT NULL DEFAULT 0,
+                expires INTEGER, note TEXT, created TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_convo_owner ON conversations(owner_id, updated);
             CREATE INDEX IF NOT EXISTS idx_msg_convo ON messages(convo_id, position);
             CREATE INDEX IF NOT EXISTS idx_folder_owner ON folders(owner_id);
@@ -354,6 +358,54 @@ def allowed_models_for(u):
 def model_allowed(u, model):
     allow = allowed_models_for(u)
     return allow is None or model in allow
+
+
+# ---------------------------------------------------------------- invite links
+def gen_token():
+    return base64.urlsafe_b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+
+
+def invite_by_token(tok):
+    return db().execute("SELECT * FROM invites WHERE token=?", (tok,)).fetchone()
+
+
+def invite_valid(inv):
+    if inv is None:
+        return False
+    if inv["expires"] is not None and time.time() >= inv["expires"]:
+        return False
+    if inv["max_uses"] is not None and inv["uses"] >= inv["max_uses"]:
+        return False
+    return True
+
+
+def invite_status(inv):
+    if inv["expires"] is not None and time.time() >= inv["expires"]:
+        return "expired"
+    if inv["max_uses"] is not None and inv["uses"] >= inv["max_uses"]:
+        return "used up"
+    return "active"
+
+
+def invite_error(inv):
+    if inv is None:
+        return "This invite link is not valid."
+    if inv["expires"] is not None and time.time() >= inv["expires"]:
+        return "This invite link has expired."
+    if inv["max_uses"] is not None and inv["uses"] >= inv["max_uses"]:
+        return "This invite link has already been used up."
+    return "This invite link is not valid."
+
+
+def invite_public(inv):
+    return {"token": inv["token"], "role": inv["role"],
+            "allowed_models": json.loads(inv["allowed_models"]) if inv["allowed_models"] else [],
+            "max_uses": inv["max_uses"], "uses": inv["uses"], "expires": inv["expires"],
+            "note": inv["note"] or "", "status": invite_status(inv), "created": inv["created"]}
+
+
+def list_invites():
+    return [invite_public(r) for r in db().execute("SELECT * FROM invites ORDER BY created DESC").fetchall()]
 
 
 def delete_user_cascade(uid):
@@ -1242,6 +1294,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._redirect("/setup") if user_count() == 0 else self._html(LOGIN_PAGE)
         if path == "/setup":
             return self._redirect("/login") if user_count() > 0 else self._html(SETUP_PAGE)
+        if re.fullmatch(r"/invite/([A-Za-z0-9_-]+)", path):
+            if self.current_user():
+                return self._redirect("/")
+            return self._html(INVITE_PAGE)
+        m = re.fullmatch(r"/api/invite/([A-Za-z0-9_-]+)", path)
+        if m:
+            inv = invite_by_token(m.group(1))
+            if not invite_valid(inv):
+                return self._json(200, {"valid": False, "error": invite_error(inv)})
+            return self._json(200, {"valid": True, "role": inv["role"]})
 
         u = self.current_user()
         if path == "/":
@@ -1280,6 +1342,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if u["role"] != "admin":
                 return self._json(403, {"error": "admin only"})
             return self._json(200, {"users": [user_public(r) for r in db().execute("SELECT * FROM users ORDER BY id").fetchall()]})
+        if path == "/api/invites":
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            return self._json(200, {"invites": list_invites()})
         m = re.fullmatch(r"/api/conversations/([^/]+)", path)
         if m and valid_id(m.group(1)):
             c = get_convo(m.group(1), u)
@@ -1350,6 +1416,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 db().execute("DELETE FROM presets WHERE id=?", (m.group(1),))
             return self._json(200, {"presets": visible_presets(u)})
 
+        m = re.fullmatch(r"/api/invites/([A-Za-z0-9_-]+)", path)
+        if m:
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            with db():
+                db().execute("DELETE FROM invites WHERE token=?", (m.group(1),))
+            return self._json(200, {"invites": list_invites()})
+
         m = re.fullmatch(r"/api/users/([0-9]+)", path)
         if m:
             if u["role"] != "admin":
@@ -1389,6 +1463,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             u = create_user(name, pw, role="admin")
             import_legacy(u["id"])
             return self._json(200, {"ok": True, "me": user_public(u)}, extra=[self._set_cookie(sign_session(name))])
+
+        if path == "/api/invite/register":
+            if not self._csrf_ok():
+                return self._json(403, {"error": "bad origin"})
+            tok = (payload.get("token") or "").strip()
+            name = (payload.get("username") or "").strip()
+            pw = payload.get("password") or ""
+            inv = invite_by_token(tok)
+            if not invite_valid(inv):
+                return self._json(400, {"error": invite_error(inv)})
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{2,32}", name):
+                return self._json(400, {"error": "username must be 2-32 chars: letters, digits, _ . -"})
+            if len(pw) < 8:
+                return self._json(400, {"error": "password must be at least 8 characters"})
+            if user_by_name(name):
+                return self._json(400, {"error": "that username is already taken"})
+            role = "admin" if inv["role"] == "admin" else "user"
+            allowed = inv["allowed_models"]  # already JSON or None; store as-is
+            conn = db()
+            with conn:
+                # re-check inside the transaction so concurrent sign-ups can't overrun max_uses
+                cur = conn.execute("SELECT uses, max_uses, expires FROM invites WHERE token=?", (tok,)).fetchone()
+                if cur is None or (cur["expires"] is not None and time.time() >= cur["expires"]) \
+                        or (cur["max_uses"] is not None and cur["uses"] >= cur["max_uses"]):
+                    return self._json(400, {"error": "This invite link is no longer valid."})
+                if user_by_name(name):
+                    return self._json(400, {"error": "that username is already taken"})
+                conn.execute("INSERT INTO users(username,pw_hash,role,allowed_models,created) VALUES(?,?,?,?,?)",
+                             (name, hash_pw(pw), role, allowed, _now()))
+                conn.execute("UPDATE invites SET uses=uses+1 WHERE token=?", (tok,))
+            nu = user_by_name(name)
+            return self._json(200, {"ok": True, "me": user_public(nu)}, extra=[self._set_cookie(sign_session(name))])
 
         u = self.current_user()
         if not u:
@@ -1549,6 +1655,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             create_user(name, payload["password"], role="admin" if payload.get("role") == "admin" else "user",
                         allowed=payload.get("allowed_models") or None)
             return self._json(200, {"users": [user_public(r) for r in db().execute("SELECT * FROM users ORDER BY id").fetchall()]})
+
+        if path == "/api/invites":
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            role = "admin" if payload.get("role") == "admin" else "user"
+            allowed = payload.get("allowed_models") or None
+            max_uses = payload.get("max_uses")
+            try:
+                max_uses = int(max_uses) if max_uses not in (None, "") else None
+            except (ValueError, TypeError):
+                max_uses = None
+            if max_uses is not None and max_uses < 1:
+                max_uses = None
+            days = payload.get("days")
+            try:
+                days = float(days) if days not in (None, "") else None
+            except (ValueError, TypeError):
+                days = None
+            expires = int(time.time() + days * 86400) if (days and days > 0) else None
+            note = (payload.get("note") or "").strip()[:200]
+            tok = gen_token()
+            with db():
+                db().execute("INSERT INTO invites(token,created_by,role,allowed_models,max_uses,uses,expires,note,created)"
+                             " VALUES(?,?,?,?,?,0,?,?,?)",
+                             (tok, u["id"], role, json.dumps(allowed) if allowed else None, max_uses, expires, note, _now()))
+            return self._json(200, {"invites": list_invites(), "token": tok})
 
         mu = re.fullmatch(r"/api/users/([0-9]+)", path)
         if mu:
@@ -2233,6 +2365,36 @@ document.getElementById("f").onsubmit=async(ev)=>{ev.preventDefault();const e=do
  }catch(err){e.textContent=err.message;}};
 </script></body></html>""")
 
+INVITE_PAGE = (r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>oracle · register</title>""" + META_TAGS + r"""
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap" rel="stylesheet">
+<style>""" + AUTH_CSS + r"""</style></head><body>
+<form class="card" id="f">
+  <div class="brand">ORACLE <span class="sub">// invite</span></div>
+  <h1>Create your account</h1>
+  <p class="lede" id="lede">You have been invited to this private instance. Choose a username and password.</p>
+  <label>Username</label><input id="u" autocomplete="username" autofocus>
+  <label>Password <span style="text-transform:none;letter-spacing:0;color:var(--faint)">(min 8)</span></label><input id="p" type="password" autocomplete="new-password">
+  <label>Confirm password</label><input id="p2" type="password" autocomplete="new-password">
+  <button type="submit" id="go">Create &amp; enter</button>
+  <div class="err" id="e"></div>
+</form>
+<script>
+var TOKEN=decodeURIComponent((location.pathname.split("/").filter(Boolean).pop())||"");
+(async function(){try{const r=await fetch("/api/invite/"+encodeURIComponent(TOKEN));const j=await r.json().catch(()=>({}));
+  if(!j.valid){document.getElementById("f").innerHTML='<div class="brand">ORACLE</div><h1>Invite unavailable</h1><p class="lede">'+(j.error||"This invite link is not valid.")+'</p><a href="/login" style="color:var(--accent)">Go to sign in &rarr;</a>';return;}
+  if(j.role==="admin")document.getElementById("lede").textContent="You have been invited as an administrator. Choose a username and password.";
+ }catch(_){}})();
+document.getElementById("f").onsubmit=async(ev)=>{ev.preventDefault();const e=document.getElementById("e");e.textContent="";
+ const p=document.getElementById("p").value,p2=document.getElementById("p2").value;
+ if(p!==p2){e.textContent="passwords do not match";return;}
+ try{const r=await fetch("/api/invite/register",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({token:TOKEN,username:document.getElementById("u").value,password:p})});
+  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||"registration failed");location.href="/";
+ }catch(err){e.textContent=err.message;}};
+</script></body></html>""")
+
 PAGE_HEAD = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -2563,6 +2725,9 @@ PAGE_HEAD = r"""<!doctype html>
   .row-card .cmain{flex:1;min-width:0;}
   .row-card .cn{font-family:var(--serif);font-size:15px;}
   .row-card .cn .badge{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-weak);border-radius:5px;padding:1px 5px;margin-left:8px;}
+  .invite-sec{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;}
+  .invite-url{width:100%;margin-top:8px;background:var(--surface2);border:none;border-radius:7px;padding:7px 9px;font-family:var(--mono);font-size:11px;color:var(--accent2);cursor:text;}
+  .invite-url:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
   .row-card .cs{font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
   .row-card .cbtns{display:flex;gap:6px;}
   .toggle-row{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:14px;letter-spacing:.03em;}
@@ -2757,6 +2922,21 @@ PAGE_BODY = r"""
             <div class="fld" id="us_models_wrap"><span class="lab">allowed models <span class="sub">none checked = use global list</span></span><div class="model-pick" id="us_models"></div></div>
             <label class="fld" id="us_reset_wrap" style="display:none;"><span class="lab">reset password <span class="sub">blank = keep</span></span><input type="password" id="us_reset"></label>
             <div class="edit-row" style="margin-top:14px;"><button class="btn-primary" id="us_save">save</button><button class="btn-ghost" id="us_cancel">cancel</button></div>
+          </div>
+          <div class="invite-sec">
+            <div class="lab" style="margin-bottom:8px;">invite links <span class="sub">let people self-register</span></div>
+            <div id="invite-list"></div>
+            <button class="mini" id="invite-add">+ create invite link</button>
+            <div id="invite-edit" style="display:none;margin-top:12px;">
+              <label class="fld"><span class="lab">role</span><select id="iv_role"><option value="user">user</option><option value="admin">admin</option></select></label>
+              <div class="fld"><span class="lab">allowed models <span class="sub">none checked = use global list</span></span><div class="model-pick" id="iv_models"></div></div>
+              <div class="edit-row">
+                <label class="fld" style="flex:1;"><span class="lab">expires in days <span class="sub">blank = never</span></span><input type="number" id="iv_days" min="0" step="1" placeholder="never"></label>
+                <label class="fld" style="flex:1;"><span class="lab">max uses <span class="sub">blank = unlimited</span></span><input type="number" id="iv_uses" min="1" step="1" placeholder="unlimited"></label>
+              </div>
+              <label class="fld"><span class="lab">note <span class="sub">optional, only you see it</span></span><input type="text" id="iv_note" placeholder="e.g. for the book club"></label>
+              <div class="edit-row" style="margin-top:12px;"><button class="btn-primary" id="iv_save">create link</button><button class="btn-ghost" id="iv_cancel">cancel</button></div>
+            </div>
           </div>
         </div>
       </div>
@@ -3469,7 +3649,7 @@ function switchTab(name){
   $$(".tab-pane").forEach(p=>p.classList.toggle("active",p.id==="tab-"+name));
   $("#settings-save").style.display=["models","endpoints","defaults"].includes(name)?"block":"none";
   $("#settings-note").textContent="";
-  if(name==="users")loadUsers();
+  if(name==="users"){loadUsers();loadInvites();}
 }
 function openSettings(tab){
   renderCharacters();
@@ -3550,6 +3730,53 @@ async function saveUser(){const id=$("#us_id").value;
   try{if(id){const body={role:$("#us_role").value,allowed_models:readModelPick($("#us_models"))};if($("#us_reset").value)body.password=$("#us_reset").value;const r=await api("POST","/api/users/"+id,body);userCache=r.users;}
     else{const r=await api("POST","/api/users",{username:$("#us_name").value.trim(),password:$("#us_pw").value,role:$("#us_role").value,allowed_models:readModelPick($("#us_models"))});userCache=r.users;}
     $("#user-edit").style.display="none";renderUsers();toast("saved");}catch(e){toast(e.message);}}
+// invite links
+let inviteCache=[];
+async function loadInvites(){try{const j=await api("GET","/api/invites");inviteCache=j.invites||[];renderInvites();}catch(e){}}
+function inviteUrl(tok){return location.origin+"/invite/"+tok;}
+function inviteExpiryText(iv){
+  if(iv.expires==null)return "never expires";
+  const ms=iv.expires*1000-Date.now();
+  if(ms<=0)return "expired";
+  const days=Math.floor(ms/86400000);
+  if(days>=1)return "expires in "+days+" day"+(days>1?"s":"");
+  const hrs=Math.max(1,Math.floor(ms/3600000));
+  return "expires in "+hrs+" hr"+(hrs>1?"s":"");
+}
+function copyInvite(url){
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(()=>toast("link copied"),()=>toast("copy failed — select the link"));
+  else toast("select the link and copy");
+}
+function renderInvites(){
+  const list=$("#invite-list");list.innerHTML="";
+  if(!inviteCache.length){list.innerHTML='<div style="color:var(--faint);font-family:var(--mono);font-size:11px;margin-bottom:10px;">no invite links yet.</div>';return;}
+  inviteCache.forEach(iv=>{
+    const url=inviteUrl(iv.token),dead=iv.status!=="active";
+    const uses=iv.uses+"/"+(iv.max_uses==null?"∞":iv.max_uses)+" used";
+    const row=document.createElement("div");row.className="row-card";row.style.alignItems="flex-start";
+    row.innerHTML='<div class="cmain"><div class="cn">'+esc(iv.role)+'<span class="badge"'+(dead?' style="color:var(--danger);border-color:var(--danger-weak)"':'')+'>'+esc(iv.status)+'</span></div>'
+      +'<div class="cs">'+esc(uses)+' · '+esc(inviteExpiryText(iv))+(iv.note?' · '+esc(iv.note):'')+'</div>'
+      +'<input class="invite-url" readonly value="'+esc(url)+'"></div>'
+      +'<div class="cbtns"><button class="mini" data-copy>copy</button><button class="mini danger" data-revoke>revoke</button></div>';
+    const inp=row.querySelector(".invite-url");
+    inp.onclick=()=>inp.select();
+    row.querySelector("[data-copy]").onclick=()=>copyInvite(url);
+    row.querySelector("[data-revoke]").onclick=async()=>{if(!await uiConfirm("Revoke this invite link? Anyone holding it can no longer register.",{danger:true,ok:"Revoke"}))return;try{const r=await api("DELETE","/api/invites/"+iv.token);inviteCache=r.invites;renderInvites();toast("revoked");}catch(e){toast(e.message);}};
+    list.appendChild(row);
+  });
+}
+function newInvite(){$("#invite-edit").style.display="block";$("#iv_role").value="user";$("#iv_days").value="";$("#iv_uses").value="";$("#iv_note").value="";
+  const wrap=$("#iv_models");wrap.innerHTML="";(CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'">'+esc(m)+'</label>'));}
+async function createInvite(){
+  const body={role:$("#iv_role").value,allowed_models:readModelPick($("#iv_models")),
+    days:$("#iv_days").value.trim()?parseFloat($("#iv_days").value):null,
+    max_uses:$("#iv_uses").value.trim()?parseInt($("#iv_uses").value,10):null,
+    note:$("#iv_note").value.trim()};
+  try{const r=await api("POST","/api/invites",body);inviteCache=r.invites;$("#invite-edit").style.display="none";renderInvites();
+    const url=inviteUrl(r.token);
+    if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(()=>toast("invite link created · copied"),()=>toast("invite link created"));
+    else toast("invite link created");}catch(e){toast(e.message);}
+}
 // account
 async function changePassword(){const o=$("#ac_old").value,n=$("#ac_new").value,n2=$("#ac_new2").value;
   if(n!==n2){toast("passwords do not match");return;}
@@ -3610,6 +3837,9 @@ $("#def_clear").onclick=()=>buildParamsGrid($("#def_params"),{});
 $("#user-add").onclick=()=>editUser(null);
 $("#us_save").onclick=saveUser;
 $("#us_cancel").onclick=()=>$("#user-edit").style.display="none";
+$("#invite-add").onclick=newInvite;
+$("#iv_save").onclick=createInvite;
+$("#iv_cancel").onclick=()=>$("#invite-edit").style.display="none";
 $("#ac_save").onclick=changePassword;
 $("#acctdel").onclick=deleteAccount;
 $("#exportall").onclick=()=>{const a=document.createElement("a");a.href="/api/export";a.click();toast("exporting…");};
