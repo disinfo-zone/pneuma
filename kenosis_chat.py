@@ -1023,6 +1023,28 @@ def build_meta(t0, t_first, t1, usage, reply):
             "tokens_est": est, "tps": round((comp / gen) if gen > 0 else 0, 1)}
 
 
+# Cooperative stop: a running generation polls this set each token and, when its conversation id
+# appears, wraps up gracefully — persisting whatever has streamed so far and emitting its normal
+# `done` event over the still-open stream (so the client keeps the partial, no disconnect race).
+_STOP = set()
+_STOP_LOCK = threading.Lock()
+
+
+def request_stop(cid):
+    with _STOP_LOCK:
+        _STOP.add(cid)
+
+
+def stop_requested(cid):
+    with _STOP_LOCK:
+        return cid in _STOP
+
+
+def clear_stop(cid):
+    with _STOP_LOCK:
+        _STOP.discard(cid)
+
+
 # ---------------------------------------------------------------- tools / fetch
 class _TextExtractor(HTMLParser):
     """Very small HTML -> readable-text reducer (stdlib only)."""
@@ -1669,6 +1691,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if ms and valid_id(ms.group(1)):
             return self._stream(ms.group(1), payload, u)
 
+        mstop = re.fullmatch(r"/api/conversations/([^/]+)/stop", path)
+        if mstop and valid_id(mstop.group(1)):
+            if get_convo(mstop.group(1), u) is None:
+                return self._json(404, {"error": "not found"})
+            request_stop(mstop.group(1))
+            return self._json(200, {"ok": True})
+
         # set active leaf (sibling switch)
         ma = re.fullmatch(r"/api/conversations/([^/]+)/active", path)
         if ma and valid_id(ma.group(1)):
@@ -1911,6 +1940,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
         tools = TOOLS_SPEC if convo.get("tools") else None
+        clear_stop(cid)   # drop any stale stop flag from a prior run on this conversation
 
         _, by, _ = _tree(cid)
         content = (payload.get("content") or "").strip()
@@ -2012,7 +2042,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     tcalls = ev["tool_calls"]
                 elif "finish" in ev:
                     finish = ev["finish"]
-                if gone[0]:
+                if gone[0] or stop_requested(cid):
                     break
             return "".join(parts), "".join(rparts), tcalls, used, finish
 
@@ -2042,7 +2072,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if parsed:
                             tcalls = parsed; seg_reply = strip_tool_calls(seg_reply)
                     # the streaming tool parser dropped the call -> recover via reliable non-streaming
-                    if not tcalls and not gone[0] and (finish == "tool_calls" or not seg_reply.strip()):
+                    if not tcalls and not gone[0] and not stop_requested(cid) and (finish == "tool_calls" or not seg_reply.strip()):
                         try:
                             c2, r2, t2, u2, _ = call_model_nonstream(ep, model, system, work, params, cur_tools)
                         except Exception:
@@ -2058,7 +2088,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if not t_first[0]:
                                 t_first[0] = time.time()
                             emit({"delta": c2})
-                if gone[0] or not tcalls:
+                if gone[0] or stop_requested(cid) or not tcalls:
                     reply, reasoning = seg_reply, seg_reason
                     break
                 emit({"tool_turn": True})
@@ -2100,8 +2130,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 reply = (reply + "\n\n" + hint).strip() if reply else hint
 
         if not reply and not reasoning and not collected:
-            if not gone[0]:
-                emit({"error": "the model returned an empty response — please try again"})
+            if gone[0]:
+                return
+            if stop_requested(cid):       # stopped before anything streamed — resolve cleanly
+                try:
+                    emit({"done": True, "convo": get_convo(cid, u)})
+                except Exception:
+                    pass
+                return
+            emit({"error": "the model returned an empty response — please try again"})
             return
         meta = build_meta(t0, t_first[0] or None, time.time(), usage, reply)
         meta["params"] = {k: params[k] for k in params if k in PARAM_KEYS}   # what was actually sent
@@ -2111,7 +2148,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         persist(collected, reply, reasoning, meta)
 
         # On the very first exchange, summarize a short title (replacing the first-line fallback).
-        if lead and parent is None and not gone[0]:
+        # Skip the extra title-gen model call when the user stopped, so stop feels immediate.
+        if lead and parent is None and not gone[0] and not stop_requested(cid):
             utext = lead[1]
             atts = lead[2] or []
             if atts and atts[0].get("text"):
@@ -2799,8 +2837,10 @@ PAGE_HEAD = r"""<!doctype html>
   .phead .x{margin-left:auto;background:none;border:none;color:var(--muted);font-size:22px;cursor:pointer;width:32px;height:32px;border-radius:8px;line-height:1;}
   .phead .x:hover{background:var(--surface);color:var(--text);}
   .pbody{flex:1;min-height:0;overflow-y:auto;padding:8px 18px 16px;}
-  .pfoot{padding:14px 18px;display:flex;gap:8px;}
+  .pfoot{padding:14px 18px;display:flex;gap:8px;align-items:center;}
   .pfoot button{flex:1;border-radius:9px;padding:11px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;}
+  .pfoot .dhint{flex:1;font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.04em;text-transform:uppercase;}
+  .pfoot .dhint+button{flex:0 0 auto;padding:11px 22px;}
   #modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:70;padding:20px;}
   #modal.show{display:flex;}
   .modal-card{background:var(--panel);border-radius:16px;box-shadow:var(--shadow);width:800px;max-width:100%;max-height:90vh;max-height:90dvh;display:flex;flex-direction:column;overflow:hidden;}
@@ -2987,7 +3027,7 @@ PAGE_BODY = r"""
         <div class="params-foot"><button class="mini" id="d_defaults">server defaults</button><button class="mini" id="d_clear">clear all</button></div>
       </div>
     </div>
-    <div class="pfoot"><button class="btn-ghost" data-close-drawer>cancel</button><button class="btn-primary" id="d_save">save</button></div>
+    <div class="pfoot"><span class="dhint">changes apply instantly</span><button class="btn-primary" data-close-drawer>done</button></div>
   </div>
 
   <div id="modal">
@@ -3573,10 +3613,18 @@ async function streamTurn(body){
     clearThink();
     return {res,stopped:false};
   }catch(e){clearThink();if(e.name==="AbortError")return {res:null,stopped:true};throw e;}
-  finally{activeController=null;}
+  finally{activeController=null;clearTimeout(_stopFallback);}
 }
 function setBusy(b){busy=b;const s=$("#send");s.classList.toggle("stop",b);s.innerHTML=b?ICON_STOP:ICON_SEND;s.title=b?"stop":"send";}
-function stopStream(){if(activeController)activeController.abort();}
+let _stopFallback=null;
+function stopStream(){
+  if(!busy||!current)return;
+  // Cooperative stop: the server finalizes the partial, sets it as the active branch, and sends
+  // `done` over the open stream — so a stopped regenerate keeps the new branch instead of snapping
+  // back to the previous version. Abort is only a fallback if a stalled stream never winds down.
+  api("POST","/api/conversations/"+current.id+"/stop").catch(()=>{});
+  if(activeController){const c=activeController;clearTimeout(_stopFallback);_stopFallback=setTimeout(()=>{try{c.abort();}catch(_){}},4000);}
+}
 async function runStream(body,optimistic){
   if(busy||!current)return;setBusy(true);
   if(optimistic)optimistic();
@@ -3702,6 +3750,7 @@ function onPresetChange(){
   else if(v.indexOf("p:")===0)applyPresetById(v.slice(2));
   if(v!=="__custom__"){const c=sel.querySelector('option[value="__custom__"]');if(c)c.remove();sel.value=v;}
   updatePresetDel();
+  if(v!=="__custom__")applyParams();
 }
 async function savePresetDialog(){
   const model=$("#d_model").value;
@@ -3753,12 +3802,18 @@ async function openDrawer(){
   cs.value=current.character_id||"";
   if(isAdmin()){const es=$("#d_endpoint");es.innerHTML='<option value="">default ('+esc((endpointName(CFG.settings.active_endpoint)||{}).name||"-")+')</option>';
     CFG.settings.endpoints.forEach(e=>{const o=document.createElement("option");o.value=e.id;o.textContent=e.name;es.appendChild(o);});es.value=current.endpoint_id||"";
-    es.onchange=()=>refreshDrawerModels(es.value,$("#d_model").value);}
+    es.onchange=async()=>{await refreshDrawerModels(es.value,$("#d_model").value);buildPresetSelect();applyDrawer({endpoint_id:es.value||null,model:$("#d_model").value});};}
   await refreshDrawerModels(current.endpoint_id,current.model);
-  cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}else{$("#d_system").value="";}buildPresetSelect();};
-  $("#d_model").onchange=()=>buildPresetSelect();
+  cs.onchange=()=>{const c=charById(cs.value),patch={character_id:cs.value||null};
+    // picking a character applies its system prompt (+ model); picking "none" just detaches it and
+    // leaves the current prompt intact (no cancel button now, so don't wipe it out from under them).
+    if(c){$("#d_system").value=c.system||"";patch.system=c.system||"";if(c.model){rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);patch.model=c.model;}}
+    buildPresetSelect();applyDrawer(patch,{rerender:true,relist:true});};
+  $("#d_model").onchange=()=>{buildPresetSelect();applyDrawer({model:$("#d_model").value},{relist:true});};
   $("#d_system").value=current.system||"";
+  $("#d_system").oninput=applySystem;
   $("#d_tools").checked=!!current.tools;
+  $("#d_tools").onchange=()=>applyDrawer({tools:$("#d_tools").checked});
   buildParamsGrid($("#d_params"),current.params||{});
   buildPresetSelect();
   showOverlay($("#drawer"));
@@ -3768,11 +3823,15 @@ async function refreshDrawerModels(endpointId,value){
   if(isAdmin()&&endpointId){try{const r=await api("GET","/api/models?endpoint="+encodeURIComponent(endpointId));models=r.models;}catch(_){}}
   rebuildModelSelect($("#d_model"),models,value||current.model);
 }
-async function saveDrawer(){
-  const payload={character_id:$("#d_char").value||null,model:$("#d_model").value,system:$("#d_system").value,tools:$("#d_tools").checked,params:readParamsGrid($("#d_params"))};
-  if(isAdmin())payload.endpoint_id=$("#d_endpoint").value||null;
-  try{current=await api("POST","/api/conversations/"+current.id+"/settings",payload);closeOverlay($("#drawer"));renderConvo();refreshList();toast("saved");}catch(e){toast(e.message);}
+function debounce(fn,ms){let t;return function(){clearTimeout(t);t=setTimeout(fn,ms);};}
+async function applyDrawer(patch,opts){
+  if(!current)return;opts=opts||{};
+  try{current=await api("POST","/api/conversations/"+current.id+"/settings",patch);
+    syncBar();if(opts.rerender)renderConvo();if(opts.relist)refreshList();
+  }catch(e){toast(e.message);}
 }
+const applyParams=debounce(()=>applyDrawer({params:readParamsGrid($("#d_params"))}),350);
+const applySystem=debounce(()=>applyDrawer({system:$("#d_system").value}),450);
 
 // ---------------- sidebar collapse / resize
 function applySidebar(){
@@ -3970,13 +4029,12 @@ $("#themebtn").onclick=()=>applyTheme(curTheme()==="dark"?"light":"dark");
 $("#logoutbtn").onclick=async()=>{try{await api("POST","/api/logout");}catch(_){}; location.href="/login";};
 $("#modelsel").onchange=async()=>{if(current){try{current=await api("POST","/api/conversations/"+current.id+"/settings",{model:$("#modelsel").value});syncBar();toast("model: "+$("#modelsel").value);}catch(e){toast(e.message);syncBar();}}};
 $("#send").onclick=()=>busy?stopStream():send();
-$("#d_save").onclick=saveDrawer;
-$("#d_defaults").onclick=()=>{fillDefaults($("#d_params"));syncPresetSelect();};
-$("#d_clear").onclick=()=>{buildParamsGrid($("#d_params"),{});syncPresetSelect();};
+$("#d_defaults").onclick=()=>{fillDefaults($("#d_params"));syncPresetSelect();applyParams();};
+$("#d_clear").onclick=()=>{buildParamsGrid($("#d_params"),{});syncPresetSelect();applyParams();};
 $("#d_preset").onchange=onPresetChange;
 $("#d_preset_save").onclick=savePresetDialog;
 $("#d_preset_del").onclick=deletePreset;
-$("#d_params").addEventListener("input",syncPresetSelect);
+$("#d_params").addEventListener("input",()=>{syncPresetSelect();applyParams();});
 $$("[data-close-drawer]").forEach(b=>b.onclick=()=>closeOverlay($("#drawer")));
 $$("[data-close-modal]").forEach(b=>b.onclick=closeModal);
 $("#backdrop").onclick=closeAll;
