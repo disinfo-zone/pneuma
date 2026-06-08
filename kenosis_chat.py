@@ -22,6 +22,7 @@ import base64
 import hmac
 import hashlib
 import glob
+import random
 import sqlite3
 import threading
 import socket
@@ -176,7 +177,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
                 pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
-                allowed_models TEXT, disabled INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+                allowed_models TEXT, disabled INTEGER NOT NULL DEFAULT 0, persona TEXT, created TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS folders(
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, name TEXT NOT NULL,
@@ -219,6 +220,9 @@ def init_db():
             c.execute("ALTER TABLE conversations ADD COLUMN active_leaf_id TEXT")
         if "tools" not in ccols:
             c.execute("ALTER TABLE conversations ADD COLUMN tools INTEGER NOT NULL DEFAULT 0")
+        ucols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
+        if "persona" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN persona TEXT")
         c.commit()
         seed_settings()
         if not get_setting("tree_migrated"):
@@ -400,6 +404,7 @@ def create_user(name, pw, role="user", allowed=None):
 def user_public(u):
     return {"id": u["id"], "username": u["username"], "role": u["role"],
             "allowed_models": json.loads(u["allowed_models"]) if u["allowed_models"] else [],
+            "persona": (u["persona"] or "") if "persona" in u.keys() else "",
             "disabled": bool(u["disabled"]), "created": u["created"]}
 
 
@@ -801,6 +806,60 @@ def _attach_block(attachments):
     for a in attachments or []:
         parts.append("[Attached file: %s]\n%s" % (a.get("name", "file"), a.get("text", "")))
     return "\n\n".join(parts)
+
+
+def _roll_dice(spec):
+    spec = spec.strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d*)d(\d+)", spec)
+    if m:
+        n = min(int(m.group(1) or "1"), 100)
+        sides = max(1, min(int(m.group(2)), 1000))
+        return sum(random.randint(1, sides) for _ in range(max(0, n)))
+    if spec.isdigit() and int(spec) > 0:
+        return random.randint(1, int(spec))
+    return 0
+
+
+def apply_macros(text, ctx):
+    """SillyTavern-style {{macros}} for the system prompt. ctx provides user/char/model; time/date
+    are resolved at send time. Unknown macros are left untouched."""
+    if not text or "{{" not in text:
+        return text
+    now = datetime.now().astimezone()
+    simple = {
+        "user": ctx.get("user") or "User",
+        "char": ctx.get("char") or "Assistant",
+        "character": ctx.get("char") or "Assistant",
+        "model": ctx.get("model") or "",
+        "newline": "\n",
+        "time": now.strftime("%H:%M"),
+        "isotime": now.strftime("%H:%M:%S"),
+        "date": now.strftime("%Y-%m-%d"),
+        "isodate": now.strftime("%Y-%m-%d"),
+        "weekday": now.strftime("%A"),
+        "day": now.strftime("%d"),
+        "month": now.strftime("%B"),
+        "year": now.strftime("%Y"),
+    }
+
+    def repl(m):
+        raw = m.group(1).strip()
+        key = raw.lower()
+        if key in simple:
+            return simple[key]
+        if raw.startswith("//"):          # {{// comment}}
+            return ""
+        head, sep, rest = raw.partition(":")
+        if sep:
+            head = head.strip().lower()
+            if head in ("random", "pick"):
+                opts = [o.strip() for o in rest.split(",") if o.strip()]
+                return random.choice(opts) if opts else ""
+            if head == "roll":
+                return str(_roll_dice(rest))
+        return m.group(0)                 # unknown -> leave as typed
+
+    return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", repl, text)
 
 
 def build_api_messages(system, messages):
@@ -1492,6 +1551,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if u["role"] != "admin":
                 return self._json(403, {"error": "admin only"})
             return self._json(200, {"invites": list_invites()})
+
+        # --- admin read-only peek at another user's chats + characters (no write endpoints exist)
+        m = re.fullmatch(r"/api/admin/users/([0-9]+)", path)
+        if m:
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            tu = user_by_id(int(m.group(1)))
+            if tu is None:
+                return self._json(404, {"error": "not found"})
+            chars = [{"id": r["id"], "name": r["name"], "avatar": r["avatar"] or "", "model": r["model"],
+                      "scope": r["scope"], "system": r["system"] or ""}
+                     for r in db().execute("SELECT * FROM characters WHERE owner_id=? ORDER BY name COLLATE NOCASE", (tu["id"],)).fetchall()]
+            return self._json(200, {"user": user_public(tu), "conversations": list_convos(tu), "characters": chars})
+        m = re.fullmatch(r"/api/admin/conversations/([^/]+)", path)
+        if m and valid_id(m.group(1)):
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            c = get_convo(m.group(1), None)   # None owner = bypass ownership (read-only view)
+            return self._json(200, c) if c else self._json(404, {"error": "not found"})
+
         m = re.fullmatch(r"/api/conversations/([^/]+)", path)
         if m and valid_id(m.group(1)):
             c = get_convo(m.group(1), u)
@@ -1666,6 +1745,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with db():
                 db().execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(payload["new"]), u["id"]))
             return self._json(200, {"ok": True})
+
+        if path == "/api/account":
+            persona = (payload.get("persona") or "").strip()[:60]
+            with db():
+                db().execute("UPDATE users SET persona=? WHERE id=?", (persona or None, u["id"]))
+            return self._json(200, {"me": user_public(user_by_id(u["id"]))})
 
         if path == "/api/extract":
             name = (payload.get("name") or "file").strip()
@@ -1939,6 +2024,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ep, model, system, params = resolve_request(convo)
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
+        char_row = character_by_id(convo.get("character_id")) if convo.get("character_id") else None
+        system = apply_macros(system, {"user": (u["persona"] if "persona" in u.keys() else None) or u["username"],
+                                       "char": char_row["name"] if char_row else None, "model": model})
         tools = TOOLS_SPEC if convo.get("tools") else None
         clear_stop(cid)   # drop any stale stop flag from a prior run on this conversation
 
@@ -2851,6 +2939,24 @@ PAGE_HEAD = r"""<!doctype html>
   .tabs button{background:none;border:none;color:var(--faint);padding:9px 13px;font-family:var(--mono);font-size:11px;letter-spacing:.09em;text-transform:uppercase;cursor:pointer;border-radius:8px 8px 0 0;}
   .tabs button.active{color:var(--text);background:var(--surface);}
   .tab-body{flex:1;overflow-y:auto;padding:18px 20px;background:var(--surface);}
+  #peekmodal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:72;padding:20px;}
+  #peekmodal.show{display:flex;}
+  .peek-card{width:1040px;height:88vh;height:88dvh;}
+  #peek-tabs{margin-left:6px;}
+  .peek-body{flex:1;min-height:0;background:var(--surface);display:flex;overflow:hidden;}
+  .peek-pane{flex:1;min-height:0;display:flex;}
+  #peek-chars{display:none;overflow-y:auto;padding:16px 18px;flex-direction:column;gap:10px;}
+  .peek-list{flex:0 0 300px;width:300px;overflow-y:auto;border-right:1px solid var(--line);padding:10px;}
+  .peek-view{flex:1;min-width:0;overflow-y:auto;padding:16px 22px;}
+  .peek-view .wrap{max-width:none;}
+  .peek-item{padding:9px 11px;border-radius:9px;cursor:pointer;margin-bottom:3px;}
+  .peek-item:hover,.peek-item.on{background:var(--panel);}
+  .peek-item .pt{font-family:var(--serif);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .peek-item .ps{font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.02em;margin-top:2px;}
+  .peek-hint{color:var(--faint);font-family:var(--mono);font-size:12px;padding:24px;text-align:center;}
+  .peek-char .cn{font-family:var(--serif);font-size:15px;margin-bottom:6px;}
+  .peek-sys{font-family:var(--mono);font-size:11.5px;color:var(--muted);white-space:pre-wrap;line-height:1.55;max-height:240px;overflow:auto;background:var(--bg);border-radius:8px;padding:10px 12px;}
+  @media (max-width:680px){.peek-card{height:90vh;height:90dvh;} .peek-list{flex-basis:42%;width:42%;}}
   .tab-pane{display:none;} .tab-pane.active{display:block;}
 
   label.fld{display:block;margin:14px 0 0;} label.fld:first-child{margin-top:0;}
@@ -3036,7 +3142,10 @@ PAGE_BODY = r"""
       <div class="tabs" id="tabs"></div>
       <div class="tab-body">
         <div class="tab-pane" id="tab-account">
-          <div class="lbl" style="margin-bottom:10px;">change password</div>
+          <div class="lbl" style="margin-bottom:10px;">your name</div>
+          <label class="fld"><span class="lab">display name <span class="sub">fills <code>{{user}}</code> in prompts · blank = your username</span></span><input type="text" id="ac_persona" maxlength="60" placeholder="e.g. Alex"></label>
+          <div class="edit-row" style="margin-top:10px;"><button class="btn-primary" id="ac_persona_save">save name</button></div>
+          <div class="lbl" style="margin:24px 0 10px;">change password</div>
           <label class="fld"><span class="lab">current password</span><input type="password" id="ac_old"></label>
           <label class="fld"><span class="lab">new password <span class="sub">(min 8)</span></span><input type="password" id="ac_new"></label>
           <label class="fld"><span class="lab">confirm new</span><input type="password" id="ac_new2"></label>
@@ -3069,6 +3178,7 @@ PAGE_BODY = r"""
             <label class="fld"><span class="lab">mark <span class="sub">1-2 chars/glyph, optional</span></span><input type="text" id="ch_avatar" maxlength="2" placeholder="A"></label>
             <label class="fld"><span class="lab">default model <span class="sub">optional</span></span><select id="ch_model"></select></label>
             <label class="fld"><span class="lab">system prompt</span><textarea id="ch_system"></textarea></label>
+            <div class="hintbox" style="margin-top:8px;">Macros (resolved when sending): <code>{{user}}</code> <code>{{char}}</code> <code>{{model}}</code> <code>{{time}}</code> <code>{{date}}</code> <code>{{weekday}}</code> <code>{{random:a,b,c}}</code> <code>{{roll:2d6}}</code> <code>{{newline}}</code></div>
             <div class="toggle-row" id="ch_sitewrap" style="display:none;"><input type="checkbox" id="ch_site"><label for="ch_site" style="cursor:pointer;">make site-wide (all users, read-only to them)</label></div>
             <div class="edit-row" style="margin-top:14px;"><button class="btn-primary" id="ch_save">save character</button><button class="btn-ghost" id="ch_cancel">cancel</button></div>
           </div>
@@ -3129,6 +3239,18 @@ PAGE_BODY = r"""
 
   <div id="menu"></div>
   <div id="dlgwrap"><div class="dlg" id="dlg"></div></div>
+  <div id="peekmodal">
+    <div class="modal-card peek-card">
+      <div class="mhead"><h3 id="peek-title">user</h3><div class="seg" id="peek-tabs"><button data-pt="chats" class="on">chats</button><button data-pt="chars">characters</button></div><button class="x" data-close-peek>&times;</button></div>
+      <div class="peek-body">
+        <div id="peek-chats" class="peek-pane">
+          <div class="peek-list" id="peek-convos"></div>
+          <div class="peek-view" id="peek-view"></div>
+        </div>
+        <div id="peek-chars" class="peek-pane" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
   <div id="backdrop"></div>
   <div id="tipbox" class="tipbox" role="tooltip"></div>
   <div id="toast"></div>
@@ -3251,6 +3373,7 @@ async function loadConfig(){
   CFG=await api("GET","/api/config");
   CFG.characters=CFG.characters||[];CFG.models=CFG.models||[];CFG.presets=CFG.presets||[];folderCache=CFG.folders||[];
   $("#who-nm").textContent=CFG.me.username;$("#who-rl").textContent=CFG.me.role;
+  $("#ac_persona").value=CFG.me.persona||"";
   if(!isAdmin())$("#d_endpoint_wrap").style.display="none";
   buildTabs();
   rebuildModelSelect($("#modelsel"),CFG.models);
@@ -3928,11 +4051,67 @@ function renderUsers(){
   const list=$("#user-list");list.innerHTML="";
   userCache.forEach(u=>{const row=document.createElement("div");row.className="row-card";
     const am=u.allowed_models&&u.allowed_models.length?u.allowed_models.join(", "):(u.role==="admin"?"all (admin)":"global default");
-    row.innerHTML='<div class="cav">'+esc(u.username.slice(0,2).toUpperCase())+'</div><div class="cmain"><div class="cn">'+esc(u.username)+'<span class="badge">'+esc(u.role)+'</span>'+(u.disabled?'<span class="badge" style="color:var(--danger)">disabled</span>':'')+'</div><div class="cs">models: '+esc(am)+'</div></div><div class="cbtns"><button class="mini" data-edit>edit</button><button class="mini danger" data-del>del</button></div>';
+    row.innerHTML='<div class="cav">'+esc(u.username.slice(0,2).toUpperCase())+'</div><div class="cmain"><div class="cn">'+esc(u.username)+'<span class="badge">'+esc(u.role)+'</span>'+(u.disabled?'<span class="badge" style="color:var(--danger)">disabled</span>':'')+'</div><div class="cs">models: '+esc(am)+'</div></div><div class="cbtns"><button class="mini" data-peek title="read-only view of this user\'s chats and characters">view</button><button class="mini" data-edit>edit</button><button class="mini danger" data-del>del</button></div>';
+    row.querySelector("[data-peek]").onclick=()=>openPeek(u.id,u.username);
     row.querySelector("[data-edit]").onclick=()=>editUser(u);
     row.querySelector("[data-del]").onclick=async()=>{if(!await uiConfirm("Delete user '"+u.username+"' and ALL their conversations?",{danger:true,ok:"Delete"}))return;try{const r=await api("DELETE","/api/users/"+u.id);userCache=r.users;renderUsers();toast("deleted");}catch(e){toast(e.message);}};
     list.appendChild(row);});
 }
+// ---------------- admin read-only peek at a user's chats + characters
+let peekData=null;
+function peekMsgEl(m,charName,userName){
+  if(m.role==="tool")return toolResultEl(m);
+  if(m.role==="assistant"&&m.tool&&m.tool.tool_calls&&!(m.content||"").trim()){const s=document.createElement("div");s.style.display="none";return s;}
+  const d=document.createElement("div");d.className="msg "+m.role;
+  const role=m.role==="user"?(userName||"user"):(charName||"assistant");
+  const reason=m.reasoning?'<details class="reason"><summary>reasoning</summary><div class="rbody">'+esc(m.reasoning)+'</div></details>':"";
+  const edited=m.edited?' · edited':'';
+  const mark=m.rating?'<span class="ratemark '+(m.rating>0?'up':'down')+'">'+(m.rating>0?'&#9650;':'&#9660;')+'</span>':'';
+  let disp=m.content||"";
+  if(m.role==="assistant"&&disp.indexOf("<tool_call>")>=0)disp=stripTC(disp)||"";
+  const body=m.role==="assistant"?'<div class="bubble">'+md(disp)+'</div>':'<div class="bubble raw">'+esc(m.content)+'</div>';
+  d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm">'+esc(fmtTime(m.ts)+edited)+'</span>'+mark+'</div>'+reason+attsHtml(m)+body+metaLine(m);
+  const mk=d.querySelector(".meta .pill.k"),mtip=paramsTipText(m);
+  if(mk&&mtip){mk.classList.add("has-tip");bindTip(mk,mtip);}
+  return d;
+}
+function peekCharName(cid){const c=(peekData&&peekData.characters||[]).find(x=>x.id===cid);return c?c.name:"assistant";}
+async function openPeek(uid,username){
+  let d;try{d=await api("GET","/api/admin/users/"+uid);}catch(e){toast(e.message);return;}
+  peekData=d;
+  $("#peek-title").textContent="\u{1F441} "+username+" · read-only";
+  $$("#peek-tabs button").forEach(b=>b.classList.toggle("on",b.dataset.pt==="chats"));
+  $("#peek-chats").style.display="flex";$("#peek-chars").style.display="none";
+  renderPeekConvos();renderPeekChars();
+  $("#peek-view").innerHTML='<div class="peek-hint">select a conversation to read</div>';
+  closeModal();
+  $("#backdrop").classList.add("show");$("#peekmodal").classList.add("show");
+}
+function renderPeekConvos(){
+  const L=$("#peek-convos");L.innerHTML="";
+  if(!peekData.conversations.length){L.innerHTML='<div class="peek-hint">no conversations</div>';return;}
+  peekData.conversations.forEach(c=>{const it=document.createElement("div");it.className="peek-item";
+    it.innerHTML='<div class="pt">'+esc(c.title||"untitled")+'</div><div class="ps">'+esc((c.model||"?")+" · "+relTime(c.updated)+" · "+(c.turns||0)+" msgs")+'</div>';
+    it.onclick=()=>{$$("#peek-convos .peek-item").forEach(x=>x.classList.remove("on"));it.classList.add("on");openPeekConvo(c.id);};
+    L.appendChild(it);});
+}
+async function openPeekConvo(cid){
+  const V=$("#peek-view");V.innerHTML='<div class="peek-hint">loading…</div>';
+  let convo;try{convo=await api("GET","/api/admin/conversations/"+cid);}catch(e){V.innerHTML='<div class="peek-hint">'+esc(e.message)+'</div>';return;}
+  const charName=peekCharName(convo.character_id),userName=peekData.user.username;
+  V.innerHTML="";const wrap=document.createElement("div");wrap.className="wrap";
+  (convo.messages||[]).forEach(m=>{if(m.role==="user"||m.role==="assistant"||m.role==="tool")wrap.appendChild(peekMsgEl(m,charName,userName));});
+  if(!wrap.children.length)wrap.innerHTML='<div class="peek-hint">empty conversation</div>';
+  V.appendChild(wrap);V.scrollTop=0;
+}
+function renderPeekChars(){
+  const L=$("#peek-chars");L.innerHTML="";
+  if(!peekData.characters.length){L.innerHTML='<div class="peek-hint">no characters</div>';return;}
+  peekData.characters.forEach(c=>{const card=document.createElement("div");card.className="ep-card peek-char";
+    card.innerHTML='<div class="cn">'+esc((c.avatar?c.avatar+" ":"")+c.name)+(c.scope==="site"?' <span class="badge">site</span>':'')+(c.model?' <span class="badge">'+esc(c.model)+'</span>':'')+'</div><div class="peek-sys">'+esc(c.system||"(no system prompt)")+'</div>';
+    L.appendChild(card);});
+}
+function closePeek(){$("#peekmodal").classList.remove("show");if(!$("#modal").classList.contains("show")&&!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");peekData=null;}
 function userModelPick(selected){const wrap=$("#us_models");wrap.innerHTML="";const sel=new Set(selected||[]);
   (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(sel.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
 function editUser(u){$("#user-edit").style.display="block";
@@ -3993,6 +4172,7 @@ async function createInvite(){
 async function changePassword(){const o=$("#ac_old").value,n=$("#ac_new").value,n2=$("#ac_new2").value;
   if(n!==n2){toast("passwords do not match");return;}
   try{await api("POST","/api/account/password",{old:o,new:n});$("#ac_old").value=$("#ac_new").value=$("#ac_new2").value="";toast("password changed");}catch(e){toast(e.message);}}
+async function savePersona(){try{const r=await api("POST","/api/account",{persona:$("#ac_persona").value.trim()});CFG.me=r.me;toast("name saved");}catch(e){toast(e.message);}}
 async function deleteAccount(){
   if(!await uiConfirm("Delete your account and EVERYTHING you own (chats, folders, private characters)? This cannot be undone.",{danger:true,ok:"Delete account"}))return;
   const c=await uiPrompt("Type your username to confirm:","",{title:"Confirm deletion",ok:"Delete forever"});
@@ -4006,7 +4186,7 @@ function showModal(){$("#backdrop").classList.add("show");$("#modal").classList.
 function closeModal(){$("#modal").classList.remove("show");if(!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");}
 function openSidebar(){$("#sidebar").classList.add("show");$("#backdrop").classList.add("show");}
 function closeSidebar(){$("#sidebar").classList.remove("show");if(!$("#modal").classList.contains("show")&&!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");}
-function closeAll(){$("#drawer").classList.remove("show");closeModal();$("#sidebar").classList.remove("show");$("#backdrop").classList.remove("show");hideMenu();}
+function closeAll(){$("#drawer").classList.remove("show");closeModal();$("#peekmodal").classList.remove("show");peekData=null;$("#sidebar").classList.remove("show");$("#backdrop").classList.remove("show");hideMenu();}
 
 // ---------------- wire up
 $("#newbtn").onclick=newChat;
@@ -4037,6 +4217,8 @@ $("#d_preset_del").onclick=deletePreset;
 $("#d_params").addEventListener("input",()=>{syncPresetSelect();applyParams();});
 $$("[data-close-drawer]").forEach(b=>b.onclick=()=>closeOverlay($("#drawer")));
 $$("[data-close-modal]").forEach(b=>b.onclick=closeModal);
+$$("[data-close-peek]").forEach(b=>b.onclick=closePeek);
+$$("#peek-tabs button").forEach(b=>b.onclick=()=>{$$("#peek-tabs button").forEach(x=>x.classList.toggle("on",x===b));const t=b.dataset.pt;$("#peek-chats").style.display=t==="chats"?"flex":"none";$("#peek-chars").style.display=t==="chars"?"flex":"none";});
 $("#backdrop").onclick=closeAll;
 $("#ep-add").onclick=addEndpoint;
 $("#settings-save").onclick=saveSettings;
@@ -4052,6 +4234,7 @@ $("#invite-add").onclick=newInvite;
 $("#iv_save").onclick=createInvite;
 $("#iv_cancel").onclick=()=>$("#invite-edit").style.display="none";
 $("#ac_save").onclick=changePassword;
+$("#ac_persona_save").onclick=savePersona;
 $("#acctdel").onclick=deleteAccount;
 $("#exportall").onclick=()=>{const a=document.createElement("a");a.href="/api/export";a.click();toast("exporting…");};
 $$("#themeseg button").forEach(b=>b.onclick=()=>applyTheme(b.dataset.th));
