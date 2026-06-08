@@ -758,6 +758,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/favicon.ico":
             return self._send(204, "image/x-icon", b"")
+        if path == "/favicon.svg":
+            return self._send(200, "image/svg+xml; charset=utf-8", FAVICON_SVG,
+                              [("Cache-Control", "public, max-age=604800")])
+        if path == "/og-image.png":
+            return self._send(200, "image/png", og_image_png(),
+                              [("Cache-Control", "public, max-age=86400")])
+        if path in ("/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"):
+            return self._send(200, "image/png", apple_icon_png(),
+                              [("Cache-Control", "public, max-age=604800")])
         if path == "/api/setup-status":
             return self._json(200, {"needs_setup": user_count() == 0})
         if path == "/login":
@@ -1223,8 +1232,306 @@ AUTH_CSS = r"""
   .err{color:var(--danger);font-size:13px;margin-top:14px;min-height:16px;font-family:var(--mono);}
 """
 
+# ============================================================ branding / icons
+# A procedurally-generated alchemical sigil: a {7/3} heptagram (seven points for
+# the seven models on the endpoint) ringed around an all-seeing, serpent-slit
+# oracle eye. Gold-on-black to match the ORACLE theme. The favicon ships as crisp
+# vector SVG; the Open Graph card (1200x630) and Apple touch icon (180x180) are
+# rendered to PNG in pure stdlib (zlib + struct) — no image libs, no build step —
+# computed once on first request and cached.
+
+PUBLIC_URL = os.environ.get("KENOSIS_PUBLIC_URL", "https://delphi.disinfo.zone").rstrip("/")
+
+FAVICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+<defs>
+<radialGradient id="disc" cx="50%" cy="46%" r="62%">
+<stop offset="0%" stop-color="#241a0f"/><stop offset="60%" stop-color="#140f09"/><stop offset="100%" stop-color="#0b0805"/>
+</radialGradient>
+<linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="#f7e3a1"/><stop offset="50%" stop-color="#d9a64c"/><stop offset="100%" stop-color="#a9772a"/>
+</linearGradient>
+<radialGradient id="eyeglow" cx="50%" cy="50%" r="60%">
+<stop offset="0%" stop-color="#fff6dd"/><stop offset="55%" stop-color="#f3cd84"/><stop offset="100%" stop-color="#d9a84e"/>
+</radialGradient>
+<radialGradient id="iris" cx="50%" cy="50%" r="58%">
+<stop offset="0%" stop-color="#e9b65e"/><stop offset="60%" stop-color="#b07e30"/><stop offset="100%" stop-color="#5e3f16"/>
+</radialGradient>
+</defs>
+<circle cx="32" cy="32" r="31" fill="url(#disc)"/>
+<circle cx="32" cy="32" r="30" fill="none" stroke="url(#gold)" stroke-width="1" opacity="0.5"/>
+<circle cx="32" cy="32" r="27.5" fill="none" stroke="#a9772a" stroke-width="0.6" stroke-dasharray="0.6 3" opacity="0.6"/>
+<g fill="none" stroke-linejoin="round">
+<path d="M32 8 L42.41 53.62 L13.24 17.04 L55.40 37.34 L8.60 37.34 L50.76 17.04 L21.59 53.62 Z" stroke="#e9b85e" stroke-width="3" opacity="0.16"/>
+<path d="M32 8 L42.41 53.62 L13.24 17.04 L55.40 37.34 L8.60 37.34 L50.76 17.04 L21.59 53.62 Z" stroke="url(#gold)" stroke-width="1.4"/>
+</g>
+<g fill="#f7e3a1">
+<circle cx="32" cy="8" r="1.4"/><circle cx="50.76" cy="17.04" r="1.4"/><circle cx="55.40" cy="37.34" r="1.4"/><circle cx="42.41" cy="53.62" r="1.4"/><circle cx="21.59" cy="53.62" r="1.4"/><circle cx="8.60" cy="37.34" r="1.4"/><circle cx="13.24" cy="17.04" r="1.4"/>
+</g>
+<g>
+<path d="M20.5 32 Q32 23 43.5 32 Q32 41 20.5 32 Z" fill="url(#eyeglow)" stroke="url(#gold)" stroke-width="0.8"/>
+<circle cx="32" cy="32" r="4" fill="url(#iris)"/>
+<ellipse cx="32" cy="32" rx="1" ry="3.3" fill="#0c0905"/>
+<circle cx="30.6" cy="30.6" r="0.8" fill="#fffaf0" opacity="0.85"/>
+</g>
+</svg>"""
+
+_OG_DESC = "A private oracle - authenticated chat with local language models. Pneuma, kenosis, prophecy. Entry by invitation only."
+_OG_ALT = "A glowing golden seven-pointed star with a serpent-eyed oracle at its center."
+META_TAGS = (
+    '<meta name="description" content="' + _OG_DESC + '">' +
+    '<meta name="keywords" content="ORACLE, pneuma, kenosis, Delphi, oracle, LLM chat, local AI, disinfo.zone">' +
+    '<meta name="author" content="disinfo.zone">' +
+    '<meta name="theme-color" content="#100c08">' +
+    '<meta name="color-scheme" content="dark light">' +
+    '<meta name="robots" content="noindex, nofollow">' +
+    '<link rel="canonical" href="' + PUBLIC_URL + '/">' +
+    '<link rel="icon" type="image/svg+xml" href="/favicon.svg">' +
+    '<link rel="alternate icon" type="image/png" sizes="180x180" href="/apple-touch-icon.png">' +
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' +
+    '<meta property="og:type" content="website">' +
+    '<meta property="og:site_name" content="ORACLE">' +
+    '<meta property="og:title" content="ORACLE">' +
+    '<meta property="og:description" content="' + _OG_DESC + '">' +
+    '<meta property="og:url" content="' + PUBLIC_URL + '/">' +
+    '<meta property="og:image" content="' + PUBLIC_URL + '/og-image.png">' +
+    '<meta property="og:image:secure_url" content="' + PUBLIC_URL + '/og-image.png">' +
+    '<meta property="og:image:type" content="image/png">' +
+    '<meta property="og:image:width" content="1200">' +
+    '<meta property="og:image:height" content="630">' +
+    '<meta property="og:image:alt" content="' + _OG_ALT + '">' +
+    '<meta name="twitter:card" content="summary_large_image">' +
+    '<meta name="twitter:title" content="ORACLE">' +
+    '<meta name="twitter:description" content="' + _OG_DESC + '">' +
+    '<meta name="twitter:image" content="' + PUBLIC_URL + '/og-image.png">' +
+    '<meta name="twitter:image:alt" content="' + _OG_ALT + '">'
+)
+
+_BRAND_LOCK = threading.Lock()
+_BRAND_CACHE = {}
+
+
+def _sigil_png(W, H, R, eye_w, eye_h, iris_r, slit_rx, slit_ry, point_r,
+               ring1, ring2, line_half, glow_r, stars):
+    """Render the ORACLE sigil to PNG bytes using only the standard library."""
+    import math, zlib, struct
+    cx, cy = W / 2, H / 2
+    BG_TOP, BG_BOT = (20, 15, 9), (10, 8, 5)
+    GLOW = (70, 48, 18)
+    GOLD, GOLD_HI, GOLD_LO = (233, 184, 94), (247, 227, 161), (169, 119, 42)
+    EYE_PALE, EYE_MID, EYE_EDGE = (255, 246, 221), (243, 205, 132), (217, 168, 78)
+    IRIS_HI, IRIS_MID, IRIS_LO = (233, 182, 94), (176, 126, 48), (94, 63, 22)
+    PUPIL, HILITE, STAR = (12, 9, 5), (255, 250, 240), (200, 170, 110)
+    buf = bytearray(W * H * 3)
+
+    def lerp(a, b, t):
+        return (a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t)
+
+    def blend(x, y, c, a):
+        if a <= 0 or x < 0 or y < 0 or x >= W or y >= H:
+            return
+        i = (int(y) * W + int(x)) * 3
+        if a >= 1:
+            buf[i], buf[i+1], buf[i+2] = int(c[0]), int(c[1]), int(c[2])
+        else:
+            ia = 1 - a
+            buf[i]   = int(buf[i]   * ia + c[0] * a)
+            buf[i+1] = int(buf[i+1] * ia + c[1] * a)
+            buf[i+2] = int(buf[i+2] * ia + c[2] * a)
+
+    def addlight(x, y, c, f):
+        if f <= 0 or x < 0 or y < 0 or x >= W or y >= H:
+            return
+        i = (int(y) * W + int(x)) * 3
+        buf[i]   = min(255, int(buf[i]   + c[0] * f))
+        buf[i+1] = min(255, int(buf[i+1] + c[1] * f))
+        buf[i+2] = min(255, int(buf[i+2] + c[2] * f))
+
+    # background: vertical gradient + radial amber glow + corner vignette
+    maxd = math.hypot(W, H) / 2
+    glow_rad = R * 1.45
+    for y in range(H):
+        base = lerp(BG_TOP, BG_BOT, y / (H - 1))
+        dy2 = (y - cy) ** 2
+        row = y * W * 3
+        for x in range(W):
+            d = math.sqrt((x - cx) ** 2 + dy2)
+            g = max(0.0, 1 - d / glow_rad); g = g * g * 0.9
+            vig = 1 - 0.35 * (d / maxd) ** 2
+            i = row + x * 3
+            buf[i]   = min(255, int(base[0] * vig + GLOW[0] * g))
+            buf[i+1] = min(255, int(base[1] * vig + GLOW[1] * g))
+            buf[i+2] = min(255, int(base[2] * vig + GLOW[2] * g))
+
+    # faint starfield (deterministic LCG), kept clear of the central disc
+    if stars:
+        seed = 1337
+        for _ in range(70):
+            seed = (1103515245 * seed + 12345) & 0x7fffffff; sx = seed % W
+            seed = (1103515245 * seed + 12345) & 0x7fffffff; sy = seed % H
+            seed = (1103515245 * seed + 12345) & 0x7fffffff
+            br = 0.12 + (seed % 100) / 100 * 0.33
+            if math.hypot(sx - cx, sy - cy) < R * 1.05:
+                continue
+            addlight(sx, sy, STAR, br)
+            addlight(sx + 1, sy, STAR, br * 0.4)
+            addlight(sx, sy + 1, STAR, br * 0.4)
+
+    # heptagram {7/3}
+    pts = []
+    for k in range(7):
+        ang = math.radians(-90 + k * (360 / 7))
+        pts.append((cx + R * math.cos(ang), cy + R * math.sin(ang)))
+    order = [0, 3, 6, 2, 5, 1, 4]
+    segs = [(pts[order[i]], pts[order[(i + 1) % 7]]) for i in range(7)]
+
+    def line(p0, p1, half, col, glowf=0.0):
+        x0, y0 = p0; x1, y1 = p1
+        ext = half + (glow_r if glowf else 1) + 1
+        minx = max(0, int(min(x0, x1) - ext)); maxx = min(W - 1, int(max(x0, x1) + ext))
+        miny = max(0, int(min(y0, y1) - ext)); maxy = min(H - 1, int(max(y0, y1) + ext))
+        dx = x1 - x0; dy = y1 - y0; L2 = dx*dx + dy*dy or 1
+        for y in range(miny, maxy + 1):
+            for x in range(minx, maxx + 1):
+                t = ((x - x0) * dx + (y - y0) * dy) / L2
+                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                d = math.hypot(x - (x0 + t*dx), y - (y0 + t*dy))
+                if glowf:
+                    gg = max(0.0, 1 - d / glow_r)
+                    if gg > 0:
+                        addlight(x, y, col, gg * gg * glowf)
+                a = half - d + 0.5
+                if a > 0:
+                    blend(x, y, col, min(1.0, a))
+
+    for p0, p1 in segs:
+        line(p0, p1, line_half, GOLD, glowf=0.5)
+    for p0, p1 in segs:
+        line(p0, p1, line_half, GOLD)
+
+    # talisman rings
+    def ring(r, hw, col, a_mul=1.0):
+        ext = hw + 2
+        for y in range(max(0, int(cy - r - ext)), min(H, int(cy + r + ext))):
+            dy2 = (y - cy) ** 2
+            for x in range(max(0, int(cx - r - ext)), min(W, int(cx + r + ext))):
+                a = hw - abs(math.sqrt((x - cx) ** 2 + dy2) - r) + 0.5
+                if a > 0:
+                    blend(x, y, col, min(1.0, a) * a_mul)
+
+    def dashed_ring(r, hw, col, dashes, duty, a_mul):
+        for j in range(dashes):
+            a0 = (j / dashes) * 2 * math.pi
+            a1 = a0 + (duty / dashes) * 2 * math.pi
+            for s in range(9):
+                ang = a0 + (a1 - a0) * s / 8
+                px = cx + r * math.cos(ang); py = cy + r * math.sin(ang)
+                for oy in (-1, 0, 1):
+                    for ox in (-1, 0, 1):
+                        aa = hw - math.hypot(ox, oy) + 0.4
+                        if aa > 0:
+                            blend(int(px) + ox, int(py) + oy, col, min(1.0, aa) * a_mul)
+
+    ring(ring1, 1.4, GOLD, 0.6)
+    dashed_ring(ring2, 1.0, GOLD_LO, 84, 0.5, 0.6)
+
+    # seven points
+    def disc(px, py, r, col, glowf=0.0, gr=14.0):
+        ext = r + (gr if glowf else 1) + 1
+        for y in range(max(0, int(py - ext)), min(H, int(py + ext + 1))):
+            for x in range(max(0, int(px - ext)), min(W, int(px + ext + 1))):
+                d = math.hypot(x - px, y - py)
+                if glowf:
+                    gg = max(0.0, 1 - d / gr)
+                    if gg > 0:
+                        addlight(x, y, col, gg * gg * glowf)
+                a = r - d + 0.5
+                if a > 0:
+                    blend(x, y, col, min(1.0, a))
+
+    for (px, py) in pts:
+        disc(px, py, point_r, GOLD_HI, glowf=0.6, gr=16)
+
+    # the eye: parabolic-lid lens
+    def lid(x):
+        u = (x - cx) / eye_w
+        return -1 if abs(u) >= 1 else eye_h * (1 - u * u)
+
+    for y in range(max(0, int(cy - eye_h - 2)), min(H, int(cy + eye_h + 3))):
+        for x in range(max(0, int(cx - eye_w - 2)), min(W, int(cx + eye_w + 3))):
+            l = lid(x)
+            if l < 0:
+                continue
+            cover = l - abs(y - cy) + 0.5
+            if cover <= 0:
+                continue
+            rr = math.hypot((x - cx) / eye_w, (y - cy) / eye_h)
+            col = lerp(EYE_PALE, EYE_MID, rr / 0.5) if rr < 0.5 else lerp(EYE_MID, EYE_EDGE, min(1.0, (rr - 0.5) / 0.5))
+            blend(x, y, col, min(1.0, cover))
+
+    # gold rim along both lids
+    rim_steps = int(eye_w * 2)
+    for s in range(rim_steps + 1):
+        x = cx - eye_w + (2 * eye_w) * s / rim_steps
+        l = lid(x)
+        if l < 0:
+            continue
+        for sign in (1, -1):
+            yy = cy + sign * l
+            for oy in (-1, 0, 1):
+                a = 1.3 - abs(oy)
+                if a > 0:
+                    blend(int(x), int(yy) + oy, GOLD, min(1.0, a) * 0.9)
+
+    # iris
+    for y in range(int(cy - iris_r - 1), int(cy + iris_r + 2)):
+        for x in range(int(cx - iris_r - 1), int(cx + iris_r + 2)):
+            d = math.hypot(x - cx, y - cy)
+            a = iris_r - d + 0.5
+            if a <= 0:
+                continue
+            t = d / iris_r
+            col = lerp(IRIS_HI, IRIS_MID, t / 0.6) if t < 0.6 else lerp(IRIS_MID, IRIS_LO, (t - 0.6) / 0.4)
+            blend(x, y, col, min(1.0, a))
+
+    # serpent slit pupil
+    for y in range(int(cy - slit_ry - 1), int(cy + slit_ry + 2)):
+        for x in range(int(cx - slit_rx - 1), int(cx + slit_rx + 2)):
+            rr = math.hypot((x - cx) / slit_rx, (y - cy) / slit_ry)
+            a = (1 - rr) * slit_rx + 0.5
+            if a > 0:
+                blend(x, y, PUPIL, min(1.0, a))
+
+    disc(cx - iris_r * 0.35, cy - iris_r * 0.35, max(2, iris_r * 0.14), HILITE)
+
+    # encode PNG (RGB, no filtering)
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data +
+                struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+    raw = bytearray(); stride = W * 3
+    for y in range(H):
+        raw.append(0); raw += buf[y * stride:(y + 1) * stride]
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+            chunk(b"IEND", b""))
+
+
+def og_image_png():
+    with _BRAND_LOCK:
+        if "og" not in _BRAND_CACHE:
+            _BRAND_CACHE["og"] = _sigil_png(1200, 630, 250, 150, 60, 44, 10, 34, 6, 282, 262, 3.4, 15.0, True)
+    return _BRAND_CACHE["og"]
+
+
+def apple_icon_png():
+    with _BRAND_LOCK:
+        if "apple" not in _BRAND_CACHE:
+            _BRAND_CACHE["apple"] = _sigil_png(180, 180, 74, 46, 19, 13.5, 3.2, 10.5, 2.2, 85, 79, 1.3, 5.0, False)
+    return _BRAND_CACHE["apple"]
+
+
 LOGIN_PAGE = (r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>oracle · sign in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>oracle · sign in</title>""" + META_TAGS + r"""
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap" rel="stylesheet">
 <style>""" + AUTH_CSS + r"""</style></head><body>
@@ -1246,7 +1553,7 @@ document.getElementById("f").onsubmit=async(ev)=>{ev.preventDefault();const e=do
 </script></body></html>""")
 
 SETUP_PAGE = (r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>oracle · setup</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>oracle · setup</title>""" + META_TAGS + r"""
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap" rel="stylesheet">
 <style>""" + AUTH_CSS + r"""</style></head><body>
@@ -1274,7 +1581,7 @@ PAGE_HEAD = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>oracle</title>
+<title>oracle</title>""" + META_TAGS + r"""
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap" rel="stylesheet">
 <script>
