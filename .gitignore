@@ -3,6 +3,9 @@ chat.db
 chat.db-wal
 chat.db-shm
 data/
+local.env
+*.env
+HANDOFF.md
 
 # python
 __pycache__/
