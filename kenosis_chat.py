@@ -23,9 +23,12 @@ import hmac
 import hashlib
 import sqlite3
 import threading
+import socket
+import ipaddress
 import requests
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from html.parser import HTMLParser
+from urllib.parse import urlparse, parse_qs, urlunparse, urljoin
 
 # ---------------------------------------------------------------- config
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +43,16 @@ COOKIE_NAME = "ksession"
 MAX_TOKENS = 32768
 REQUEST_TIMEOUT = 1800
 PBKDF2_ITERS = 240000
+
+# Attachments (uploaded files folded into a user turn) and the web-fetch tool.
+DEFAULT_CONTEXT = 8192               # fallback context window when /v1/models doesn't report one
+ATTACH_MAX_BYTES = 12 * 1024 * 1024  # 12 MB raw upload cap
+ATTACH_MAX_CHARS = 500000            # ~125k tokens of extracted text per file (truncated beyond)
+TEXT_EXTS = (".txt", ".md", ".markdown", ".text", ".csv", ".tsv", ".json", ".log", ".rst", ".yaml", ".yml")
+FETCH_MAX_BYTES = 2 * 1024 * 1024    # cap on a fetched page
+FETCH_MAX_CHARS = 60000              # ~15k tokens of extracted page text returned to the model
+FETCH_TIMEOUT = 12
+TOOL_MAX_ITERS = 4                   # max tool round-trips per assistant turn (loop guard)
 
 DEFAULT_SYSTEM = (
     "You are Artaud, the schizo-poster, a master of elucidating thought, a philosopher, "
@@ -85,7 +98,8 @@ _local = threading.local()
 
 # ---------------------------------------------------------------- small utils
 def _now():
-    return datetime.now().isoformat(timespec="seconds")
+    # timezone-aware (absolute instant); the browser renders it in each viewer's local zone
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _mid():
@@ -143,10 +157,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS conversations(
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, folder_id TEXT, title TEXT,
                 system TEXT, model TEXT, endpoint_id TEXT, params TEXT, character_id TEXT,
-                active_leaf_id TEXT, created TEXT NOT NULL, updated TEXT NOT NULL);
+                active_leaf_id TEXT, tools INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL, updated TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages(
                 id TEXT PRIMARY KEY, convo_id TEXT NOT NULL, parent_id TEXT, position INTEGER NOT NULL,
-                role TEXT NOT NULL, content TEXT, reasoning TEXT, model TEXT, meta TEXT, ts TEXT, edited TEXT, rating INTEGER);
+                role TEXT NOT NULL, content TEXT, reasoning TEXT, model TEXT, meta TEXT, ts TEXT, edited TEXT,
+                rating INTEGER, attachments TEXT, tool TEXT);
             CREATE TABLE IF NOT EXISTS characters(
                 id TEXT PRIMARY KEY, owner_id INTEGER, scope TEXT NOT NULL DEFAULT 'private',
                 name TEXT, avatar TEXT, model TEXT, params TEXT, system TEXT, created TEXT NOT NULL);
@@ -161,9 +176,15 @@ def init_db():
             c.execute("ALTER TABLE messages ADD COLUMN parent_id TEXT")
         if "rating" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN rating INTEGER")
+        if "attachments" not in mcols:
+            c.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
+        if "tool" not in mcols:
+            c.execute("ALTER TABLE messages ADD COLUMN tool TEXT")
         ccols = [r["name"] for r in c.execute("PRAGMA table_info(conversations)")]
         if "active_leaf_id" not in ccols:
             c.execute("ALTER TABLE conversations ADD COLUMN active_leaf_id TEXT")
+        if "tools" not in ccols:
+            c.execute("ALTER TABLE conversations ADD COLUMN tools INTEGER NOT NULL DEFAULT 0")
         c.commit()
         seed_settings()
         if not get_setting("tree_migrated"):
@@ -391,6 +412,10 @@ def _msg_dict(r):
         m["edited"] = r["edited"]
     if r["rating"] is not None:
         m["rating"] = r["rating"]
+    if r["attachments"]:
+        m["attachments"] = json.loads(r["attachments"])
+    if r["tool"]:
+        m["tool"] = json.loads(r["tool"])
     return m
 
 
@@ -427,7 +452,9 @@ def chain_content(cid, node_id):
         seq.append(by[cur])
         cur = by[cur]["parent_id"]
     seq.reverse()
-    return [{"role": r["role"], "content": r["content"] or ""} for r in seq]
+    return [{"role": r["role"], "content": r["content"] or "",
+             "attachments": json.loads(r["attachments"]) if r["attachments"] else None,
+             "tool": json.loads(r["tool"]) if r["tool"] else None} for r in seq]
 
 
 def get_convo(cid, u=None):
@@ -438,6 +465,7 @@ def get_convo(cid, u=None):
             "title": r["title"] or "", "system": r["system"] or "", "model": r["model"],
             "endpoint_id": r["endpoint_id"], "params": json.loads(r["params"]) if r["params"] else {},
             "character_id": r["character_id"], "active_leaf_id": r["active_leaf_id"],
+            "tools": bool(r["tools"]),
             "created": r["created"], "updated": r["updated"],
             "messages": active_path(cid, r["active_leaf_id"])}
 
@@ -462,13 +490,16 @@ def next_position(cid):
     return (r["p"] + 1) if r["p"] is not None else 0
 
 
-def insert_message(cid, parent, role, content, reasoning=None, model=None, meta=None):
+def insert_message(cid, parent, role, content, reasoning=None, model=None, meta=None,
+                   attachments=None, tool=None):
     mid = _mid()
     db().execute(
-        "INSERT INTO messages(id,convo_id,parent_id,position,role,content,reasoning,model,meta,ts)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages(id,convo_id,parent_id,position,role,content,reasoning,model,meta,ts,attachments,tool)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (mid, cid, parent, next_position(cid), role, content, reasoning or None, model,
-         json.dumps(meta) if meta else None, _now()))
+         json.dumps(meta) if meta else None, _now(),
+         json.dumps(attachments) if attachments else None,
+         json.dumps(tool) if tool else None))
     return mid
 
 
@@ -557,13 +588,38 @@ def bootstrap_admin():
 
 
 # ---------------------------------------------------------------- model calls
+def est_tokens(text):
+    return max(1, round(len(text or "") / 4))
+
+
+def _attach_block(attachments):
+    parts = []
+    for a in attachments or []:
+        parts.append("[Attached file: %s]\n%s" % (a.get("name", "file"), a.get("text", "")))
+    return "\n\n".join(parts)
+
+
 def build_api_messages(system, messages):
     api = []
     if system and system.strip():
         api.append({"role": "system", "content": system})
     for m in messages:
-        if m.get("role") in ("user", "assistant"):
-            api.append({"role": m["role"], "content": m.get("content", "")})
+        role = m.get("role")
+        if role == "tool":
+            t = m.get("tool") or {}
+            api.append({"role": "tool", "tool_call_id": t.get("tool_call_id", ""),
+                        "content": m.get("content", "")})
+        elif role == "assistant" and (m.get("tool") or {}).get("tool_calls"):
+            api.append({"role": "assistant", "content": m.get("content") or "",
+                        "tool_calls": m["tool"]["tool_calls"]})
+        elif role in ("user", "assistant"):
+            content = m.get("content", "")
+            if role == "assistant" and content and "<tool_call>" in content:
+                content = strip_tool_calls(content)  # don't feed leaked tool-call text back as an example
+            block = _attach_block(m.get("attachments"))
+            if block:
+                content = block + ("\n\n" + content if content else "")
+            api.append({"role": role, "content": content})
     return api
 
 
@@ -588,9 +644,12 @@ def _open_stream(ep, body):
     return requests.post(ep["url"], headers=headers, json=body, stream=True, timeout=REQUEST_TIMEOUT)
 
 
-def stream_model(ep, model, system, messages, params):
+def stream_model(ep, model, system, messages, params, tools=None):
     base = {"model": model, "messages": build_api_messages(system, messages), "stream": True}
     base.update(params)
+    if tools:
+        base["tools"] = tools
+        base["tool_choice"] = "auto"
     body = dict(base)
     body["stream_options"] = {"include_usage": True}
     r = _open_stream(ep, body)
@@ -601,6 +660,8 @@ def stream_model(ep, model, system, messages, params):
             pass
         r = _open_stream(ep, base)
     r.raise_for_status()
+    tcalls = {}
+    finish = None
     with r:
         for raw in r.iter_lines(decode_unicode=True):
             if not raw or not raw.startswith("data:"):
@@ -614,28 +675,91 @@ def stream_model(ep, model, system, messages, params):
                 continue
             choices = obj.get("choices") or []
             if choices:
+                if choices[0].get("finish_reason"):
+                    finish = choices[0]["finish_reason"]
                 delta = choices[0].get("delta") or {}
                 if delta.get("content"):
                     yield {"delta": delta["content"]}
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     yield {"reasoning": rc}
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index", 0)
+                    slot = tcalls.setdefault(idx, {"id": None, "type": "function",
+                                                   "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
             if obj.get("usage"):
                 yield {"usage": obj["usage"]}
+    if tcalls:
+        ordered = [tcalls[k] for k in sorted(tcalls)]
+        for i, s in enumerate(ordered):
+            if not s.get("id"):
+                s["id"] = "call_%d" % i
+        yield {"tool_calls": ordered}
+    yield {"finish": finish}
+
+
+def call_model_nonstream(ep, model, system, messages, params, tools):
+    """One non-streaming completion. The oMLX server returns structured tool_calls reliably this
+    way (its streaming tool parser can silently drop a call), so it's the recovery path."""
+    body = {"model": model, "messages": build_api_messages(system, messages), "stream": False}
+    body.update(params)
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    headers = {"Content-Type": "application/json"}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    r = requests.post(ep["url"], headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    d = r.json()
+    ch = (d.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    return (msg.get("content") or "",
+            msg.get("reasoning_content") or msg.get("reasoning") or "",
+            msg.get("tool_calls") or None,
+            d.get("usage"), ch.get("finish_reason"))
+
+
+def _models_data(ep):
+    headers = {}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    r = requests.get(models_url_for(ep), headers=headers, timeout=8)
+    r.raise_for_status()
+    return r.json().get("data", [])
 
 
 def fetch_models(ep):
     try:
-        headers = {}
-        if ep.get("key"):
-            headers["Authorization"] = "Bearer " + ep["key"]
-        r = requests.get(models_url_for(ep), headers=headers, timeout=8)
-        r.raise_for_status()
-        ids = [m["id"] for m in r.json().get("data", [])]
+        ids = [m["id"] for m in _models_data(ep)]
         ids.sort(key=lambda x: (not x.startswith("kenosistron"), x))
         return ids or FALLBACK_MODELS
     except Exception:
         return FALLBACK_MODELS
+
+
+def model_contexts(ep):
+    """Map model id -> context window (from /v1/models max_model_len, with fallbacks)."""
+    out = {}
+    try:
+        for m in _models_data(ep):
+            ctx = (m.get("max_model_len") or m.get("max_context_length")
+                   or m.get("context_length") or m.get("n_ctx"))
+            if ctx:
+                try:
+                    out[m["id"]] = int(ctx)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return out
 
 
 def shown_models(u):
@@ -657,6 +781,270 @@ def build_meta(t0, t_first, t1, usage, reply):
             "ttft_ms": round((t_first - t0) * 1000) if t_first else None,
             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": comp,
             "tokens_est": est, "tps": round((comp / gen) if gen > 0 else 0, 1)}
+
+
+# ---------------------------------------------------------------- tools / fetch
+class _TextExtractor(HTMLParser):
+    """Very small HTML -> readable-text reducer (stdlib only)."""
+    _SKIP = {"script", "style", "noscript", "template", "svg", "head", "nav", "footer"}
+    _BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+              "section", "article", "header", "blockquote", "pre"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip = 0
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self.skip += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self.skip:
+            self.skip -= 1
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+            return
+        if self.skip:
+            return
+        t = data.strip()
+        if t:
+            self.parts.append(t)
+
+    def text(self):
+        s = " ".join(self.parts)
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r" *\n *", "\n", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s.strip()
+
+
+class _PinnedHTTPSAdapter(requests.adapters.HTTPAdapter):
+    """Connect to a pre-validated IP while verifying TLS against the real hostname (SNI + cert)."""
+    def __init__(self, hostname):
+        self._hostname = hostname
+        super().__init__(max_retries=0)
+
+    def init_poolmanager(self, *a, **kw):
+        kw["assert_hostname"] = self._hostname
+        kw["server_hostname"] = self._hostname
+        return super().init_poolmanager(*a, **kw)
+
+
+def _resolve_public_ip(host):
+    """Resolve a host and return one public IP, refusing any private/internal address (SSRF guard)."""
+    ip = None
+    for info in socket.getaddrinfo(host, None):
+        addr = ipaddress.ip_address(info[4][0])
+        if (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+                or addr.is_multicast or addr.is_unspecified):
+            raise ValueError("refusing to fetch a private/internal address (%s)" % addr)
+        if ip is None:
+            ip = str(addr)
+    if ip is None:
+        raise ValueError("could not resolve host")
+    return ip
+
+
+def _assert_public_host(host):  # thin alias retained for clarity / call-sites
+    _resolve_public_ip(host)
+
+
+def safe_fetch(url):
+    """Fetch a public http(s) page with SSRF guards. DNS is pinned to a validated IP (defeats
+    rebinding) and every redirect hop is validated before it is followed. Returns (title, text, final_url)."""
+    sess = requests.Session()
+    hops = 0
+    raw, ctype = b"", ""
+    encoding = "utf-8"
+    while True:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            raise ValueError("only http/https URLs are allowed")
+        if not p.hostname:
+            raise ValueError("missing host in URL")
+        ip = _resolve_public_ip(p.hostname)                      # validate + pin
+        port = p.port or (443 if p.scheme == "https" else 80)
+        defport = port in (80, 443)
+        host_hdr = p.hostname if defport else "%s:%d" % (p.hostname, port)
+        ipnet = ("[%s]" % ip) if ":" in ip else ip
+        ip_url = urlunparse(p._replace(netloc=(ipnet if defport else "%s:%d" % (ipnet, port))))
+        if p.scheme == "https":
+            sess.mount("https://", _PinnedHTTPSAdapter(p.hostname))
+        headers = {"Host": host_hdr, "User-Agent": "ORACLE-fetch/1.0",
+                   "Accept": "text/html,text/plain;q=0.9,*/*;q=0.5"}
+        r = sess.get(ip_url, headers=headers, timeout=FETCH_TIMEOUT, stream=True, allow_redirects=False)
+        if r.is_redirect or r.is_permanent_redirect:
+            loc = r.headers.get("Location", ""); r.close()
+            hops += 1
+            if hops > 5:
+                raise ValueError("too many redirects")
+            if not loc:
+                raise ValueError("redirect without a location")
+            url = urljoin(url, loc)                              # next hop re-validated at loop top
+            continue
+        ctype = r.headers.get("Content-Type", "")
+        r.raise_for_status()
+        for chunk in r.iter_content(8192):
+            raw += chunk
+            if len(raw) > FETCH_MAX_BYTES:
+                break
+        encoding = r.encoding or "utf-8"
+        r.close()
+        break
+    body = raw.decode(encoding, errors="replace")
+    title = ""
+    if "html" in ctype or body.lstrip()[:1] == "<":
+        ex = _TextExtractor()
+        try:
+            ex.feed(body)
+        except Exception:
+            pass
+        title, text = ex.title.strip(), ex.text()
+    else:
+        text = body
+    if len(text) > FETCH_MAX_CHARS:
+        text = text[:FETCH_MAX_CHARS] + "\n\n[...truncated...]"
+    return title, text, url
+
+
+# Some models are tool-trained and emit a tool call as plain text (e.g. "<tool_call><function=fetch__fetch>
+# <parameter=url>...</parameter></function></tool_call>") instead of via the structured tool_calls channel,
+# especially the MLX server doesn't parse it when no tools were offered. Parse/strip those so they never leak.
+_TOOLCALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.S)
+_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.S)
+_FETCH_ALIASES = {"fetch_url", "fetch", "fetch__fetch", "browse", "open_url", "get_url", "web_fetch", "url_fetch"}
+
+
+def parse_text_tool_calls(text):
+    """Recover tool calls a model leaked into plain text (XML-tag or JSON forms)."""
+    calls = []
+    for i, block in enumerate(_TOOLCALL_RE.findall(text or "")):
+        block = block.strip()
+        name, args = None, {}
+        mf = _FUNC_RE.search(block)
+        if mf:
+            name = mf.group(1).strip()
+            for pk, pv in _PARAM_RE.findall(mf.group(2)):
+                args[pk.strip()] = pv.strip()
+        else:
+            try:
+                obj = json.loads(block)
+                name = obj.get("name")
+                args = obj.get("arguments") or obj.get("parameters") or {}
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except Exception:
+                pass
+        if name:
+            calls.append({"id": "call_%d" % i, "type": "function",
+                          "function": {"name": name,
+                                       "arguments": json.dumps(args if isinstance(args, dict) else {})}})
+    return calls
+
+
+def strip_tool_calls(text):
+    if not text or "<tool_call>" not in text:
+        return text
+    text = _TOOLCALL_RE.sub("", text)
+    text = re.sub(r"<tool_call>.*$", "", text, flags=re.S)  # drop a dangling/unclosed block
+    return text.strip()
+
+
+TOOLS_SPEC = [{
+    "type": "function",
+    "function": {
+        "name": "fetch_url",
+        "description": ("Fetch a public web page (or plain-text/JSON URL) over http(s) and return its "
+                        "readable text. Use this to look up current information or to read a link the "
+                        "user shares. Only public internet addresses are allowed."),
+        "parameters": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "Absolute http(s) URL to fetch."}},
+            "required": ["url"],
+        },
+    },
+}]
+
+
+_URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
+_FETCHY = ("fetch", "browse", "scrape", "crawl", "url", "http", "web", "visit", "page", "read", "open", "get", "curl", "wget", "request")
+
+
+def _url_from_args(args):
+    for key in ("url", "uri", "link", "href", "address", "page", "target", "input", "query", "q", "text"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in args.values():  # any value that looks like a URL
+        if isinstance(v, str) and v.strip().lower().startswith(("http://", "https://")):
+            return v.strip()
+    return ""
+
+
+def execute_tool(name, args, fallback_url=None):
+    """Run one tool call. Tolerant of the names tool-trained models invent (fetch__fetch, fetch__fetcher,
+    browse, …) and recovers the URL from conversation context when the model omits it. Returns (text, ui)."""
+    nm = (name or "").lower()
+    url = _url_from_args(args if isinstance(args, dict) else {})
+    looks_fetch = (nm in _FETCH_ALIASES) or any(k in nm for k in _FETCHY)
+    if looks_fetch or url:
+        if not url:
+            url = (fallback_url or "").strip()
+        if not url:
+            return ("Error: no URL was provided. Call the tool again with the user's link in the \"url\" argument.",
+                    {"ok": False, "url": "", "summary": "no url provided"})
+        try:
+            title, text, final = safe_fetch(url)
+            head = ("Title: %s\n" % title) if title else ""
+            return ("Fetched %s\n%s\n%s" % (final, head, text),
+                    {"ok": True, "url": final, "title": title, "chars": len(text), "summary": title or final})
+        except Exception as e:
+            return "Error fetching %s: %s" % (url, e), {"ok": False, "url": url, "summary": str(e)}
+    return ("Error: unknown tool '%s'. The only available tool is fetch_url(url)." % name,
+            {"ok": False, "summary": "unknown tool: %s" % name})
+
+
+def extract_text_file(name, raw):
+    """Extract plain text from an uploaded file (txt/md/etc. or PDF). Raises ValueError on failure."""
+    lower = (name or "").lower()
+    if lower.endswith(".pdf"):
+        try:
+            import pypdf
+        except Exception:
+            raise ValueError("PDF support is not installed on the server (pypdf).")
+        import io
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+        except Exception as e:
+            raise ValueError("could not read PDF: %s" % e)
+        pages = []
+        for pg in reader.pages:
+            try:
+                pages.append(pg.extract_text() or "")
+            except Exception:
+                pages.append("")
+        text = "\n\n".join(pages).strip()
+        if not text:
+            raise ValueError("no extractable text (scanned/image PDF? OCR is not supported)")
+        return text
+    if lower.endswith(TEXT_EXTS):
+        return raw.decode("utf-8", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("unsupported file type")
 
 
 # ---------------------------------------------------------------- HTTP handler
@@ -746,6 +1134,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "default_system": get_setting("default_system", DEFAULT_SYSTEM),
             "default_params": get_setting("default_params", {}),
             "default_model": get_setting("default_model", DEFAULT_MODEL),
+            "model_contexts": model_contexts(active_endpoint()),
+            "default_context": DEFAULT_CONTEXT,
         }
         if u["role"] == "admin":
             payload["settings"] = admin_settings()
@@ -928,6 +1318,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 db().execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(payload["new"]), u["id"]))
             return self._json(200, {"ok": True})
 
+        if path == "/api/extract":
+            name = (payload.get("name") or "file").strip()
+            try:
+                raw = base64.b64decode(payload.get("data") or "")
+            except Exception:
+                return self._json(400, {"error": "bad file data"})
+            if not raw:
+                return self._json(400, {"error": "empty file"})
+            if len(raw) > ATTACH_MAX_BYTES:
+                return self._json(413, {"error": "file too large (max %d MB)" % (ATTACH_MAX_BYTES // (1024 * 1024))})
+            try:
+                text = extract_text_file(name, raw)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            truncated = len(text) > ATTACH_MAX_CHARS
+            if truncated:
+                text = text[:ATTACH_MAX_CHARS]
+            return self._json(200, {"name": name, "text": text, "chars": len(text),
+                                    "tokens_est": est_tokens(text), "truncated": truncated})
+
         ms = re.fullmatch(r"/api/conversations/([^/]+)/stream", path)
         if ms and valid_id(ms.group(1)):
             return self._stream(ms.group(1), payload, u)
@@ -1085,6 +1495,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sets.append("model=?"); args.append(payload["model"])
             if "endpoint_id" in payload and u["role"] == "admin":
                 sets.append("endpoint_id=?"); args.append(payload["endpoint_id"])
+            if "tools" in payload:
+                sets.append("tools=?"); args.append(1 if payload["tools"] else 0)
             if "params" in payload:
                 sets.append("params=?"); args.append(json.dumps(payload["params"] or {}))
             if "folder_id" in payload:
@@ -1100,6 +1512,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     # ================================================== streaming (tree-aware)
+    @staticmethod
+    def _sanitize_attachments(raw):
+        out = []
+        for a in (raw or [])[:12]:
+            if isinstance(a, dict) and a.get("text"):
+                out.append({"name": str(a.get("name") or "file")[:200], "text": a["text"][:ATTACH_MAX_CHARS]})
+        return out
+
     def _stream(self, cid, payload, u):
         convo = get_convo(cid, u)
         if convo is None:
@@ -1107,12 +1527,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ep, model, system, params = resolve_request(convo)
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
+        tools = TOOLS_SPEC if convo.get("tools") else None
 
         _, by, _ = _tree(cid)
         content = (payload.get("content") or "").strip()
+        attachments = self._sanitize_attachments(payload.get("attachments"))
         regenerate_id = payload.get("regenerate_id")
         edit_user_id = payload.get("edit_user_id")
 
+        # mode -> (parent node, ctx sent to model, optional leading user message, whether to title)
         if regenerate_id or payload.get("regenerate"):
             target = regenerate_id or convo.get("active_leaf_id")
             tr = by.get(target)
@@ -1120,38 +1543,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "nothing to regenerate"})
             parent = tr["parent_id"]
             ctx = chain_content(cid, parent)
-
-            def commit(reply, reasoning, meta):
-                with db():
-                    aid = insert_message(cid, parent, "assistant", reply, reasoning, model, meta)
-                    set_leaf(cid, aid)
-                    touch_convo(cid)
+            lead, title_after = None, False
         elif edit_user_id:
             tu = by.get(edit_user_id)
             if tu is None or tu["role"] != "user":
                 return self._json(400, {"error": "cannot edit/resend that message"})
             new_content = content or tu["content"]
             parent = tu["parent_id"]
-            ctx = chain_content(cid, parent) + [{"role": "user", "content": new_content}]
-
-            def commit(reply, reasoning, meta):
-                with db():
-                    uid = insert_message(cid, parent, "user", new_content)
-                    aid = insert_message(cid, uid, "assistant", reply, reasoning, model, meta)
-                    set_leaf(cid, aid)
-                    touch_convo(cid); maybe_title(cid)
+            ctx = chain_content(cid, parent) + [{"role": "user", "content": new_content, "attachments": attachments or None}]
+            lead, title_after = ("user", new_content, attachments), True
         else:
-            if not content:
+            if not content and not attachments:
                 return self._json(400, {"error": "empty message"})
             parent = convo.get("active_leaf_id")
-            ctx = chain_content(cid, parent) + [{"role": "user", "content": content}]
+            ctx = chain_content(cid, parent) + [{"role": "user", "content": content, "attachments": attachments or None}]
+            lead, title_after = ("user", content, attachments), True
 
-            def commit(reply, reasoning, meta):
-                with db():
-                    uid = insert_message(cid, parent, "user", content)
-                    aid = insert_message(cid, uid, "assistant", reply, reasoning, model, meta)
-                    set_leaf(cid, aid)
-                    touch_convo(cid); maybe_title(cid)
+        def persist(collected, reply, reasoning, meta):
+            with db():
+                node = parent
+                if lead:
+                    node = insert_message(cid, node, "user", lead[1], attachments=lead[2] or None)
+                for item in collected:
+                    node = insert_message(cid, node, item["role"], item["content"],
+                                          reasoning=item.get("reasoning"),
+                                          model=model if item["role"] == "assistant" else None,
+                                          tool=item.get("tool"))
+                if reply or reasoning or not collected:
+                    node = insert_message(cid, node, "assistant", reply, reasoning, model, meta)
+                set_leaf(cid, node)
+                touch_convo(cid)
+                if title_after:
+                    maybe_title(cid)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -1159,45 +1582,146 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        gone = [False]
+
         def emit(obj):
-            self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self.wfile.flush()
+            if gone[0]:
+                return
+            try:
+                self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                gone[0] = True
 
-        parts, rparts, usage = [], [], None
-        t0 = time.time(); t_first = None; gone = False
-        try:
-            for ev in stream_model(ep, model, system, ctx, params):
+        work = list(ctx)
+        collected = []
+        reply, reasoning, usage = "", "", None
+        t0 = time.time(); t_first = [0.0]
+
+        def run_stream(cur_tools):
+            # Stream a turn. Leading whitespace is held back so a *dropped* tool call (which the oMLX
+            # server emits as a lone "\n") never spawns an empty bubble — the thinking dots stay up.
+            parts, rparts, tcalls, used, finish = [], [], None, None, None
+            flushed = [False]
+
+            def push(d):
+                parts.append(d)
+                if flushed[0]:
+                    if not t_first[0]:
+                        t_first[0] = time.time()
+                    emit({"delta": d})
+                elif "".join(parts).strip():
+                    flushed[0] = True
+                    if not t_first[0]:
+                        t_first[0] = time.time()
+                    emit({"delta": "".join(parts)})
+
+            for ev in stream_model(ep, model, system, work, params, tools=cur_tools):
                 if "delta" in ev:
-                    if t_first is None:
-                        t_first = time.time()
-                    parts.append(ev["delta"])
-                    try:
-                        emit({"delta": ev["delta"]})
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        gone = True; break
+                    push(ev["delta"])
                 elif "reasoning" in ev:
-                    if t_first is None:
-                        t_first = time.time()
-                    rparts.append(ev["reasoning"])
-                    try:
-                        emit({"reasoning": ev["reasoning"]})
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        gone = True; break
+                    if not t_first[0]:
+                        t_first[0] = time.time()
+                    rparts.append(ev["reasoning"]); emit({"reasoning": ev["reasoning"]})
                 elif "usage" in ev:
-                    usage = ev["usage"]
+                    used = ev["usage"]
+                elif "tool_calls" in ev:
+                    tcalls = ev["tool_calls"]
+                elif "finish" in ev:
+                    finish = ev["finish"]
+                if gone[0]:
+                    break
+            return "".join(parts), "".join(rparts), tcalls, used, finish
+
+        # the user's most recent link — recovered into a tool call when the model omits the url
+        fallback_url = None
+        for m in reversed(work):
+            if m.get("role") == "user":
+                found = _URL_RE.findall(m.get("content") or "")
+                if found:
+                    fallback_url = found[-1]
+                    break
+
+        seen_calls = set()
+        force_answer = False
+        try:
+            for it in range(TOOL_MAX_ITERS + 1):
+                cur_tools = tools if (it < TOOL_MAX_ITERS and not force_answer) else None  # force a text answer
+                if cur_tools:
+                    emit({"status": "reading the results…" if collected else "thinking…"})
+                # Always stream first — a real text answer streams cleanly token-by-token.
+                seg_reply, seg_reason, tcalls, used, finish = run_stream(cur_tools)
+                if used:
+                    usage = used
+                if cur_tools and not tcalls:
+                    if seg_reply and "<tool_call>" in seg_reply:           # tool call leaked as text
+                        parsed = parse_text_tool_calls(seg_reply)
+                        if parsed:
+                            tcalls = parsed; seg_reply = strip_tool_calls(seg_reply)
+                    # the streaming tool parser dropped the call -> recover via reliable non-streaming
+                    if not tcalls and not gone[0] and (finish == "tool_calls" or not seg_reply.strip()):
+                        try:
+                            c2, r2, t2, u2, _ = call_model_nonstream(ep, model, system, work, params, cur_tools)
+                        except Exception:
+                            c2, r2, t2, u2 = "", "", None, None
+                        if u2:
+                            usage = u2
+                        if t2:
+                            tcalls = t2; seg_reply = strip_tool_calls(c2); seg_reason = seg_reason or r2
+                        elif c2 and "<tool_call>" in c2 and parse_text_tool_calls(c2):
+                            tcalls = parse_text_tool_calls(c2); seg_reply = strip_tool_calls(c2); seg_reason = seg_reason or r2
+                        elif c2:                                            # actually a text answer; show it
+                            seg_reply, seg_reason = c2, (seg_reason or r2)
+                            if not t_first[0]:
+                                t_first[0] = time.time()
+                            emit({"delta": c2})
+                if gone[0] or not tcalls:
+                    reply, reasoning = seg_reply, seg_reason
+                    break
+                emit({"tool_turn": True})
+                collected.append({"role": "assistant", "content": seg_reply, "reasoning": seg_reason,
+                                  "tool": {"tool_calls": tcalls}})
+                work.append({"role": "assistant", "content": seg_reply, "tool": {"tool_calls": tcalls}})
+                new_call = False
+                for tc in tcalls:
+                    fn = tc.get("function") or {}
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except ValueError:
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    sig = (fn.get("name"), json.dumps(args, sort_keys=True))
+                    if sig not in seen_calls:
+                        new_call = True
+                    seen_calls.add(sig)
+                    emit({"tool_call": {"name": fn.get("name"), "args": args, "id": tc.get("id")}})
+                    result, ui = execute_tool(fn.get("name"), args, fallback_url=fallback_url)
+                    emit({"tool_result": dict(ui, name=fn.get("name"), id=tc.get("id"))})
+                    collected.append({"role": "tool", "content": result,
+                                      "tool": {"tool_call_id": tc.get("id"), "name": fn.get("name"), "ui": ui}})
+                    work.append({"role": "tool", "content": result, "tool": {"tool_call_id": tc.get("id")}})
+                if not new_call:
+                    force_answer = True  # model is repeating the same call — make the next pass answer
         except Exception as e:
-            if not gone:
-                try:
-                    emit({"error": "model error: " + str(e)})
-                except Exception:
-                    pass
+            emit({"error": "model error: " + str(e)})
             return
 
-        reply, reasoning = "".join(parts), "".join(rparts)
-        if not reply and not reasoning:
+        # never leak raw <tool_call> syntax into a final answer; if tools are off but the model
+        # tried to call one, replace the dead-end with an actionable hint.
+        if reply and "<tool_call>" in reply:
+            attempted = parse_text_tool_calls(reply)
+            reply = strip_tool_calls(reply)
+            if not tools and attempted:
+                hint = "_(I tried to use a web tool, but web tools are off for this chat — turn on **web tools** in *tune* to let me fetch links.)_"
+                reply = (reply + "\n\n" + hint).strip() if reply else hint
+
+        if not reply and not reasoning and not collected:
+            if not gone[0]:
+                emit({"error": "the model returned an empty response — please try again"})
             return
-        commit(reply, reasoning, build_meta(t0, t_first, time.time(), usage, reply))
-        if not gone:
+        persist(collected, reply, reasoning, build_meta(t0, t_first[0] or None, time.time(), usage, reply))
+        if not gone[0]:
             try:
                 emit({"done": True, "convo": get_convo(cid, u)})
             except Exception:
@@ -1619,7 +2143,7 @@ PAGE_HEAD = r"""<!doctype html>
   *{box-sizing:border-box;}
   html,body{height:100%;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:var(--serif);font-size:16px;overflow:hidden;-webkit-font-smoothing:antialiased;}
-  #app{display:flex;height:100dvh;height:100vh;}
+  #app{display:flex;height:100vh;height:100dvh;}
   button{font-family:var(--mono);color:inherit;}
   .mono{font-family:var(--mono);}
   .lbl{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.16em;color:var(--muted);}
@@ -1646,7 +2170,7 @@ PAGE_HEAD = r"""<!doctype html>
   #searchbox:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
   .side-act .row button{flex:1;background:var(--surface);border:none;color:var(--muted);border-radius:9px;padding:9px;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;}
   .side-act .row button:hover,#selbtn.on{background:var(--surface2);color:var(--text);}
-  #tree{flex:1;overflow-y:auto;padding:2px 8px 16px;}
+  #tree{flex:1;min-height:0;overflow-y:auto;padding:2px 8px 16px;}
   .folder-head{display:flex;align-items:center;gap:7px;padding:7px 7px;border-radius:8px;cursor:pointer;color:var(--muted);margin-top:4px;}
   .folder-head:hover{background:var(--surface);}
   .folder-head .tw{width:9px;font-family:var(--mono);font-size:9px;color:var(--faint);transition:transform .12s;}
@@ -1705,7 +2229,7 @@ PAGE_HEAD = r"""<!doctype html>
   .barbtn:hover{background:var(--surface2);color:var(--text);}
 
   /* ---------------- log */
-  #log{flex:1;overflow-y:auto;padding:74px 0 10px;}
+  #log{flex:1;min-height:0;overflow-y:auto;padding:74px 0 10px;}
   .wrap{max-width:var(--cw);margin:0 auto;padding:0 28px;}
   .msg{padding:6px 0 20px;position:relative;}
   .msg .head{display:flex;align-items:center;gap:10px;margin-bottom:7px;}
@@ -1770,7 +2294,7 @@ PAGE_HEAD = r"""<!doctype html>
   .empty p{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--faint);}
 
   /* ---------------- composer */
-  #composer{padding:12px 0 18px;background:var(--bg);}
+  #composer{padding:12px 0 18px;background:var(--bg);padding-bottom:max(18px,env(safe-area-inset-bottom));}
   #composer .wrap{display:flex;gap:10px;align-items:flex-end;}
   .input-shell{flex:1;display:flex;align-items:flex-end;background:var(--surface);border-radius:14px;padding:12px 14px;min-height:48px;}
   .input-shell:focus-within{outline:2px solid var(--accent-weak);outline-offset:-1px;}
@@ -1781,21 +2305,67 @@ PAGE_HEAD = r"""<!doctype html>
   #send .ico{width:20px;height:20px;stroke-width:2.2;}
   .chint{max-width:var(--cw);margin:7px auto 0;padding:0 28px;font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.03em;}
 
+  /* ---------------- context meter */
+  #ctxmeter{display:flex;align-items:center;gap:7px;height:32px;padding:0 9px;border-radius:8px;background:var(--surface);}
+  #ctxmeter .ctxbar{width:52px;height:5px;border-radius:3px;background:var(--surface3);overflow:hidden;}
+  #ctxmeter .ctxbar i{display:block;height:100%;width:0;background:var(--ok);transition:width .3s,background .3s;}
+  #ctxmeter.warn .ctxbar i{background:var(--bot);} #ctxmeter.hot .ctxbar i{background:var(--danger);}
+  #ctxmeter .ctxtxt{font-family:var(--mono);font-size:10px;letter-spacing:.02em;color:var(--muted);white-space:nowrap;}
+  @media (max-width:620px){ #ctxmeter .ctxtxt{display:none;} }
+
+  /* ---------------- composer: attach + pending files */
+  #attachbtn{flex:0 0 auto;background:var(--surface);color:var(--muted);border:none;border-radius:14px;width:48px;height:48px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  #attachbtn:hover{background:var(--surface2);color:var(--text);}
+  #attachbtn .ico{width:19px;height:19px;stroke-width:2;}
+  #pending{max-width:var(--cw);margin:0 auto 8px;padding:0 28px;display:flex;flex-wrap:wrap;gap:7px;}
+  #pending:empty{display:none;}
+  .achip{display:inline-flex;align-items:center;gap:7px;background:var(--surface2);border:1px solid var(--line);border-radius:9px;padding:5px 9px;font-family:var(--mono);font-size:10.5px;color:var(--text);max-width:280px;}
+  .achip .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .achip .tk{color:var(--faint);} .achip.busy{opacity:.6;} .achip.err{border-color:var(--danger);color:var(--danger);}
+  .achip .rm{background:none;border:none;color:var(--faint);cursor:pointer;font-size:14px;line-height:1;padding:0;} .achip .rm:hover{color:var(--danger);}
+  #composer.dragover .input-shell{outline:2px dashed var(--accent);outline-offset:3px;}
+
+  /* ---------------- scroll-to-top floating button */
+  #scrolltop{position:absolute;right:16px;bottom:92px;width:42px;height:42px;border-radius:50%;background:var(--surface2);color:var(--text);border:1px solid var(--line);box-shadow:var(--shadow);display:none;align-items:center;justify-content:center;cursor:pointer;z-index:30;opacity:.94;}
+  #scrolltop.show{display:flex;}
+  #scrolltop:hover{background:var(--surface3);opacity:1;}
+  #scrolltop .ico{width:18px;height:18px;stroke-width:2.3;}
+  .msg .atts{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 9px;}
+  .msg .atts details{background:var(--surface);border:1px solid var(--line);border-radius:9px;max-width:100%;}
+  .msg .atts summary{cursor:pointer;list-style:none;padding:5px 9px;font-family:var(--mono);font-size:10.5px;color:var(--muted);display:flex;gap:7px;align-items:center;}
+  .msg .atts summary::-webkit-details-marker{display:none;}
+  .msg .atts .atxt{max-height:280px;overflow:auto;margin:0;padding:10px 12px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11px;white-space:pre-wrap;color:var(--muted);}
+
+  /* ---------------- tool steps */
+  .toolstep{margin:7px 0;border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden;}
+  .toolstep summary{cursor:pointer;list-style:none;padding:8px 11px;font-family:var(--mono);font-size:11px;color:var(--accent2);display:flex;gap:8px;align-items:center;}
+  .toolstep summary::-webkit-details-marker{display:none;}
+  .toolstep .tlabel{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} .toolstep.err summary{color:var(--danger);}
+  .toolstep .tbody{max-height:300px;overflow:auto;margin:0;padding:10px 12px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11px;white-space:pre-wrap;color:var(--muted);}
+  .toolstep .turl{color:var(--accent);text-decoration:none;word-break:break-all;} .toolstep .turl:hover{text-decoration:underline;}
+  .toolspin{display:inline-block;width:10px;height:10px;border:2px solid var(--surface3);border-top-color:var(--accent);border-radius:50%;animation:tsp .7s linear infinite;flex:0 0 auto;}
+  @keyframes tsp{to{transform:rotate(360deg);}}
+  .thinking .thinkrow{display:flex;align-items:center;gap:9px;color:var(--muted);font-family:var(--read-font);font-style:italic;font-size:calc(15px*var(--rs));padding:3px 0;}
+  .thinkdot{width:9px;height:9px;border-radius:50%;background:var(--accent);animation:thinkpulse 1.15s ease-in-out infinite;flex:0 0 auto;}
+  @keyframes thinkpulse{0%,100%{opacity:.3;transform:scale(.82);}50%{opacity:1;transform:scale(1.12);}}
+  .chk .chkrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);cursor:pointer;}
+  .chk .chkrow code{font-family:var(--mono);font-size:11px;background:var(--code-bg);padding:.05em .3em;border-radius:4px;}
+
   /* ---------------- overlays */
   #backdrop{position:fixed;inset:0;background:rgba(8,6,3,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:50;}
   #backdrop.show{opacity:1;pointer-events:auto;}
-  .panel{position:fixed;top:0;right:0;height:100dvh;height:100vh;width:430px;max-width:93vw;background:var(--panel);box-shadow:var(--shadow);transform:translateX(103%);transition:transform .22s ease;z-index:70;display:flex;flex-direction:column;}
+  .panel{position:fixed;top:0;right:0;height:100vh;height:100dvh;width:430px;max-width:93vw;background:var(--panel);box-shadow:var(--shadow);transform:translateX(103%);transition:transform .22s ease;z-index:70;display:flex;flex-direction:column;}
   .panel.show{transform:translateX(0);}
   .phead{padding:16px 18px;display:flex;align-items:center;gap:10px;}
   .phead h3{margin:0;font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);}
   .phead .x{margin-left:auto;background:none;border:none;color:var(--muted);font-size:22px;cursor:pointer;width:32px;height:32px;border-radius:8px;line-height:1;}
   .phead .x:hover{background:var(--surface);color:var(--text);}
-  .pbody{flex:1;overflow-y:auto;padding:8px 18px 16px;}
+  .pbody{flex:1;min-height:0;overflow-y:auto;padding:8px 18px 16px;}
   .pfoot{padding:14px 18px;display:flex;gap:8px;}
   .pfoot button{flex:1;border-radius:9px;padding:11px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;}
   #modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:70;padding:20px;}
   #modal.show{display:flex;}
-  .modal-card{background:var(--panel);border-radius:16px;box-shadow:var(--shadow);width:800px;max-width:100%;max-height:90dvh;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;}
+  .modal-card{background:var(--panel);border-radius:16px;box-shadow:var(--shadow);width:800px;max-width:100%;max-height:90vh;max-height:90dvh;display:flex;flex-direction:column;overflow:hidden;}
   .mhead{padding:16px 20px;display:flex;align-items:center;gap:14px;}
   .mhead h3{margin:0;font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);}
   .mhead .x{margin-left:auto;background:none;border:none;color:var(--muted);font-size:22px;cursor:pointer;}
@@ -1874,18 +2444,25 @@ PAGE_HEAD = r"""<!doctype html>
 
   /* responsive */
   @media (max-width:860px){
-    #sidebar{position:fixed;left:0;top:0;height:100dvh;height:100vh;transform:translateX(-103%);transition:transform .22s ease;box-shadow:var(--shadow);z-index:80;}
+    #sidebar{position:fixed;left:0;top:0;height:100vh;height:100dvh;transform:translateX(-103%);transition:transform .22s ease;box-shadow:var(--shadow);z-index:80;}
     #sidebar.show{transform:translateX(0);}
     #app.sbcollapsed #sidebar{display:flex;}
     #resizer{display:none;}
     .menubtn{display:flex;} #revealbtn{display:none!important;} #collapsebtn{display:none;}
     #charchip,select.msel{display:none;}
-    .wrap,.chint{padding:0 16px;}
+    .wrap,.chint,#pending{padding:0 16px;}
     .bubble{font-size:calc(17px*var(--rs));}
-    .actions{opacity:1;}
+    /* tap a message to reveal its actions (instead of always-on hover) */
+    .actions{display:none;}
+    .msg.revealed .actions{display:flex;opacity:1;}
+    .msg.revealed>.bubble{box-shadow:-3px 0 0 var(--accent-weak);}
     .convo .cmenu,.folder-head .fmenu{opacity:1;}
   }
-  @media (max-width:560px){ .params-grid{grid-template-columns:1fr;} .barbtn .t{display:none;} }
+  @media (max-width:560px){
+    .params-grid{grid-template-columns:1fr;} .barbtn .t{display:none;}
+    #composer .wrap{gap:6px;} #attachbtn,#send{width:44px;height:44px;}
+    #scrolltop{bottom:86px;right:12px;}
+  }
 </style></head>
 <body>
 """
@@ -1919,6 +2496,7 @@ PAGE_BODY = r"""
         <button class="iconbtn" id="revealbtn" title="show sidebar">&raquo;</button>
         <div id="titlewrap"><span id="title">oracle</span><div id="submeta"></div></div>
         <div class="barbtns">
+          <div id="ctxmeter" title="context usage" style="display:none"><div class="ctxbar"><i></i></div><span class="ctxtxt"></span></div>
           <button class="barbtn" id="exportbtn" title="export this chat">export</button>
           <button class="barbtn" id="charchip"><span class="t">character</span></button>
           <select class="msel" id="modelsel" title="model"></select>
@@ -1927,7 +2505,10 @@ PAGE_BODY = r"""
       </header>
       <div id="log"></div>
       <footer id="composer">
+        <div id="pending"></div>
         <div class="wrap">
+          <button id="attachbtn" title="attach a file (PDF, text, markdown)"><svg class="ico" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.19 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg></button>
+          <input type="file" id="fileinput" multiple accept=".pdf,.txt,.md,.markdown,.text,.csv,.tsv,.json,.log,.rst,.yaml,.yml" style="display:none">
           <div class="input-shell">
             <textarea id="input" rows="1" placeholder="say something…   (enter to send, shift+enter for newline)"></textarea>
           </div>
@@ -1935,6 +2516,7 @@ PAGE_BODY = r"""
         </div>
         <div class="chint" id="chint"></div>
       </footer>
+      <button id="scrolltop" title="scroll to top"><svg class="ico" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
     </main>
   </div>
 
@@ -1945,6 +2527,7 @@ PAGE_BODY = r"""
       <label class="fld" id="d_endpoint_wrap"><span class="lab">endpoint <span class="sub">(admin)</span></span><select id="d_endpoint"></select></label>
       <label class="fld"><span class="lab">model</span><select id="d_model"></select></label>
       <label class="fld"><span class="lab">system prompt <span class="sub">this chat only</span></span><textarea id="d_system" placeholder="empty = no system prompt"></textarea></label>
+      <label class="fld chk"><span class="lab">web tools <span class="sub">let the model fetch web pages</span></span><label class="chkrow"><input type="checkbox" id="d_tools"> <span>enable <code>fetch_url</code> for this chat</span></label></label>
       <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span><div class="params-grid" id="d_params"></div>
         <div class="params-foot"><button class="mini" id="d_defaults">server defaults</button><button class="mini" id="d_clear">clear all</button></div>
       </div>
@@ -2045,6 +2628,7 @@ PAGE_JS1 = r"""<script>
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 let CFG=null, current=null, busy=false, activeController=null;
 let convoCache=[], folderCache=[], collapsed={}, selMode=false, selected=new Set();
+let pendingAtt=[];
 
 const ICON_SEND='<svg class="ico" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 const ICON_STOP='<svg class="ico" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></svg>';
@@ -2289,7 +2873,9 @@ function syncBar(){
   const bits=[current.model];if(ch)bits.push(ch.name);
   if(isAdmin()&&current.endpoint_id){const e=endpointName(current.endpoint_id);if(e)bits.push(e.name);}
   const np=Object.keys(current.params||{}).length;if(np)bits.push(np+" param"+(np>1?"s":""));
+  if(current.tools)bits.push("◇ tools");
   $("#submeta").textContent=bits.join("  ·  ");
+  updateCtx();
 }
 function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clientHeight<100;}
 function scrollDown(){const l=$("#log");l.scrollTop=l.scrollHeight;}
@@ -2301,7 +2887,7 @@ function renderConvo(opts){
   const wrap=document.createElement("div");wrap.className="wrap";
   const msgs=(current.messages||[]).filter(m=>m.role==="user"||m.role==="assistant");
   if(!msgs.length)wrap.innerHTML='<div class="empty"><div class="glyph">&rsaquo;_</div><h2>new conversation</h2><p>say something to begin</p></div>';
-  else current.messages.forEach((m,i)=>{if(m.role==="user"||m.role==="assistant")wrap.appendChild(msgEl(m,i));});
+  else current.messages.forEach((m,i)=>{if(m.role==="user"||m.role==="assistant"||m.role==="tool")wrap.appendChild(msgEl(m,i));});
   log.appendChild(wrap);
   if(stick)scrollDown();else log.scrollTop=prev;
 }
@@ -2320,21 +2906,31 @@ function sibNav(m){
   return '<span class="sib" title="branch '+(i+1)+' of '+m.sib_count+'"><button data-sib="prev"'+(i<=0?' disabled':'')+'>&lsaquo;</button><span class="n">'+(i+1)+' / '+m.sib_count+'</span><button data-sib="next"'+(i>=m.sib_count-1?' disabled':'')+'>&rsaquo;</button></span>';
 }
 function msgEl(m,i){
+  if(m.role==="tool")return toolResultEl(m);
+  // intermediate assistant turn that only requested a tool (no prose): hide; the tool step carries it
+  if(m.role==="assistant"&&m.tool&&m.tool.tool_calls&&!(m.content||"").trim()){const s=document.createElement("div");s.style.display="none";return s;}
   const d=document.createElement("div");d.className="msg "+m.role;d.dataset.id=m.id;
   const ch=charById(current.character_id);
   const role=m.role==="user"?(CFG.me.username||"you"):(ch?ch.name:"oracle");
   let reason=m.reasoning?'<details class="reason"><summary>reasoning</summary><div class="rbody">'+esc(m.reasoning)+'</div></details>':"";
   const edited=m.edited?' · edited':'';
   const mark=m.rating?'<span class="ratemark '+(m.rating>0?'up':'down')+'" title="'+(m.rating>0?'rated good':'rated bad')+'">'+(m.rating>0?'&#9650;':'&#9660;')+'</span>':'';
-  const body=m.role==="assistant"?'<div class="bubble">'+md(m.content)+'</div>':'<div class="bubble raw">'+esc(m.content)+'</div>';
+  let disp=m.content||"";
+  if(m.role==="assistant"&&disp.indexOf("<tool_call>")>=0)disp=stripTC(disp)||"_(tried to use a web tool — enable **web tools** in tune to allow it)_";
+  const body=m.role==="assistant"?'<div class="bubble">'+md(disp)+'</div>':'<div class="bubble raw">'+esc(m.content)+'</div>';
   const rateBtns=m.role==="assistant"?'<button data-act="up" class="rate up'+(m.rating>0?' on':'')+'" title="good response (saved for RLHF)">'+ICON_THUMB+'</button><button data-act="down" class="rate down'+(m.rating<0?' on':'')+'" title="bad response (saved for RLHF)">'+ICON_THUMB+'</button>':'';
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span>'+sibNav(m)+'<span class="tm">'+esc(fmtTime(m.ts)+edited)+'</span>'+mark+'</div>'+
-    reason+body+metaLine(m)+
+    reason+attsHtml(m)+body+metaLine(m)+
     '<div class="actions"><button data-act="copy">copy</button>'+
     (m.role==="assistant"?'<button data-act="raw">raw</button><button data-act="regen">regenerate</button>'+rateBtns:'')+
     '<button data-act="edit">edit</button><button data-act="del" class="danger">delete</button></div>';
   d.querySelectorAll(".actions button").forEach(b=>b.onclick=()=>handleAction(b.dataset.act,m,d,b));
   d.querySelectorAll("[data-sib]").forEach(b=>b.onclick=()=>{if(b.disabled)return;switchSibling(m.siblings[m.sib_index+(b.dataset.sib==="next"?1:-1)]);});
+  d.addEventListener("click",e=>{   // tap a message (mobile) to reveal its actions
+    if(e.target.closest("button,a,input,textarea,summary,.edit-wrap"))return;
+    if(String(window.getSelection?window.getSelection():"").trim())return;
+    d.classList.toggle("revealed");
+  });
   return d;
 }
 function handleAction(act,m,d,btn){
@@ -2366,16 +2962,97 @@ function startEdit(m,d){
 async function deleteMsg(m){if(!await uiConfirm("Delete this message and everything below it on this branch?",{danger:true,ok:"Delete"}))return;
   try{current=await api("DELETE","/api/conversations/"+current.id+"/messages/"+m.id);renderConvo();refreshList();toast("deleted");}catch(e){toast(e.message);}}
 
+// ---------------- attachments + context meter
+function fmtK(n){n=Math.round(n||0);if(n<1000)return ""+n;if(n<10000)return (n/1000).toFixed(1).replace(/\.0$/,'')+"k";return Math.round(n/1000)+"k";}
+function estTok(s){return Math.max(1,Math.round((s||"").length/4));}
+function stripTC(s){return (s||"").replace(/<tool_call>[\s\S]*?<\/tool_call>/g,"").replace(/<tool_call>[\s\S]*$/,"").trim();}
+function fileToB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(",")[1]||"");r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(file);});}
+function pendingReady(){return pendingAtt.filter(a=>!a.busy&&!a.error&&a.text);}
+function clearPending(){pendingAtt=[];renderPending();}
+function renderPending(){
+  const box=$("#pending");if(!box)return;box.innerHTML="";
+  pendingAtt.forEach((a,i)=>{
+    const c=document.createElement("div");c.className="achip"+(a.busy?" busy":"")+(a.error?" err":"");
+    const tail=a.busy?'<span class="toolspin"></span>':(a.error?'<span class="tk">'+esc(a.error)+'</span>':'<span class="tk">~'+fmtK(a.tokens_est)+' tok</span>');
+    c.innerHTML='<span class="nm">'+esc(a.name)+'</span>'+tail+'<button class="rm" title="remove">&times;</button>';
+    c.querySelector(".rm").onclick=()=>{pendingAtt.splice(i,1);renderPending();};
+    box.appendChild(c);
+  });
+  updateCtx();
+}
+async function uploadFiles(files){
+  for(const f of files){
+    const item={name:f.name,busy:true};pendingAtt.push(item);renderPending();
+    try{
+      const data=await fileToB64(f);
+      const r=await api("POST","/api/extract",{name:f.name,data});
+      Object.assign(item,{busy:false,text:r.text,tokens_est:r.tokens_est,chars:r.chars,truncated:r.truncated});
+      if(r.truncated)toast(f.name+": truncated to fit");
+    }catch(e){item.busy=false;item.error=(e.message||"failed").slice(0,40);toast(f.name+": "+(e.message||"failed"));}
+    renderPending();
+  }
+}
+function ctxLimit(){const m=current&&current.model;return (CFG.model_contexts&&CFG.model_contexts[m])||CFG.default_context||8192;}
+function ctxUsed(){
+  if(!current||!current.messages)return 0;
+  for(let i=current.messages.length-1;i>=0;i--){const m=current.messages[i];
+    if(m.role==="assistant"&&m.meta&&m.meta.prompt_tokens!=null)return m.meta.prompt_tokens+(m.meta.completion_tokens||0);}
+  let t=current.system?estTok(current.system):0;
+  current.messages.forEach(m=>{t+=estTok(m.content);(m.attachments||[]).forEach(a=>t+=estTok(a.text));});
+  return t;
+}
+function updateCtx(){
+  const el=$("#ctxmeter");if(!el)return;
+  if(!current){el.style.display="none";return;}
+  const lim=ctxLimit();let used=ctxUsed();
+  const draft=($("#input")&&$("#input").value)||"";used+=estTok(draft);
+  pendingReady().forEach(a=>used+=(a.tokens_est||estTok(a.text)));
+  const pct=Math.min(100,Math.round(used/lim*100));
+  el.style.display="flex";
+  el.classList.toggle("warn",pct>=70&&pct<90);el.classList.toggle("hot",pct>=90);
+  el.querySelector("i").style.width=pct+"%";
+  el.querySelector(".ctxtxt").textContent=fmtK(used)+" / "+fmtK(lim);
+  el.title="context: "+used.toLocaleString()+" / "+lim.toLocaleString()+" tokens ("+pct+"%)";
+}
+function attsHtml(m){
+  if(!m.attachments||!m.attachments.length)return "";
+  return '<div class="atts">'+m.attachments.map(a=>{const tx=a.text||"";return '<details><summary>&#9636; '+esc(a.name)+' <span style="color:var(--faint)">~'+fmtK(estTok(tx))+' tok</span></summary><pre class="atxt">'+esc(tx.slice(0,20000))+(tx.length>20000?"\n…":"")+'</pre></details>';}).join("")+'</div>';
+}
+function toolResultEl(m){
+  const t=m.tool||{},ui=t.ui||{},ok=ui.ok!==false;
+  const d=document.createElement("div");d.className="msg assistant";d.dataset.id=m.id;
+  const label=esc((t.name||"tool")+(ui.summary?" — "+ui.summary:""));
+  const urlLine=ui.url?'<a class="turl" href="'+esc(ui.url)+'" target="_blank" rel="noopener">'+esc(ui.url)+'</a>\n\n':'';
+  d.innerHTML='<details class="toolstep'+(ok?"":" err")+'"><summary>&#9671; <span class="tlabel">'+label+'</span></summary><div class="tbody">'+urlLine+esc((m.content||"").slice(0,20000))+'</div></details>';
+  return d;
+}
 // ---------------- streaming
+function liveWrap(){let w=$("#log").querySelector(".wrap");if(!w){const l=$("#log");l.innerHTML="";w=document.createElement("div");w.className="wrap";l.appendChild(w);}const e=w.querySelector(".empty");if(e)e.remove();return w;}
 function appendLive(){
-  const stick=nearBottom();let wrap=$("#log").querySelector(".wrap");
-  if(!wrap){const l=$("#log");l.innerHTML="";wrap=document.createElement("div");wrap.className="wrap";l.appendChild(wrap);}
-  const e=wrap.querySelector(".empty");if(e)e.remove();
+  const stick=nearBottom();const wrap=liveWrap();
   const ch=charById(current.character_id);const role=ch?ch.name:"oracle";
   const d=document.createElement("div");d.className="msg assistant";
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div><div class="reason-live" style="display:none"></div><div class="bubble raw"><span class="typing"><i></i><i></i><i></i></span></div>';
   wrap.appendChild(d);if(stick)scrollDown();
-  return {bubble:d.querySelector(".bubble"),reason:d.querySelector(".reason-live")};
+  return {bubble:d.querySelector(".bubble"),reason:d.querySelector(".reason-live"),started:false};
+}
+function appendThinking(){
+  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking";
+  d.innerHTML='<div class="thinkrow"><span class="thinkdot"></span><span class="tlabel">thinking…</span></div>';
+  w.appendChild(d);if(nearBottom())scrollDown();return d;
+}
+function appendToolStep(tc){
+  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant";
+  const url=(tc.args&&tc.args.url)?tc.args.url:"";
+  d.innerHTML='<div class="toolstep"><div class="summary" style="padding:8px 11px;display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--accent2)"><span class="toolspin"></span> <span class="tlabel">'+esc(tc.name||"tool")+(url?" "+esc(url):"")+'…</span></div></div>';
+  w.appendChild(d);return d;
+}
+function updateToolStep(el,tr){
+  if(!el)return;const ok=tr.ok!==false;
+  const label=esc((tr.name||"tool")+(tr.summary?" — "+tr.summary:""));
+  const urlLine=tr.url?'<a class="turl" href="'+esc(tr.url)+'" target="_blank" rel="noopener">'+esc(tr.url)+'</a>':esc(tr.summary||"");
+  const note=tr.chars?"\n\n["+Number(tr.chars).toLocaleString()+" chars fetched]":"";
+  el.innerHTML='<details class="toolstep'+(ok?"":" err")+'"><summary>&#9671; <span class="tlabel">'+label+'</span></summary><div class="tbody">'+urlLine+note+'</div></details>';
 }
 async function streamRequest(path,body,handlers,signal){
   const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),signal});
@@ -2386,18 +3063,30 @@ async function streamRequest(path,body,handlers,signal){
     let nl;while((nl=buf.indexOf("\n"))>=0){const line=buf.slice(0,nl);buf=buf.slice(nl+1);if(!line.trim())continue;
       let o;try{o=JSON.parse(line);}catch(_){continue;}
       if(o.error)throw new Error(o.error);else if(o.delta!==undefined)handlers.onDelta(o.delta);
-      else if(o.reasoning!==undefined)handlers.onReason(o.reasoning);else if(o.done)result=o;}}
+      else if(o.reasoning!==undefined)handlers.onReason(o.reasoning);
+      else if(o.status!==undefined)handlers.onStatus&&handlers.onStatus(o.status);
+      else if(o.tool_call)handlers.onToolCall&&handlers.onToolCall(o.tool_call);
+      else if(o.tool_result)handlers.onToolResult&&handlers.onToolResult(o.tool_result);
+      else if(o.done)result=o;}}
   return result;
 }
 async function streamTurn(body){
-  const live=appendLive();let acc="",racc="",started=false;
+  let live=null,think=null,racc="";const toolEls={};
+  function clearThink(){if(think){think.remove();think=null;}}
+  function showThink(t){if(live)return;if(!think)think=appendThinking();const l=think.querySelector(".tlabel");if(l&&t)l.textContent=t;if(nearBottom())scrollDown();}
+  function bubble(){clearThink();if(!live)live=appendLive();return live;}
+  showThink("thinking…");
   const c=new AbortController();activeController=c;
   try{const res=await streamRequest("/api/conversations/"+current.id+"/stream",body,{
-      onDelta:d=>{const st=nearBottom();if(!started){live.bubble.textContent="";started=true;}acc+=d;live.bubble.textContent=acc;if(st)scrollDown();},
-      onReason:r=>{const st=nearBottom();racc+=r;live.reason.style.display="block";live.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(st)scrollDown();}
+      onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
+      onDelta:d=>{const st=nearBottom();const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;}L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(st)scrollDown();},
+      onReason:r=>{const st=nearBottom();const L=bubble();racc+=r;L.reason.style.display="block";L.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(st)scrollDown();},
+      onToolCall:tc=>{const st=nearBottom();clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(st)scrollDown();},
+      onToolResult:tr=>{const st=nearBottom();updateToolStep(toolEls[tr.id],tr);if(st)scrollDown();}
     },c.signal);
+    clearThink();
     return {res,stopped:false};
-  }catch(e){if(e.name==="AbortError")return {res:null,stopped:true};throw e;}
+  }catch(e){clearThink();if(e.name==="AbortError")return {res:null,stopped:true};throw e;}
   finally{activeController=null;}
 }
 function setBusy(b){busy=b;const s=$("#send");s.classList.toggle("stop",b);s.innerHTML=b?ICON_STOP:ICON_SEND;s.title=b?"stop":"send";}
@@ -2412,10 +3101,14 @@ async function runStream(body,optimistic){
   finally{setBusy(false);$("#input").focus();}
 }
 async function send(){
-  const text=$("#input").value.trim();if(!text||busy)return;
+  const text=$("#input").value.trim();const atts=pendingReady();
+  if((!text&&!atts.length)||busy)return;
+  if(pendingAtt.some(a=>a.busy)){toast("still reading a file…");return;}
   if(!current){current=await api("POST","/api/conversations",{system:CFG.default_system,model:$("#modelsel").value||CFG.default_model});}
   $("#input").value="";$("#input").style.height="auto";
-  runStream({content:text},()=>{current.messages.push({id:"tmp",role:"user",content:text,ts:new Date().toISOString()});renderConvo({stick:true});});
+  const sendAtts=atts.map(a=>({name:a.name,text:a.text}));
+  clearPending();
+  runStream({content:text,attachments:sendAtts},()=>{current.messages.push({id:"tmp",role:"user",content:text,attachments:sendAtts,ts:new Date().toISOString()});renderConvo({stick:true});});
 }
 function regenerate(m){
   const idx=current.messages.findIndex(x=>x.id===m.id);
@@ -2472,6 +3165,7 @@ async function openDrawer(){
   await refreshDrawerModels(current.endpoint_id,current.model);
   cs.onchange=()=>{const c=charById(cs.value);if(c){$("#d_system").value=c.system||"";if(c.model)rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);}};
   $("#d_system").value=current.system||"";
+  $("#d_tools").checked=!!current.tools;
   buildParamsGrid($("#d_params"),current.params||{});
   showOverlay($("#drawer"));
 }
@@ -2481,7 +3175,7 @@ async function refreshDrawerModels(endpointId,value){
   rebuildModelSelect($("#d_model"),models,value||current.model);
 }
 async function saveDrawer(){
-  const payload={character_id:$("#d_char").value||null,model:$("#d_model").value,system:$("#d_system").value,params:readParamsGrid($("#d_params"))};
+  const payload={character_id:$("#d_char").value||null,model:$("#d_model").value,system:$("#d_system").value,tools:$("#d_tools").checked,params:readParamsGrid($("#d_params"))};
   if(isAdmin())payload.endpoint_id=$("#d_endpoint").value||null;
   try{current=await api("POST","/api/conversations/"+current.id+"/settings",payload);closeOverlay($("#drawer"));renderConvo();refreshList();toast("saved");}catch(e){toast(e.message);}
 }
@@ -2664,7 +3358,20 @@ $("#cw_range").addEventListener("input",e=>applyCW(parseInt(e.target.value)));
 $("#cw_reset").onclick=()=>applyCW(840);
 const inp=$("#input");
 inp.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();if(!busy)send();}});
-inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,230)+"px";});
+inp.addEventListener("input",()=>{inp.style.height="auto";inp.style.height=Math.min(inp.scrollHeight,230)+"px";updateCtx();});
+$("#attachbtn").onclick=()=>$("#fileinput").click();
+$("#fileinput").onchange=e=>{const fs=[...e.target.files];e.target.value="";if(fs.length)uploadFiles(fs);};
+(function(){const comp=$("#composer");if(!comp)return;
+  let dc=0;
+  comp.addEventListener("dragenter",e=>{e.preventDefault();dc++;comp.classList.add("dragover");});
+  comp.addEventListener("dragover",e=>{e.preventDefault();});
+  comp.addEventListener("dragleave",e=>{e.preventDefault();if(--dc<=0){dc=0;comp.classList.remove("dragover");}});
+  comp.addEventListener("drop",e=>{e.preventDefault();dc=0;comp.classList.remove("dragover");const fs=[...((e.dataTransfer&&e.dataTransfer.files)||[])];if(fs.length)uploadFiles(fs);});
+})();
+(function(){const log=$("#log"),btn=$("#scrolltop");if(!log||!btn)return;
+  log.addEventListener("scroll",()=>btn.classList.toggle("show",log.scrollTop>500));
+  btn.onclick=()=>log.scrollTo({top:0,behavior:"smooth"});
+})();
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){if($("#dlgwrap").classList.contains("show"))return;closeAll();}});
 
 (async function init(){
