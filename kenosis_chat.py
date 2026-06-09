@@ -106,7 +106,7 @@ FALLBACK_MODELS = ["kenosistron", "kenosistron-q6", "kenosistron-mtp", "kenosis-
 # (what the per-param reset clears toward). top_k / repetition_penalty are file-only on the
 # server (need a model reload) so they are intentionally NOT exposed here.
 PARAM_SPECS = [
-    {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
+    {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 4,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
      "tip": "Controls randomness. Higher values (e.g. 1.2) make replies more creative and varied; lower values (e.g. 0.7) make them more focused and predictable. 0 always picks the single most likely token."},
     {"key": "top_p",             "label": "top_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.98,
      "tip": "Nucleus sampling. Each step only considers the most likely tokens whose probabilities add up to this fraction. 0.9 keeps the top 90% of the probability mass; lower means more focused. Often tuned instead of temperature."},
