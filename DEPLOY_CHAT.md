@@ -67,6 +67,7 @@ directly via `sqlite3 chat.db`.
 | `KENOSIS_COOKIE_SECURE` | off | `1` marks the session cookie `Secure` (use behind HTTPS) |
 | `KENOSIS_SESSION_DAYS` | `30` | session lifetime |
 | `KENOSIS_ADMIN_USER` / `KENOSIS_ADMIN_PASS` | — | bootstrap an admin on startup (optional) |
+| `KENOSIS_SITUATION` | `1` | append the current date (and, with tools off, a no-internet note) to the system prompt for grounding. Day-granular so it preserves prefix caching; set `0` to disable |
 
 The model endpoints themselves (URLs + API keys) are configured in-app under Settings → Endpoints,
 not via env, so they live in the database with the rest of the state.

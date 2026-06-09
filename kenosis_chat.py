@@ -44,6 +44,10 @@ SESSION_DAYS = int(os.environ.get("KENOSIS_SESSION_DAYS", "30"))
 COOKIE_NAME = "ksession"
 
 MAX_TOKENS = 32768
+# Sliding-window context management: when a conversation outgrows the model's window we drop the
+# oldest turns from what we *send* (the saved chat is untouched) so generation can keep rolling over.
+CTX_REPLY_RESERVE = 512   # always keep at least this much room for the answer
+CTX_MARGIN = 256          # slack for prompt-token estimation error
 REQUEST_TIMEOUT = 1800
 PBKDF2_ITERS = 240000
 
@@ -808,10 +812,19 @@ def est_tokens(text):
     return max(1, round(len(text or "") / 4))
 
 
+def _msg_tokens(m):
+    t = est_tokens(m.get("content"))
+    for a in (m.get("attachments") or []):
+        t += est_tokens(a.get("text"))
+    return t
+
+
 def _attach_block(attachments):
+    # Fence each file so the model can cleanly tell document text apart from the user's instruction.
     parts = []
     for a in attachments or []:
-        parts.append("[Attached file: %s]\n%s" % (a.get("name", "file"), a.get("text", "")))
+        name = str(a.get("name", "file")).replace('"', "'")
+        parts.append('<file name="%s">\n%s\n</file>' % (name, a.get("text", "")))
     return "\n\n".join(parts)
 
 
@@ -891,6 +904,48 @@ def build_api_messages(system, messages):
                 content = block + ("\n\n" + content if content else "")
             api.append({"role": role, "content": content})
     return api
+
+
+# Appended to the system prompt only when web tools are on. Static text → part of the cacheable
+# prefix, so it never costs a cache hit. Targets the exact failure modes the recovery code handles.
+TOOL_GUIDE = (
+    "# Web access\n"
+    "You can call the fetch_url function to read a public web page or a plain-text/JSON URL. "
+    "Use it when the user shares a link, or when a good answer needs current or online information you "
+    "don't reliably know. Pass the full absolute http(s) URL. Ground your answer only in what you "
+    "actually fetched — quote or summarize it — and never invent URLs, page contents, or citations. "
+    "If a fetch fails or you have no URL to use, say so plainly instead of guessing."
+)
+
+# Default-on; admins can set KENOSIS_SITUATION=0 to stop injecting the date/no-internet note.
+SITUATION_NOTE = os.environ.get("KENOSIS_SITUATION", "1") not in ("0", "false", "no", "")
+
+
+def _today_str():
+    now = datetime.now().astimezone()
+    return now.strftime("%A, ") + now.strftime("%B ") + str(int(now.strftime("%d"))) + now.strftime(", %Y")
+
+
+def compose_system(system, tools_on):
+    """Assemble the final system prompt from the user's text plus situational addenda.
+
+    Cache-aware by construction: the user's prompt and the (static) tool guidance form a stable
+    prefix, and the only volatile piece — the date — is deliberately day-granular (never time-of-day),
+    so vLLM prefix-caching holds across every turn within a day and misses at most once at midnight.
+    """
+    parts = []
+    s = (system or "").strip()
+    if s:
+        parts.append(s)
+    if tools_on:
+        parts.append(TOOL_GUIDE)
+    if SITUATION_NOTE:
+        line = "Current date: " + _today_str() + "."
+        if not tools_on:
+            line += (" You have no live internet access; if a question depends on current information "
+                     "you can't be sure of, say so rather than guessing.")
+        parts.append(line)
+    return "\n\n".join(parts)
 
 
 def effective_params(convo):
@@ -1068,6 +1123,28 @@ def model_contexts(ep):
     except Exception:
         pass
     return out
+
+
+_CTX_CACHE = {}      # endpoint id -> (fetched_at, {model: context_window}); 5-min TTL
+_CTX_LOCK = threading.Lock()
+
+
+def context_for(ep, model, default=DEFAULT_CONTEXT):
+    """Context window for a model, cached per endpoint (model_contexts hits the network). Returns
+    `default` when the window is unknown — pass default=0 to distinguish 'unknown' from a real value."""
+    key = ep.get("id") or ep.get("url") or "?"
+    now = time.time()
+    with _CTX_LOCK:
+        ent = _CTX_CACHE.get(key)
+    if not ent or now - ent[0] >= 300:
+        try:
+            m = model_contexts(ep)
+        except Exception:
+            m = {}
+        with _CTX_LOCK:
+            _CTX_CACHE[key] = (now, m)
+        ent = (now, m)
+    return ent[1].get(model) or default
 
 
 def shown_models(u):
@@ -2187,6 +2264,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ctx = chain_content(cid, parent) + [{"role": "user", "content": content, "attachments": attachments or None}]
             lead, title_after = ("user", content, attachments), True
 
+        # Finalize the system prompt against the *effective* tool state (continue mode turns tools off).
+        # Date stays day-granular so this whole block remains a stable, cacheable prefix within a day.
+        system = compose_system(system, tools is not None)
+
+        # Context-window management. When the conversation outgrows the model's window we slide it:
+        # drop the oldest turns from what we *send* (keeping the system prompt + most recent turns)
+        # so there's always room to answer and generation can roll over indefinitely. The stored chat
+        # is untouched; a non-fatal notice tells the user what the model can no longer see. max_tokens
+        # is a body param only, so none of this affects prefix-cache hits. We act only when the real
+        # window is known, so a missing/flaky /v1/models never trims or throttles a big model.
+        ctx_notice = None
+        try:
+            ctx_win = context_for(ep, model, default=0)
+            if ctx_win > 0:
+                want = int(params.get("max_tokens", MAX_TOKENS) or MAX_TOKENS)
+                sys_est = est_tokens(system)
+                budget = ctx_win - CTX_REPLY_RESERVE - CTX_MARGIN   # tokens left for the history
+                dropped = 0
+                # never drop the final message (the current turn / continue prefill)
+                while len(ctx) > 1 and sys_est + sum(_msg_tokens(m) for m in ctx) > budget:
+                    ctx.pop(0); dropped += 1
+                # don't start the window on an orphaned tool result or a dangling non-user turn
+                while len(ctx) > 1 and ctx[0].get("role") != "user":
+                    ctx.pop(0); dropped += 1
+                prompt_est = sys_est + sum(_msg_tokens(m) for m in ctx)
+                room = ctx_win - prompt_est - CTX_MARGIN
+                params["max_tokens"] = max(64, min(want, room if room > 64 else 64))
+                if dropped:
+                    ctx_notice = (
+                        "This conversation outgrew {model}'s ~{cw:,}-token context window, so the {n} "
+                        "oldest message{s} dropped from what the model sees this turn — your saved chat "
+                        "is unchanged. (Automatic context compression is coming.)").format(
+                            model=model, cw=ctx_win, n=dropped, s=" was" if dropped == 1 else "s were")
+                elif room < CTX_REPLY_RESERVE:   # a single huge final turn we can't trim around
+                    ctx_notice = (
+                        "This message nearly fills {model}'s ~{cw:,}-token context window; the reply may "
+                        "be cut short or fail. (Automatic context compression is coming.)").format(
+                            model=model, cw=ctx_win)
+        except Exception:
+            pass
+
         def persist(collected, reply, reasoning, meta):
             with db():
                 if continue_id:
@@ -2233,6 +2351,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 gone[0] = True
+
+        if ctx_notice:
+            emit({"notice": ctx_notice})
 
         work = list(ctx)
         collected = []
@@ -3050,6 +3171,9 @@ PAGE_HEAD = r"""<!doctype html>
   .thinking .thinkrow{display:flex;align-items:center;gap:9px;color:var(--muted);font-family:var(--read-font);font-style:italic;font-size:calc(15px*var(--rs));padding:3px 0;}
   .thinkdot{width:9px;height:9px;border-radius:50%;background:var(--accent);animation:thinkpulse 1.15s ease-in-out infinite;flex:0 0 auto;}
   @keyframes thinkpulse{0%,100%{opacity:.3;transform:scale(.82);}50%{opacity:1;transform:scale(1.12);}}
+  .ctx-notice{margin:4px 0 16px;padding:10px 13px;border-radius:9px;background:var(--danger-weak);
+              border:1px solid var(--danger);color:var(--danger);font-family:var(--mono);
+              font-size:11.5px;line-height:1.55;letter-spacing:.01em;}
   .chk .chkrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);cursor:pointer;}
   .chk .chkrow code{font-family:var(--mono);font-size:11px;background:var(--code-bg);padding:.05em .3em;border-radius:4px;}
   input[type=checkbox]{appearance:none;-webkit-appearance:none;flex:0 0 auto;width:17px;height:17px;margin:0;border:1px solid var(--line);border-radius:5px;background:var(--bg);cursor:pointer;display:inline-grid;place-content:center;transition:background .12s,border-color .12s;}
@@ -3427,7 +3551,7 @@ const ICON_SUN='<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtNum(n){return n==null?"?":Number(n).toLocaleString();}
 function isAdmin(){return CFG&&CFG.is_admin;}
-function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove("show"),2600);}
+function toast(m,ms){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove("show"),ms||2600);}
 async function api(method,path,body){
   const o={method,headers:{"Content-Type":"application/json"}};
   if(body!==undefined)o.body=JSON.stringify(body);
@@ -3883,6 +4007,12 @@ function appendThinking(){
   d.innerHTML='<div class="thinkrow"><span class="thinkdot"></span><span class="tlabel">thinking…</span></div>';
   w.appendChild(d);if(autoScroll)scrollDown();return d;
 }
+function showNotice(msg){
+  // non-fatal context-window warning, shown inline just above the incoming reply
+  const w=liveWrap();let n=w.querySelector(".ctx-notice");
+  if(!n){n=document.createElement("div");n.className="ctx-notice";}
+  n.textContent="⚠ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
+}
 function appendToolStep(tc){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant";
   const url=(tc.args&&tc.args.url)?tc.args.url:"";
@@ -3909,6 +4039,7 @@ async function streamRequest(path,body,handlers,signal){
       else if(o.status!==undefined)handlers.onStatus&&handlers.onStatus(o.status);
       else if(o.tool_call)handlers.onToolCall&&handlers.onToolCall(o.tool_call);
       else if(o.tool_result)handlers.onToolResult&&handlers.onToolResult(o.tool_result);
+      else if(o.notice!==undefined)handlers.onNotice&&handlers.onNotice(o.notice);
       else if(o.done)result=o;}}
   return result;
 }
@@ -3926,7 +4057,8 @@ async function streamTurn(body){
       onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;}L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();},
       onReason:r=>{const L=bubble();racc+=r;L.reason.style.display="block";L.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(autoScroll)scrollDown();},
       onToolCall:tc=>{clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(autoScroll)scrollDown();},
-      onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();}
+      onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();},
+      onNotice:msg=>{showNotice(msg);toast("context window reached",6000);}
     },c.signal);
     clearThink();
     return {res,stopped:false};
@@ -4506,6 +4638,7 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__ · ORACLE</title>
+<script>try{var _t=localStorage.getItem('oracle_theme');if(_t==='light'||_t==='dark')document.documentElement.setAttribute('data-theme',_t);}catch(e){}</script>
 <meta name="robots" content="noindex, nofollow">
 <meta name="theme-color" content="#100c08">
 <meta name="color-scheme" content="dark light">
@@ -4532,12 +4665,19 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
     --serif:'Newsreader','Iowan Old Style',Georgia,'Times New Roman',serif;
     color-scheme:dark;
   }
-  @media (prefers-color-scheme: light){:root{
+  /* light palette: follow the OS by default, but let an explicit data-theme override it */
+  @media (prefers-color-scheme: light){:root:not([data-theme]){
     --bg:#f4ecda; --surface:#e6dcc6; --line:rgba(90,68,34,.16);
     --text:#2c2316; --muted:#6a5c43; --faint:#9a8b6e;
     --accent:#b26a1d; --accent2:#7d5320; --user:#6d5a32; --code-bg:#e9e0cc;
     color-scheme:light;
   }}
+  :root[data-theme="light"]{
+    --bg:#f4ecda; --surface:#e6dcc6; --line:rgba(90,68,34,.16);
+    --text:#2c2316; --muted:#6a5c43; --faint:#9a8b6e;
+    --accent:#b26a1d; --accent2:#7d5320; --user:#6d5a32; --code-bg:#e9e0cc;
+    color-scheme:light;
+  }
   *{box-sizing:border-box;}
   html{-webkit-text-size-adjust:100%;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:var(--serif);
@@ -4546,9 +4686,15 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
   a{color:var(--accent);text-underline-offset:2px;}
   .page{max-width:46rem;margin:0 auto;padding:clamp(28px,6vw,80px) clamp(20px,5vw,40px) 40px;}
   header.doc{border-bottom:1px solid var(--line);padding-bottom:26px;margin-bottom:14px;}
+  .brandrow{display:flex;align-items:center;justify-content:space-between;gap:12px;}
   .brand{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;
          letter-spacing:.34em;text-transform:uppercase;color:var(--accent);text-decoration:none;font-weight:500;}
   .brand img{width:20px;height:20px;display:block;opacity:.92;}
+  .theme-toggle{background:none;border:none;padding:5px;margin:-5px;cursor:pointer;color:var(--faint);
+                border-radius:8px;display:inline-flex;line-height:0;transition:color .15s;}
+  .theme-toggle:hover{color:var(--accent);}
+  .theme-toggle svg{width:17px;height:17px;stroke:currentColor;stroke-width:1.7;fill:none;
+                    stroke-linecap:round;stroke-linejoin:round;display:block;}
   h1{font-family:var(--serif);font-weight:600;font-size:clamp(28px,5vw,40px);line-height:1.18;
      margin:20px 0 10px;letter-spacing:-.01em;}
   .sub{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--faint);text-transform:uppercase;}
@@ -4585,7 +4731,10 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
 </head><body>
 <div class="page">
   <header class="doc">
-    <a class="brand" href="__HOME__/"><img src="__HOME__/favicon.svg" alt=""> Oracle</a>
+    <div class="brandrow">
+      <a class="brand" href="__HOME__/"><img src="__HOME__/favicon.svg" alt=""> Oracle</a>
+      <button class="theme-toggle" id="themebtn" type="button" aria-label="Toggle light or dark theme" title="Toggle theme"></button>
+    </div>
     <h1 id="title"></h1>
     <div class="sub" id="sub"></div>
   </header>
@@ -4644,6 +4793,19 @@ function md(src){
   const sub=document.getElementById("sub");
   const n=(D.messages||[]).length;
   sub.textContent=n+(n===1?" message":" messages");
+})();
+// ---- light/dark toggle (defaults to the OS preference; an explicit choice is remembered)
+(function(){
+  const MOON='<svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+  const SUN='<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.2M12 19.8V22M4.2 4.2l1.6 1.6M18.2 18.2l1.6 1.6M2 12h2.2M19.8 12H22M4.2 19.8l1.6-1.6M18.2 5.8l1.6-1.6"/></svg>';
+  const btn=document.getElementById("themebtn");if(!btn)return;
+  const cur=()=>document.documentElement.getAttribute("data-theme")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");
+  const paint=()=>{btn.innerHTML=cur()==="dark"?MOON:SUN;};
+  btn.onclick=()=>{const t=cur()==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",t);
+    try{localStorage.setItem("oracle_theme",t);}catch(e){}
+    const mc=document.querySelector('meta[name="theme-color"]');if(mc)mc.setAttribute("content",t==="dark"?"#100c08":"#f4ecda");
+    paint();};
+  paint();
 })();
 </script>
 </body></html>"""
