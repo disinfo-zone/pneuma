@@ -190,7 +190,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS conversations(
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, folder_id TEXT, title TEXT,
                 system TEXT, model TEXT, endpoint_id TEXT, params TEXT, character_id TEXT,
-                active_leaf_id TEXT, tools INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL, updated TEXT NOT NULL);
+                active_leaf_id TEXT, tools INTEGER NOT NULL DEFAULT 0, think INTEGER, created TEXT NOT NULL, updated TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages(
                 id TEXT PRIMARY KEY, convo_id TEXT NOT NULL, parent_id TEXT, position INTEGER NOT NULL,
                 role TEXT NOT NULL, content TEXT, reasoning TEXT, model TEXT, meta TEXT, ts TEXT, edited TEXT,
@@ -230,6 +230,8 @@ def init_db():
             c.execute("ALTER TABLE conversations ADD COLUMN active_leaf_id TEXT")
         if "tools" not in ccols:
             c.execute("ALTER TABLE conversations ADD COLUMN tools INTEGER NOT NULL DEFAULT 0")
+        if "think" not in ccols:   # NULL = model default; 1 = thinking on; 0 = thinking off
+            c.execute("ALTER TABLE conversations ADD COLUMN think INTEGER")
         ucols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
         if "persona" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN persona TEXT")
@@ -279,7 +281,7 @@ def seed_settings():
     defaults = {
         "endpoints": [dict(SEED_ENDPOINT)], "active_endpoint": SEED_ENDPOINT["id"],
         "default_model": DEFAULT_MODEL, "default_system": DEFAULT_SYSTEM,
-        "default_params": {}, "user_models": [DEFAULT_MODEL],
+        "default_params": {}, "user_models": [DEFAULT_MODEL], "thinking_models": [],
     }
     for k, v in defaults.items():
         if get_setting(k) is None:
@@ -290,7 +292,8 @@ def seed_settings():
 
 def admin_settings():
     return {k: get_setting(k) for k in
-            ("endpoints", "active_endpoint", "default_model", "default_system", "default_params", "user_models")}
+            ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
+             "user_models", "thinking_models")}
 
 
 def endpoint_by_id(eid):
@@ -566,6 +569,42 @@ def list_convos(u):
     return [dict(r) for r in rows]
 
 
+def _snippet(content, q, span=140):
+    """A short excerpt of `content` centred on the first case-insensitive match of `q`."""
+    content = " ".join((content or "").split())   # collapse whitespace for a tidy one-liner
+    i = content.lower().find(q.lower())
+    if i < 0:
+        return content[:span]
+    start = max(0, i - 48)
+    end = min(len(content), i + len(q) + span - 48)
+    return ("…" if start > 0 else "") + content[start:end] + ("…" if end < len(content) else "")
+
+
+def search_convo_content(u, q, limit=60):
+    """Conversations of `u` with a message body matching `q`, each with one snippet. Title-only
+    matching is handled client-side; this is the full-text half."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    rows = db().execute(
+        "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,m.content "
+        "FROM messages m JOIN conversations c ON c.id=m.convo_id "
+        "WHERE c.owner_id=? AND m.role IN('user','assistant') AND m.content LIKE ? ESCAPE '\\' "
+        "ORDER BY c.updated DESC", (u["id"], like)).fetchall()
+    out, seen = [], set()
+    for r in rows:
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        d = {k: r[k] for k in ("id", "title", "updated", "created", "model", "character_id", "folder_id")}
+        d["snippet"] = _snippet(r["content"], q)
+        out.append(d)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _tree(cid):
     rows = db().execute("SELECT * FROM messages WHERE convo_id=? ORDER BY position", (cid,)).fetchall()
     by = {r["id"]: r for r in rows}
@@ -647,7 +686,7 @@ def get_convo(cid, u=None):
             "title": r["title"] or "", "system": r["system"] or "", "model": r["model"],
             "endpoint_id": r["endpoint_id"], "params": json.loads(r["params"]) if r["params"] else {},
             "character_id": r["character_id"], "active_leaf_id": r["active_leaf_id"],
-            "tools": bool(r["tools"]),
+            "tools": bool(r["tools"]), "think": r["think"],
             "created": r["created"], "updated": r["updated"],
             "messages": active_path(cid, r["active_leaf_id"])}
 
@@ -817,6 +856,27 @@ def _msg_tokens(m):
     for a in (m.get("attachments") or []):
         t += est_tokens(a.get("text"))
     return t
+
+
+# Our token estimate is a crude chars/4. After each reply the server reports the *real* prompt token
+# count, so we learn a per-model correction factor (real / estimated) and apply it to future context
+# trim / cap decisions — they then track the model's actual tokenizer instead of a fixed guess.
+_TOK_CAL = {}
+_TOK_CAL_LOCK = threading.Lock()
+
+
+def tok_factor(model):
+    with _TOK_CAL_LOCK:
+        return _TOK_CAL.get(model, 1.0)
+
+
+def update_tok_factor(model, real_tokens, est):
+    if not model or not real_tokens or not est:
+        return
+    obs = max(0.4, min(4.0, real_tokens / est))   # clamp wild outliers
+    with _TOK_CAL_LOCK:
+        cur = _TOK_CAL.get(model)
+        _TOK_CAL[model] = obs if cur is None else (0.7 * cur + 0.3 * obs)   # EMA toward the latest reading
 
 
 def _attach_block(attachments):
@@ -1613,6 +1673,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "default_model": get_setting("default_model", DEFAULT_MODEL),
             "model_contexts": model_contexts(active_endpoint()),
             "default_context": DEFAULT_CONTEXT,
+            "thinking_models": get_setting("thinking_models", []),
         }
         if u["role"] == "admin":
             payload["settings"] = admin_settings()
@@ -1694,6 +1755,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"folders": list_folders(u)})
         if path == "/api/conversations":
             return self._json(200, {"conversations": list_convos(u)})
+        if path == "/api/search":
+            q = (parse_qs(parsed.query).get("q") or [""])[0]
+            return self._json(200, {"results": search_convo_content(u, q)})
         if path == "/api/export":
             rows = db().execute("SELECT id FROM conversations WHERE owner_id=? ORDER BY updated DESC", (u["id"],)).fetchall()
             convos = [convo_export(r["id"]) for r in rows]
@@ -2072,7 +2136,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/settings":
             if u["role"] != "admin":
                 return self._json(403, {"error": "admin only"})
-            for k in ("endpoints", "active_endpoint", "default_model", "default_system", "default_params", "user_models"):
+            for k in ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
+                      "user_models", "thinking_models"):
                 if k in payload:
                     set_setting(k, payload[k])
             return self._json(200, {"settings": admin_settings(), "all_models": fetch_models(active_endpoint())})
@@ -2184,6 +2249,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sets.append("endpoint_id=?"); args.append(payload["endpoint_id"])
             if "tools" in payload:
                 sets.append("tools=?"); args.append(1 if payload["tools"] else 0)
+            if "think" in payload:   # None -> model default; else 1/0
+                sets.append("think=?"); args.append(None if payload["think"] is None else (1 if payload["think"] else 0))
             if "params" in payload:
                 sets.append("params=?"); args.append(json.dumps(payload["params"] or {}))
             if "folder_id" in payload:
@@ -2275,20 +2342,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # is a body param only, so none of this affects prefix-cache hits. We act only when the real
         # window is known, so a missing/flaky /v1/models never trims or throttles a big model.
         ctx_notice = None
+        sent_est_raw = None   # uncalibrated chars/4 estimate of what we sent (for post-reply learning)
         try:
             ctx_win = context_for(ep, model, default=0)
             if ctx_win > 0:
                 want = int(params.get("max_tokens", MAX_TOKENS) or MAX_TOKENS)
+                factor = tok_factor(model)   # learned correction toward this model's real tokenizer
                 sys_est = est_tokens(system)
+                raw = lambda: sys_est + sum(_msg_tokens(m) for m in ctx)
+                est = lambda: round(raw() * factor)
                 budget = ctx_win - CTX_REPLY_RESERVE - CTX_MARGIN   # tokens left for the history
                 dropped = 0
                 # never drop the final message (the current turn / continue prefill)
-                while len(ctx) > 1 and sys_est + sum(_msg_tokens(m) for m in ctx) > budget:
+                while len(ctx) > 1 and est() > budget:
                     ctx.pop(0); dropped += 1
                 # don't start the window on an orphaned tool result or a dangling non-user turn
                 while len(ctx) > 1 and ctx[0].get("role") != "user":
                     ctx.pop(0); dropped += 1
-                prompt_est = sys_est + sum(_msg_tokens(m) for m in ctx)
+                sent_est_raw = raw()
+                prompt_est = est()
                 room = ctx_win - prompt_est - CTX_MARGIN
                 params["max_tokens"] = max(64, min(want, room if room > 64 else 64))
                 if dropped:
@@ -2359,9 +2431,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         collected = []
         reply, reasoning, usage = "", "", None
         t0 = time.time(); t_first = [0.0]
-        # tells continuation-aware servers (vLLM / llama.cpp) to extend the trailing assistant
-        # message rather than open a fresh turn; harmless extras are dropped by stream_model's fallback
-        cont_extra = {"add_generation_prompt": False, "continue_final_message": True} if continue_id else None
+        # Per-request body extras (dropped by stream_model's fallback if a server rejects them):
+        #  - continuation hints so vLLM/llama.cpp extend the trailing assistant message
+        #  - enable_thinking, only for models an admin has marked thinking-capable site-wide
+        cont_extra = {}
+        if continue_id:
+            cont_extra.update({"add_generation_prompt": False, "continue_final_message": True})
+        if model in set(get_setting("thinking_models", []) or []):
+            # off by default (NULL/0); the user must explicitly enable thinking per chat in tune
+            cont_extra["chat_template_kwargs"] = {"enable_thinking": convo.get("think") == 1}
+        cont_extra = cont_extra or None
 
         def run_stream(cur_tools):
             # Stream a turn. Leading whitespace is held back so a *dropped* tool call (which the oMLX
@@ -2497,6 +2576,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pn = matching_preset_name(u, model, convo.get("params") or {})
         if pn:
             meta["preset"] = pn
+        # Learn this model's real tokens-per-estimate from the server's reported prompt size. Only on
+        # clean text turns (no tool steps, which inflate the real prompt beyond what we measured).
+        if usage and usage.get("prompt_tokens") and not collected and sent_est_raw:
+            update_tok_factor(model, usage["prompt_tokens"], sent_est_raw)
         persist(collected, reply, reasoning, meta)
 
         # On the very first exchange, summarize a short title (replacing the first-line fallback).
@@ -2988,8 +3071,12 @@ PAGE_HEAD = r"""<!doctype html>
           font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;cursor:pointer;font-weight:600;}
   #newbtn:hover{background:var(--accent);color:#1a1206;}
   .side-act .row{display:flex;gap:8px;}
-  #searchbox{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:12px;}
+  .searchwrap{position:relative;}
+  #searchbox{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:9px 30px 9px 11px;font-family:var(--mono);font-size:12px;}
   #searchbox:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
+  #searchclear{position:absolute;right:5px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--faint);
+               cursor:pointer;font-size:17px;line-height:1;padding:2px 7px;border-radius:6px;display:none;}
+  .searchwrap.has #searchclear{display:block;} #searchclear:hover{color:var(--accent);}
   .side-act .row button{flex:1;background:var(--surface);border:none;color:var(--muted);border-radius:9px;padding:9px;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;}
   .side-act .row button:hover,#selbtn.on{background:var(--surface2);color:var(--text);}
   #tree{flex:1;min-height:0;overflow-y:auto;padding:2px 8px 16px;}
@@ -3008,6 +3095,9 @@ PAGE_HEAD = r"""<!doctype html>
   .convo.active{background:var(--surface2);}
   .convo .ct{font-family:var(--serif);font-size:calc(15px*var(--rs));line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .convo .cm{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:3px;letter-spacing:.03em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .convo .cs{font-family:var(--read-font);font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.4;
+             display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .convo .cs mark{background:var(--accent-weak);color:var(--accent);border-radius:3px;padding:0 1px;}
   .convo .cmenu{position:absolute;right:5px;top:50%;transform:translateY(-50%);opacity:0;background:none;border:none;color:var(--faint);cursor:pointer;font-size:16px;padding:4px 6px;border-radius:7px;line-height:1;}
   .convo:hover .cmenu{opacity:1;}
   .convo .cmenu:hover{color:var(--text);background:var(--surface3);}
@@ -3353,7 +3443,7 @@ PAGE_BODY = r"""
       </div>
       <div class="side-act">
         <button id="newbtn">+ new conversation</button>
-        <input id="searchbox" placeholder="search…">
+        <div class="searchwrap"><input id="searchbox" placeholder="search…"><button id="searchclear" type="button" title="clear search" aria-label="clear search">&times;</button></div>
         <div class="row"><button id="foldernew" title="new folder">+ folder</button><button id="selbtn" title="select multiple">select</button></div>
       </div>
       <div id="selbar"><span class="cnt" id="selcnt">0 selected</span><button id="selmove">move</button><button id="seldel" class="danger">delete</button><button id="seldone">done</button></div>
@@ -3405,6 +3495,7 @@ PAGE_BODY = r"""
       <label class="fld"><span class="lab">model</span><select id="d_model"></select></label>
       <label class="fld"><span class="lab">system prompt <span class="sub">this chat only</span></span><textarea id="d_system" placeholder="empty = no system prompt"></textarea></label>
       <label class="fld chk"><span class="lab">web tools <span class="sub">let the model fetch web pages</span></span><label class="chkrow"><input type="checkbox" id="d_tools"> <span>enable <code>fetch_url</code> for this chat</span></label></label>
+      <label class="fld chk" id="d_think_wrap" style="display:none;"><span class="lab">thinking <span class="sub">let the model reason before answering</span></span><label class="chkrow"><input type="checkbox" id="d_think"> <span>enable extended thinking for this chat</span></label></label>
       <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span>
         <div class="preset-row"><select id="d_preset"></select><button class="mini" id="d_preset_save">save preset</button><button class="mini" id="d_preset_del" style="display:none">delete</button></div>
         <div class="params-grid" id="d_params"></div>
@@ -3474,6 +3565,10 @@ PAGE_BODY = r"""
           <label class="fld"><span class="lab">default system prompt</span><textarea id="def_system"></textarea></label>
           <div class="fld"><span class="lab">default sampler parameters</span><div class="params-grid" id="def_params"></div>
             <div class="params-foot"><button class="mini" id="def_defaults">server defaults</button><button class="mini" id="def_clear">clear</button></div>
+          </div>
+          <div class="fld"><span class="lab">thinking-capable models <span class="sub">show a per-chat thinking toggle for these</span></span>
+            <div class="hintbox" style="margin-top:6px;">Only enable for models whose chat template supports it (e.g. Qwen3, DeepSeek-R1). Sends <code>enable_thinking</code> to the endpoint.</div>
+            <div class="model-pick" id="tm_pick"></div>
           </div>
         </div>
         <div class="tab-pane" id="tab-users">
@@ -3688,9 +3783,23 @@ function renderTree(){
   });
   const uf=document.createElement("div");uf.className="folder";uf.dataset.folder="";
   if(folderCache.length)uf.innerHTML='<div class="lbl" style="padding:10px 7px 4px;">unfiled</div>';
-  if(!unfiled.length&&!convoCache.length)uf.innerHTML+='<div class="empty-list">'+(q?'no matches':'no conversations yet')+'</div>';
   unfiled.forEach(c=>uf.appendChild(convoRow(c)));
   setupDrop(uf,"");tree.appendChild(uf);
+  // full-text results: conversations matching message bodies but not the title (title matches show above)
+  let contentShown=0;
+  if(q&&q.length>=2&&searchContent.length){
+    const titleIds=new Set(convoCache.filter(match).map(c=>c.id));
+    const extra=searchContent.filter(c=>!titleIds.has(c.id));
+    if(extra.length){
+      const grp=document.createElement("div");grp.className="folder";
+      grp.innerHTML='<div class="lbl" style="padding:12px 7px 4px;">matches in messages</div>';
+      extra.forEach(c=>grp.appendChild(searchRow(c,q)));
+      tree.appendChild(grp);contentShown=extra.length;
+    }
+  }
+  const titleCount=convoCache.filter(match).length;
+  if(!convoCache.length)tree.insertAdjacentHTML("beforeend",'<div class="empty-list">no conversations yet</div>');
+  else if(q&&!titleCount&&!contentShown&&!searchPending)tree.insertAdjacentHTML("beforeend",'<div class="empty-list">no matches</div>');
 }
 function convoRow(c){
   const d=document.createElement("div");
@@ -3998,9 +4107,13 @@ function appendLive(){
   const stick=autoScroll;const wrap=liveWrap();
   const ch=charById(current.character_id);const role=ch?ch.name:"oracle";
   const d=document.createElement("div");d.className="msg assistant";
-  d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div><div class="reason-live" style="display:none"></div><div class="bubble raw"><span class="typing"><i></i><i></i><i></i></span></div>';
+  // reasoning streams into a real <details>, open, in its finished italic-quote form; it auto-collapses
+  // when the answer begins (still re-expandable).
+  d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div>'+
+    '<details class="reason" open style="display:none"><summary>reasoning</summary><div class="rbody"></div></details>'+
+    '<div class="bubble raw"><span class="typing"><i></i><i></i><i></i></span></div>';
   wrap.appendChild(d);if(stick)scrollDown();
-  return {bubble:d.querySelector(".bubble"),reason:d.querySelector(".reason-live"),started:false};
+  return {bubble:d.querySelector(".bubble"),reasonBox:d.querySelector(".reason"),reason:d.querySelector(".rbody"),started:false,reasonCollapsed:false};
 }
 function appendThinking(){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking";
@@ -4054,8 +4167,10 @@ async function streamTurn(body){
   const c=new AbortController();activeController=c;
   try{const res=await streamRequest("/api/conversations/"+current.id+"/stream",body,{
       onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
-      onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;}L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();},
-      onReason:r=>{const L=bubble();racc+=r;L.reason.style.display="block";L.reason.innerHTML='<div class="rbody">'+esc(racc)+'</div>';if(autoScroll)scrollDown();},
+      onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;
+          if(L.reasonBox&&racc&&!L.reasonCollapsed){L.reasonBox.open=false;L.reasonCollapsed=true;}}  // answer began -> fold the reasoning
+        L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();},
+      onReason:r=>{const L=bubble();racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}if(L.reason){L.reason.textContent=racc;}if(autoScroll)scrollDown();},
       onToolCall:tc=>{clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(autoScroll)scrollDown();},
       onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();},
       onNotice:msg=>{showNotice(msg);toast("context window reached",6000);}
@@ -4265,14 +4380,23 @@ async function openDrawer(){
     // leaves the current prompt intact (no cancel button now, so don't wipe it out from under them).
     if(c){$("#d_system").value=c.system||"";patch.system=c.system||"";if(c.model){rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);patch.model=c.model;}}
     buildPresetSelect();applyDrawer(patch,{rerender:true,relist:true});};
-  $("#d_model").onchange=()=>{buildPresetSelect();applyDrawer({model:$("#d_model").value},{relist:true});};
+  $("#d_model").onchange=()=>{buildPresetSelect();syncThinkRow();applyDrawer({model:$("#d_model").value},{relist:true});};
   $("#d_system").value=current.system||"";
   $("#d_system").oninput=applySystem;
   $("#d_tools").checked=!!current.tools;
   $("#d_tools").onchange=()=>applyDrawer({tools:$("#d_tools").checked});
+  $("#d_think").onchange=()=>applyDrawer({think:$("#d_think").checked?1:0});
+  syncThinkRow();
   buildParamsGrid($("#d_params"),current.params||{});
   buildPresetSelect();
   showOverlay($("#drawer"));
+}
+function syncThinkRow(){
+  // only show the thinking toggle for models an admin has marked thinking-capable site-wide
+  const model=($("#d_model").value)||(current&&current.model)||"";
+  const ok=(CFG.thinking_models||[]).includes(model);
+  $("#d_think_wrap").style.display=ok?"":"none";
+  if(ok)$("#d_think").checked=!!(current&&current.think===1);   // off by default; on only when explicitly enabled
 }
 async function refreshDrawerModels(endpointId,value){
   let models=CFG.models;
@@ -4280,6 +4404,27 @@ async function refreshDrawerModels(endpointId,value){
   rebuildModelSelect($("#d_model"),models,value||current.model);
 }
 function debounce(fn,ms){let t;return function(){clearTimeout(t);t=setTimeout(fn,ms);};}
+// ---------------- search (title instantly client-side; message bodies via a debounced server query)
+let searchContent=[],searchPending=false;
+const _searchFetch=debounce(async()=>{
+  const q=($("#searchbox").value||"").trim();
+  if(q.length<2){searchContent=[];searchPending=false;renderTree();return;}
+  try{const r=await api("GET","/api/search?q="+encodeURIComponent(q));searchContent=r.results||[];}
+  catch(_){searchContent=[];}
+  searchPending=false;renderTree();
+},220);
+function onSearchInput(){const v=$("#searchbox").value||"";$(".searchwrap").classList.toggle("has",v.length>0);searchPending=v.trim().length>=2;renderTree();_searchFetch();}
+function clearSearch(){$("#searchbox").value="";onSearchInput();$("#searchbox").focus();}
+function hlSnippet(text,q){
+  const i=(text||"").toLowerCase().indexOf(q.toLowerCase());
+  if(i<0)return esc(text||"");
+  return esc(text.slice(0,i))+'<mark>'+esc(text.slice(i,i+q.length))+'</mark>'+esc(text.slice(i+q.length));
+}
+function searchRow(c,q){
+  const d=convoRow(c);   // reuse the normal row (click to open, context menu, drag)
+  if(c.snippet){const s=document.createElement("div");s.className="cs";s.innerHTML=hlSnippet(c.snippet,q);d.appendChild(s);}
+  return d;
+}
 async function applyDrawer(patch,opts){
   if(!current)return;opts=opts||{};
   try{current=await api("POST","/api/conversations/"+current.id+"/settings",patch);
@@ -4322,7 +4467,7 @@ function switchTab(name){
 function openSettings(tab){
   renderCharacters();
   applyTheme(curTheme());applyFont(curFont());if($("#fs_range"))$("#fs_range").value=curFS();if($("#cw_range"))$("#cw_range").value=curCW();
-  if(isAdmin()){renderEndpoints();$("#def_model").value=CFG.settings.default_model||"";$("#def_system").value=CFG.settings.default_system||"";buildParamsGrid($("#def_params"),CFG.settings.default_params||{});renderUserModels();}
+  if(isAdmin()){renderEndpoints();$("#def_model").value=CFG.settings.default_model||"";$("#def_system").value=CFG.settings.default_system||"";buildParamsGrid($("#def_params"),CFG.settings.default_params||{});renderUserModels();renderThinkingModels();}
   switchTab(tab||"account");showModal();
 }
 // characters
@@ -4353,6 +4498,8 @@ async function applyCharacter(c){
 // user models
 function renderUserModels(){const wrap=$("#um_pick");wrap.innerHTML="";const wl=new Set(CFG.settings.user_models||[]);
   (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(wl.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
+function renderThinkingModels(){const wrap=$("#tm_pick");if(!wrap)return;wrap.innerHTML="";const wl=new Set(CFG.settings.thinking_models||[]);
+  (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(wl.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
 function readModelPick(wrap){return Array.from(wrap.querySelectorAll("input:checked")).map(i=>i.value);}
 // endpoints
 function renderEndpoints(){
@@ -4373,7 +4520,8 @@ async function saveSettings(){
   collectEndpoints();
   const body={endpoints:CFG.settings.endpoints,active_endpoint:CFG.settings.active_endpoint,
     default_model:$("#def_model").value.trim(),default_system:$("#def_system").value,
-    default_params:readParamsGrid($("#def_params")),user_models:readModelPick($("#um_pick"))};
+    default_params:readParamsGrid($("#def_params")),user_models:readModelPick($("#um_pick")),
+    thinking_models:readModelPick($("#tm_pick"))};
   try{const r=await api("POST","/api/settings",body);CFG.settings=r.settings;CFG.all_models=r.all_models;
     CFG.default_model=r.settings.default_model;CFG.default_system=r.settings.default_system;CFG.default_params=r.settings.default_params;
     $("#settings-note").textContent="saved";toast("settings saved");}catch(e){toast(e.message);}}
@@ -4526,7 +4674,9 @@ $("#newbtn").onclick=newChat;
 $("#menubtn").onclick=openSidebar;
 $("#revealbtn").onclick=()=>toggleCollapse(false);
 $("#collapsebtn").onclick=()=>toggleCollapse(true);
-$("#searchbox").addEventListener("input",renderTree);
+$("#searchbox").addEventListener("input",onSearchInput);
+$("#searchbox").addEventListener("keydown",e=>{if(e.key==="Escape"&&($("#searchbox").value||"")){e.stopPropagation();clearSearch();}});
+$("#searchclear").onclick=clearSearch;
 $("#foldernew").onclick=async()=>{const n=await uiPrompt("Name your new folder:","",{title:"New folder",ok:"Create"});if(n!=null){await api("POST","/api/folders",{name:(n.trim()||"New folder")});refreshFolders();toast("folder created");}};
 $("#selbtn").onclick=()=>setSelMode(!selMode);
 $("#seldone").onclick=()=>setSelMode(false);
@@ -4713,7 +4863,16 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
   .body h1{font-size:1.5em;} .body h2{font-size:1.32em;} .body h3{font-size:1.15em;} .body h4{font-size:1.03em;}
   .body ul,.body ol{margin:.6em 0;padding-left:1.45em;} .body li{margin:.3em 0;}
   .body code{font-family:var(--mono);font-size:.8em;background:var(--code-bg);border-radius:5px;padding:.08em .36em;}
-  .body pre{background:var(--code-bg);border:1px solid var(--line);border-radius:11px;padding:15px 17px;overflow-x:auto;margin:.85em 0;}
+  .body pre{position:relative;background:var(--code-bg);border:1px solid var(--line);border-radius:11px;padding:15px 17px;overflow-x:auto;margin:.85em 0;}
+  .copy-code{position:absolute;top:8px;right:8px;background:var(--surface);color:var(--faint);border:1px solid var(--line);
+             border-radius:6px;padding:3px 8px;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+             cursor:pointer;opacity:0;transition:opacity .14s,color .14s;}
+  .body pre:hover .copy-code,.copy-code:focus{opacity:1;} .copy-code:hover{color:var(--accent);}
+  #totop{position:fixed;right:clamp(14px,4vw,32px);bottom:clamp(14px,4vw,32px);width:40px;height:40px;border-radius:50%;
+         background:var(--surface);color:var(--accent);border:1px solid var(--line);cursor:pointer;font-size:18px;line-height:1;
+         display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;
+         transform:translateY(8px);box-shadow:0 6px 20px rgba(0,0,0,.25);}
+  #totop.show{opacity:1;pointer-events:auto;transform:translateY(0);} #totop:hover{color:var(--bg);background:var(--accent);}
   .body pre code{background:none;padding:0;font-size:.82em;line-height:1.6;}
   .body blockquote{margin:.8em 0;padding:.15em 0 .15em 1.15em;border-left:2px solid var(--accent);
                    color:var(--muted);font-style:italic;}
@@ -4744,6 +4903,7 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
     <a href="__HOME__/">__HOMELABEL__ &rsaquo;</a>
   </footer>
 </div>
+<button id="totop" type="button" aria-label="Scroll to top" title="Back to top">&uarr;</button>
 <script id="d" type="application/json">__DATA__</script>
 <script>
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -4792,7 +4952,23 @@ function md(src){
   });
   const sub=document.getElementById("sub");
   const n=(D.messages||[]).length;
-  sub.textContent=n+(n===1?" message":" messages");
+  const words=(D.messages||[]).reduce((a,m)=>a+(m.content||"").split(/\s+/).filter(Boolean).length,0);
+  const mins=Math.max(1,Math.round(words/220));
+  sub.textContent=n+(n===1?" message":" messages")+" · ~"+mins+" min read";
+  // copy button on each code block
+  log.querySelectorAll(".body pre").forEach(pre=>{
+    const b=document.createElement("button");b.className="copy-code";b.type="button";b.textContent="copy";
+    b.onclick=()=>{const code=pre.querySelector("code"),txt=code?code.textContent:pre.textContent;
+      navigator.clipboard.writeText(txt).then(()=>{b.textContent="copied";setTimeout(()=>b.textContent="copy",1300);},()=>{});};
+    pre.appendChild(b);
+  });
+})();
+// scroll-to-top
+(function(){
+  const t=document.getElementById("totop");if(!t)return;
+  const onscroll=()=>t.classList.toggle("show",(window.scrollY||document.documentElement.scrollTop)>600);
+  window.addEventListener("scroll",onscroll,{passive:true});onscroll();
+  t.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});
 })();
 // ---- light/dark toggle (defaults to the OS preference; an explicit choice is remembered)
 (function(){
