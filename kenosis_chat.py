@@ -28,6 +28,7 @@ import threading
 import socket
 import ipaddress
 import requests
+import html as _html_mod
 from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qs, urlunparse, urljoin
@@ -200,6 +201,11 @@ def init_db():
                 token TEXT PRIMARY KEY, created_by INTEGER, role TEXT NOT NULL DEFAULT 'user',
                 allowed_models TEXT, max_uses INTEGER, uses INTEGER NOT NULL DEFAULT 0,
                 expires INTEGER, note TEXT, created TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS shares(
+                token TEXT PRIMARY KEY, convo_id TEXT NOT NULL, owner_id INTEGER NOT NULL,
+                title TEXT, data TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0,
+                created TEXT NOT NULL, updated TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_shares_convo ON shares(convo_id);
             CREATE INDEX IF NOT EXISTS idx_convo_owner ON conversations(owner_id, updated);
             CREATE INDEX IF NOT EXISTS idx_msg_convo ON messages(convo_id, position);
             CREATE INDEX IF NOT EXISTS idx_folder_owner ON folders(owner_id);
@@ -471,6 +477,7 @@ def list_invites():
 def delete_user_cascade(uid):
     c = db()
     with c:
+        c.execute("DELETE FROM shares WHERE owner_id=?", (uid,))
         c.execute("DELETE FROM messages WHERE convo_id IN (SELECT id FROM conversations WHERE owner_id=?)", (uid,))
         c.execute("DELETE FROM conversations WHERE owner_id=?", (uid,))
         c.execute("DELETE FROM folders WHERE owner_id=?", (uid,))
@@ -907,13 +914,15 @@ def _open_stream(ep, body):
     return requests.post(ep["url"], headers=headers, json=body, stream=True, timeout=REQUEST_TIMEOUT)
 
 
-def stream_model(ep, model, system, messages, params, tools=None):
+def stream_model(ep, model, system, messages, params, tools=None, extra=None):
     base = {"model": model, "messages": build_api_messages(system, messages), "stream": True}
     base.update(params)
     if tools:
         base["tools"] = tools
         base["tool_choice"] = "auto"
     body = dict(base)
+    if extra:
+        body.update(extra)   # best-effort hints (e.g. continue_final_message); dropped on fallback
     body["stream_options"] = {"include_usage": True}
     r = _open_stream(ep, body)
     if r.status_code >= 400:
@@ -1102,6 +1111,63 @@ def stop_requested(cid):
 def clear_stop(cid):
     with _STOP_LOCK:
         _STOP.discard(cid)
+
+
+# ---------------------------------------------------------------- public sharing
+def share_by_token(tok):
+    return db().execute("SELECT * FROM shares WHERE token=?", (tok,)).fetchone()
+
+
+def share_for_convo(cid):
+    return db().execute("SELECT * FROM shares WHERE convo_id=?", (cid,)).fetchone()
+
+
+def share_public_url(tok):
+    return PUBLIC_URL + "/s/" + tok
+
+
+def build_share_snapshot(cid):
+    """A stripped-down, frozen copy of a conversation's visible thread for public viewing:
+    user/assistant prose only — no system prompt, reasoning, tool steps, params, or file bodies."""
+    convo = get_convo(cid, None)
+    if convo is None:
+        return None
+    msgs = []
+    for m in convo.get("messages", []):
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "")
+        if role == "assistant" and "<tool_call>" in content:
+            content = strip_tool_calls(content)
+        atts = [a.get("name") or "file" for a in (m.get("attachments") or []) if a.get("name") or a.get("text")]
+        if not content.strip() and not atts:
+            continue  # e.g. an intermediate tool-only assistant turn
+        entry = {"role": role, "content": content, "ts": m.get("ts")}
+        if atts:
+            entry["files"] = atts
+        msgs.append(entry)
+    return {"title": convo.get("title") or "Untitled conversation", "messages": msgs}
+
+
+def upsert_share(cid, owner_id):
+    snap = build_share_snapshot(cid)
+    if snap is None:
+        return None
+    data = json.dumps(snap, ensure_ascii=False)
+    existing = share_for_convo(cid)
+    now = _now()
+    with db():
+        if existing:
+            db().execute("UPDATE shares SET title=?, data=?, updated=? WHERE token=?",
+                         (snap["title"], data, now, existing["token"]))
+            tok = existing["token"]
+        else:
+            tok = gen_token()
+            db().execute("INSERT INTO shares(token,convo_id,owner_id,title,data,views,created,updated)"
+                         " VALUES(?,?,?,?,?,0,?,?)",
+                         (tok, cid, owner_id, snap["title"], data, now, now))
+    return share_for_convo(cid)
 
 
 # ---------------------------------------------------------------- tools / fetch
@@ -1510,6 +1576,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"valid": False, "error": invite_error(inv)})
             return self._json(200, {"valid": True, "role": inv["role"]})
 
+        # --- public, unauthenticated share viewer (frozen snapshot; no system prompt / private data)
+        m = re.fullmatch(r"/s/([A-Za-z0-9_-]+)", path)
+        if m:
+            sh = share_by_token(m.group(1))
+            if sh is None:
+                return self._send(404, "text/html; charset=utf-8", SHARE_404,
+                                  [("Content-Security-Policy", CSP)])
+            try:
+                with db():
+                    db().execute("UPDATE shares SET views=views+1 WHERE token=?", (sh["token"],))
+            except Exception:
+                pass
+            return self._send(200, "text/html; charset=utf-8", render_share_page(sh),
+                              [("Content-Security-Policy", CSP), ("X-Robots-Tag", "noindex, nofollow")])
+
         u = self.current_user()
         if path == "/":
             if user_count() == 0:
@@ -1571,6 +1652,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c = get_convo(m.group(1), None)   # None owner = bypass ownership (read-only view)
             return self._json(200, c) if c else self._json(404, {"error": "not found"})
 
+        m = re.fullmatch(r"/api/conversations/([^/]+)/share", path)
+        if m and valid_id(m.group(1)):
+            if get_convo(m.group(1), u) is None:
+                return self._json(404, {"error": "not found"})
+            sh = share_for_convo(m.group(1))
+            if sh is None:
+                return self._json(200, {"shared": False})
+            return self._json(200, {"shared": True, "token": sh["token"], "url": share_public_url(sh["token"]),
+                                    "views": sh["views"], "updated": sh["updated"]})
+
         m = re.fullmatch(r"/api/conversations/([^/]+)", path)
         if m and valid_id(m.group(1)):
             c = get_convo(m.group(1), u)
@@ -1592,6 +1683,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             delete_user_cascade(u["id"])
             return self._json(200, {"ok": True}, extra=[self._clear_cookie()])
 
+        m = re.fullmatch(r"/api/conversations/([^/]+)/share", path)
+        if m:
+            cid = m.group(1)
+            if not get_convo(cid, u):
+                return self._json(404, {"error": "not found"})
+            with db():
+                db().execute("DELETE FROM shares WHERE convo_id=?", (cid,))
+            return self._json(200, {"shared": False})
+
         m = re.fullmatch(r"/api/conversations/([^/]+)/messages/([^/]+)", path)
         if m:
             cid, mid = m.group(1), m.group(2)
@@ -1607,6 +1707,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(404, {"error": "not found"})
             c = db()
             with c:
+                c.execute("DELETE FROM shares WHERE convo_id=?", (cid,))
                 c.execute("DELETE FROM messages WHERE convo_id=?", (cid,))
                 c.execute("DELETE FROM conversations WHERE id=?", (cid,))
             return self._json(200, {"ok": True})
@@ -1782,6 +1883,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(404, {"error": "not found"})
             request_stop(mstop.group(1))
             return self._json(200, {"ok": True})
+
+        # create or re-snapshot a public share link for this conversation
+        mshare = re.fullmatch(r"/api/conversations/([^/]+)/share", path)
+        if mshare and valid_id(mshare.group(1)):
+            cid = mshare.group(1)
+            if get_convo(cid, u) is None:
+                return self._json(404, {"error": "not found"})
+            sh = upsert_share(cid, u["id"])
+            if sh is None:
+                return self._json(400, {"error": "nothing to share"})
+            return self._json(200, {"shared": True, "token": sh["token"], "url": share_public_url(sh["token"]),
+                                    "views": sh["views"], "updated": sh["updated"]})
 
         # set active leaf (sibling switch)
         ma = re.fullmatch(r"/api/conversations/([^/]+)/active", path)
@@ -2035,9 +2148,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         attachments = self._sanitize_attachments(payload.get("attachments"))
         regenerate_id = payload.get("regenerate_id")
         edit_user_id = payload.get("edit_user_id")
+        continue_id = payload.get("continue_id")
+        cont_prefix = None   # set in continue mode: the existing text we resume from
 
         # mode -> (parent node, ctx sent to model, optional leading user message, whether to title)
-        if regenerate_id or payload.get("regenerate"):
+        if continue_id:
+            # "janky prefill": resume generation from an existing assistant message. The model is
+            # fed the partial reply as a trailing assistant turn and continues it; the new tokens are
+            # appended in place to the same message. Tools are off — this is plain text continuation.
+            tc = by.get(continue_id)
+            if tc is None or tc["role"] != "assistant":
+                return self._json(400, {"error": "can only continue an assistant message"})
+            cont_prefix = content if payload.get("content") is not None else (tc["content"] or "")
+            parent = tc["parent_id"]
+            ctx = chain_content(cid, parent) + [{"role": "assistant", "content": cont_prefix}]
+            lead, title_after = None, False
+            tools = None
+        elif regenerate_id or payload.get("regenerate"):
             target = regenerate_id or convo.get("active_leaf_id")
             tr = by.get(target)
             if tr is None or tr["role"] != "assistant":
@@ -2062,6 +2189,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         def persist(collected, reply, reasoning, meta):
             with db():
+                if continue_id:
+                    # append the continuation to the existing assistant message, in place
+                    row = by.get(continue_id)
+                    new_content = (cont_prefix or "") + (reply or "")
+                    old_reason = (row["reasoning"] if row else "") or ""
+                    merged_reason = (old_reason + reasoning) if reasoning else (old_reason or None)
+                    db().execute("UPDATE messages SET content=?, reasoning=?, model=?, meta=?, edited=? WHERE id=? AND convo_id=?",
+                                 (new_content, merged_reason, model,
+                                  json.dumps(meta) if meta else (row["meta"] if row else None), _now(), continue_id, cid))
+                    _, _, kids2 = _tree(cid)
+                    set_leaf(cid, _default_leaf(continue_id, kids2))
+                    touch_convo(cid)
+                    return
                 node = parent
                 if lead:
                     node = insert_message(cid, node, "user", lead[1], attachments=lead[2] or None)
@@ -2098,6 +2238,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         collected = []
         reply, reasoning, usage = "", "", None
         t0 = time.time(); t_first = [0.0]
+        # tells continuation-aware servers (vLLM / llama.cpp) to extend the trailing assistant
+        # message rather than open a fresh turn; harmless extras are dropped by stream_model's fallback
+        cont_extra = {"add_generation_prompt": False, "continue_final_message": True} if continue_id else None
 
         def run_stream(cur_tools):
             # Stream a turn. Leading whitespace is held back so a *dropped* tool call (which the oMLX
@@ -2117,7 +2260,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         t_first[0] = time.time()
                     emit({"delta": "".join(parts)})
 
-            for ev in stream_model(ep, model, system, work, params, tools=cur_tools):
+            for ev in stream_model(ep, model, system, work, params, tools=cur_tools, extra=cont_extra):
                 if "delta" in ev:
                     push(ev["delta"])
                 elif "reasoning" in ev:
@@ -2837,11 +2980,11 @@ PAGE_HEAD = r"""<!doctype html>
   .edit-area{width:100%;background:var(--code-bg);color:var(--text);border:none;border-radius:10px;padding:12px 13px;font-size:calc(16px*var(--rs));font-family:var(--read-font);line-height:1.6;resize:vertical;min-height:96px;}
   .edit-area:focus{outline:2px solid var(--accent-weak);}
   .edit-row{display:flex;gap:8px;margin-top:8px;}
-  .btn-primary{background:var(--accent);color:#1a1206;border:none;border-radius:8px;padding:8px 15px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
+  .btn-primary{background:var(--accent);color:#1a1206;border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
   .btn-primary:hover{filter:brightness(1.07);}
-  .btn-ghost{background:var(--surface2);color:var(--muted);border:none;border-radius:8px;padding:8px 15px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
+  .btn-ghost{background:var(--surface2);color:var(--muted);border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
   .btn-ghost:hover{background:var(--surface3);color:var(--text);}
-  .btn-danger{background:var(--danger-weak);color:var(--danger);border:none;border-radius:8px;padding:8px 15px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
+  .btn-danger{background:var(--danger-weak);color:var(--danger);border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
   .btn-danger:hover{background:var(--danger);color:#fff;}
   .typing{display:inline-flex;gap:5px;align-items:center;padding:3px 0;}
   .typing i{width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.4;animation:blink 1.2s infinite;}
@@ -3038,6 +3181,16 @@ PAGE_HEAD = r"""<!doctype html>
   .dlg input:not([type=checkbox]),.dlg select{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:11px;font-size:14px;font-family:var(--mono);margin-bottom:6px;}
   .dlg input:focus,.dlg select:focus{outline:2px solid var(--accent-weak);}
   .dlg .dlg-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;}
+  .dlg .sharelink{display:flex;gap:8px;align-items:stretch;margin-top:4px;}
+  .dlg .sharelink input{flex:1;margin-bottom:0;font-size:12px;}
+  .dlg .sharelink .btn-primary{flex:0 0 auto;}
+  .dlg .share-meta{font-family:var(--mono);font-size:11px;color:var(--faint);margin:9px 0 0;letter-spacing:.02em;}
+  .dlg .share-actions{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:13px;}
+  .dlg .linkbtn{background:none;border:none;padding:0;cursor:pointer;text-decoration:none;
+                font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);}
+  .dlg .linkbtn:hover{color:var(--accent);}
+  .dlg .linkbtn.danger{color:var(--faint);} .dlg .linkbtn.danger:hover{color:var(--danger);}
+  .dlg .share-actions .grow{flex:1;}
   #toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%) translateY(8px);background:var(--surface3);padding:10px 16px;border-radius:10px;font-family:var(--mono);font-size:12px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;z-index:99;box-shadow:var(--shadow);letter-spacing:.03em;}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
 
@@ -3096,6 +3249,7 @@ PAGE_BODY = r"""
         <div id="titlewrap"><span id="title">oracle</span><div id="submeta"></div></div>
         <div class="barbtns">
           <div id="ctxmeter" title="context usage" style="display:none"><div class="ctxbar"><i></i></div><span class="ctxtxt"></span></div>
+          <button class="barbtn" id="sharebtn" title="share this chat publicly"><svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7M16 6l-4-4-4 4M12 2v13"/></svg><span class="t">share</span></button>
           <button class="barbtn" id="exportbtn" title="export this chat">export</button>
           <button class="barbtn" id="charchip"><span class="t">character</span></button>
           <select class="msel" id="modelsel" title="model"></select>
@@ -3462,6 +3616,7 @@ function convoMenu(ev,c){
   let fopts=folderCache.map(f=>'<button data-mv="'+f.id+'">&rarr; '+esc(f.name)+'</button>').join("");
   if(c.folder_id)fopts+='<button data-mv="">&rarr; unfiled</button>';
   showMenu(ev,'<button data-a="open">open</button><button data-a="rename">rename</button>'+
+    '<button data-a="share">share &hellip;</button>'+
     '<button data-a="exmd">export markdown</button><button data-a="exjson">export json</button>'+
     '<div class="sep"></div><div class="mhint">move to folder</div>'+(fopts||'<div class="mhint" style="color:var(--dim)">no folders</div>')+
     '<div class="sep"></div><button class="danger" data-a="del">delete</button>',
@@ -3469,6 +3624,7 @@ function convoMenu(ev,c){
       m.querySelectorAll("[data-mv]").forEach(b=>b.onclick=async()=>{hideMenu();const c2=await api("POST","/api/conversations/"+c.id+"/settings",{folder_id:b.dataset.mv||null});if(current&&current.id===c.id)current=c2;refreshList();toast("moved");});
       m.querySelector('[data-a="open"]').onclick=()=>{hideMenu();openConvo(c.id);closeSidebar();};
       m.querySelector('[data-a="rename"]').onclick=async()=>{hideMenu();const t=await uiPrompt("Rename conversation",c.title||"",{title:"Rename"});if(t!=null&&t.trim()){const c2=await api("POST","/api/conversations/"+c.id+"/settings",{title:t.trim()});if(current&&current.id===c.id){current=c2;syncBar();}refreshList();}};
+      m.querySelector('[data-a="share"]').onclick=()=>{hideMenu();shareDialog(c);};
       m.querySelector('[data-a="exmd"]').onclick=async()=>{hideMenu();exportChat(c.id,"md");};
       m.querySelector('[data-a="exjson"]').onclick=async()=>{hideMenu();exportChat(c.id,"json");};
       m.querySelector('[data-a="del"]').onclick=async()=>{hideMenu();if(!await uiConfirm("Delete this conversation?",{danger:true,ok:"Delete"}))return;await api("DELETE","/api/conversations/"+c.id);if(current&&current.id===c.id){current=null;renderEmpty();}refreshList();toast("deleted");};
@@ -3482,6 +3638,42 @@ function folderMenu(ev,f){
     });
 }
 document.addEventListener("click",e=>{if(!$("#menu").contains(e.target))hideMenu();});
+
+async function shareDialog(c){
+  let st;
+  try{st=await api("GET","/api/conversations/"+c.id+"/share");}catch(e){toast(e.message);return;}
+  dialog('<h4>Share conversation</h4><div id="shareBody"></div>',(d,done)=>{
+    const body=d.querySelector("#shareBody");
+    function render(){
+      if(st&&st.shared){
+        const meta=(st.views?(st.views+' view'+(st.views===1?'':'s')+' · '):'')+'snapshot saved '+esc(relTime(st.updated));
+        body.innerHTML=
+          '<p>Anyone with this link reads a frozen, stripped-down copy of this conversation. Your system prompt and any later messages stay private.</p>'+
+          '<div class="sharelink"><input id="shareUrl" readonly value="'+esc(st.url)+'"><button class="btn-primary" data-s="copy">copy</button></div>'+
+          '<div class="share-meta">'+meta+'</div>'+
+          '<div class="share-actions">'+
+            '<a class="linkbtn" href="'+esc(st.url)+'" target="_blank" rel="noopener">open ↗</a>'+
+            '<button class="linkbtn" data-s="update">update snapshot</button>'+
+            '<button class="linkbtn danger" data-s="unshare">unshare</button>'+
+            '<span class="grow"></span>'+
+            '<button class="btn-primary" data-x>done</button>'+
+          '</div>';
+        const inp=body.querySelector("#shareUrl");
+        body.querySelector('[data-s="copy"]').onclick=()=>{inp.focus();inp.select();navigator.clipboard.writeText(st.url).then(()=>toast("link copied"),()=>toast("select & copy the link"));};
+        body.querySelector('[data-s="update"]').onclick=async(e)=>{e.target.disabled=true;try{st=await api("POST","/api/conversations/"+c.id+"/share");render();toast("snapshot updated to the current thread");}catch(err){toast(err.message);render();}};
+        body.querySelector('[data-s="unshare"]').onclick=async(e)=>{e.target.disabled=true;try{st=await api("DELETE","/api/conversations/"+c.id+"/share");render();toast("link disabled");}catch(err){toast(err.message);render();}};
+        body.querySelector('[data-x]').onclick=()=>done(null);
+      }else{
+        body.innerHTML=
+          '<p>Publish a public link to a frozen snapshot of this conversation’s current thread — a clean, gorgeous, read-only page anyone can open, no sign-in needed. Your system prompt is never shared, and new messages won’t appear unless you update the snapshot.</p>'+
+          '<div class="dlg-btns"><button class="btn-ghost" data-x>cancel</button><button class="btn-primary" data-s="create">create link</button></div>';
+        body.querySelector('[data-s="create"]').onclick=async(e)=>{e.target.disabled=true;try{st=await api("POST","/api/conversations/"+c.id+"/share");render();toast("share link ready");}catch(err){toast(err.message);e.target.disabled=false;}};
+        body.querySelector('[data-x]').onclick=()=>done(null);
+      }
+    }
+    render();
+  });
+}
 
 async function exportChat(id,fmt){
   const c=await api("GET","/api/conversations/"+id);
@@ -3569,7 +3761,7 @@ function msgEl(m,i){
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span>'+sibNav(m)+'<span class="tm">'+esc(fmtTime(m.ts)+edited)+'</span>'+mark+'</div>'+
     reason+attsHtml(m)+body+metaLine(m)+
     '<div class="actions"><button data-act="copy">copy</button>'+
-    (m.role==="assistant"?'<button data-act="raw">raw</button><button data-act="regen">regenerate</button>'+rateBtns:'')+
+    (m.role==="assistant"?'<button data-act="raw">raw</button><button data-act="continue" title="keep generating from the end of this message (prefill)">continue</button><button data-act="regen">regenerate</button>'+rateBtns:'')+
     '<button data-act="edit">edit</button><button data-act="del" class="danger">delete</button></div>';
   d.querySelectorAll(".actions button").forEach(b=>b.onclick=()=>handleAction(b.dataset.act,m,d,b));
   d.querySelectorAll("[data-sib]").forEach(b=>b.onclick=()=>{if(b.disabled)return;switchSibling(m.siblings[m.sib_index+(b.dataset.sib==="next"?1:-1)]);});
@@ -3587,6 +3779,7 @@ function handleAction(act,m,d,btn){
   if(act==="raw"){const b=d.querySelector(".bubble");if(b.classList.contains("raw")){b.classList.remove("raw");b.innerHTML=md(m.content);btn.textContent="raw";}else{b.classList.add("raw");b.textContent=m.content;btn.textContent="markdown";}return;}
   if(act==="edit"){startEdit(m,d);return;}
   if(act==="regen"){regenerate(m);return;}
+  if(act==="continue"){continueMsg(m);return;}
   if(act==="up"){rate(m,(m.rating>0)?0:1);return;}
   if(act==="down"){rate(m,(m.rating<0)?0:-1);return;}
   if(act==="del"){deleteMsg(m);return;}
@@ -3724,7 +3917,9 @@ async function streamTurn(body){
   function clearThink(){if(think){think.remove();think=null;}}
   function showThink(t){if(live)return;if(!think)think=appendThinking();const l=think.querySelector(".tlabel");if(l&&t)l.textContent=t;if(autoScroll)scrollDown();}
   function bubble(){clearThink();if(!live)live=appendLive();return live;}
-  showThink("thinking…");
+  // continue/prefill: seed the live bubble with the existing text so generation visibly resumes from it
+  if(body.continue_id){const L=bubble();L.started=true;L.acc=body.prefix||"";L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();}
+  else showThink("thinking…");
   const c=new AbortController();activeController=c;
   try{const res=await streamRequest("/api/conversations/"+current.id+"/stream",body,{
       onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
@@ -3770,6 +3965,12 @@ async function send(){
 function regenerate(m){
   const idx=current.messages.findIndex(x=>x.id===m.id);
   runStream({regenerate_id:m.id},()=>{if(idx>=0)current.messages=current.messages.slice(0,idx);renderConvo({stick:true});});
+}
+function continueMsg(m){
+  // resume generation from the end of this assistant message; the server appends to it in place
+  const idx=current.messages.findIndex(x=>x.id===m.id);
+  const prefix=m.content||"";
+  runStream({continue_id:m.id,prefix},()=>{if(idx>=0)current.messages=current.messages.slice(0,idx);renderConvo({stick:true});});
 }
 function resendEdited(mid,newContent){
   const idx=current.messages.findIndex(x=>x.id===mid);
@@ -4203,6 +4404,7 @@ $("#title").onclick=editTitle;
 $("#charchip").onclick=()=>openSettings("characters");
 $("#tunebtn").onclick=openDrawer;
 $("#exportbtn").onclick=e=>{if(!current){toast("open a chat first");return;}showMenu(e,'<button data-f="md">export markdown</button><button data-f="json">export json</button>',m=>{m.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>{hideMenu();exportChat(current.id,b.dataset.f);});});};
+$("#sharebtn").onclick=()=>{if(!current){toast("open a chat first");return;}shareDialog(current);};
 $("#settingsbtn").onclick=()=>openSettings(isAdmin()?"endpoints":"account");
 $("#whobtn").onclick=()=>openSettings("account");
 $("#themebtn").onclick=()=>applyTheme(curTheme()==="dark"?"light":"dark");
@@ -4294,6 +4496,195 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape"){if($("#dlgwrap").cl
 </script></body></html>"""
 
 PAGE = PAGE_HEAD + PAGE_BODY + PAGE_JS1 + PAGE_JS2 + PAGE_JS3
+
+
+# ---------------------------------------------------------------- public share viewer
+# A standalone, dependency-free reader for a frozen conversation snapshot. Deliberately stripped
+# down: no app chrome, no auth, no private data — just the prose, set for gorgeous readability.
+SHARE_PAGE_TMPL = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ · ORACLE</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#100c08">
+<meta name="color-scheme" content="dark light">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="ORACLE">
+<meta property="og:title" content="__TITLE__">
+<meta property="og:description" content="__OGDESC__">
+<meta property="og:image" content="__HOME__/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="__TITLE__">
+<meta name="twitter:description" content="__OGDESC__">
+<meta name="twitter:image" content="__HOME__/og-image.png">
+<link rel="icon" type="image/svg+xml" href="__HOME__/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#100c08; --surface:#1b150d; --line:rgba(150,124,84,.13);
+    --text:#e8ddc5; --muted:#9a8c72; --faint:#6a6049;
+    --accent:#cf8a3c; --accent2:#cda261; --user:#b49f78; --code-bg:#0c0905;
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
+    --serif:'Newsreader','Iowan Old Style',Georgia,'Times New Roman',serif;
+    color-scheme:dark;
+  }
+  @media (prefers-color-scheme: light){:root{
+    --bg:#f4ecda; --surface:#e6dcc6; --line:rgba(90,68,34,.16);
+    --text:#2c2316; --muted:#6a5c43; --faint:#9a8b6e;
+    --accent:#b26a1d; --accent2:#7d5320; --user:#6d5a32; --code-bg:#e9e0cc;
+    color-scheme:light;
+  }}
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--serif);
+       font-size:19px;line-height:1.75;-webkit-font-smoothing:antialiased;}
+  ::selection{background:var(--accent);color:var(--bg);}
+  a{color:var(--accent);text-underline-offset:2px;}
+  .page{max-width:46rem;margin:0 auto;padding:clamp(28px,6vw,80px) clamp(20px,5vw,40px) 40px;}
+  header.doc{border-bottom:1px solid var(--line);padding-bottom:26px;margin-bottom:14px;}
+  .brand{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;
+         letter-spacing:.34em;text-transform:uppercase;color:var(--accent);text-decoration:none;font-weight:500;}
+  .brand img{width:20px;height:20px;display:block;opacity:.92;}
+  h1{font-family:var(--serif);font-weight:600;font-size:clamp(28px,5vw,40px);line-height:1.18;
+     margin:20px 0 10px;letter-spacing:-.01em;}
+  .sub{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--faint);text-transform:uppercase;}
+  .turn{padding:22px 0;border-bottom:1px solid var(--line);}
+  .turn:last-of-type{border-bottom:none;}
+  .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;
+       color:var(--faint);margin-bottom:10px;}
+  .turn.assistant .who{color:var(--accent2);}
+  .turn.user{}
+  .turn.user .who{color:var(--user);}
+  .user-body{font-style:italic;color:var(--muted);font-size:.96em;white-space:pre-wrap;overflow-wrap:anywhere;
+             border-left:2px solid var(--line);padding-left:18px;}
+  .body{overflow-wrap:anywhere;word-break:break-word;}
+  .body p{margin:.75em 0;} .body p:first-child{margin-top:0;} .body p:last-child{margin-bottom:0;}
+  .body h1,.body h2,.body h3,.body h4{font-weight:600;line-height:1.25;margin:1.1em 0 .45em;letter-spacing:-.005em;}
+  .body h1{font-size:1.5em;} .body h2{font-size:1.32em;} .body h3{font-size:1.15em;} .body h4{font-size:1.03em;}
+  .body ul,.body ol{margin:.6em 0;padding-left:1.45em;} .body li{margin:.3em 0;}
+  .body code{font-family:var(--mono);font-size:.8em;background:var(--code-bg);border-radius:5px;padding:.08em .36em;}
+  .body pre{background:var(--code-bg);border:1px solid var(--line);border-radius:11px;padding:15px 17px;overflow-x:auto;margin:.85em 0;}
+  .body pre code{background:none;padding:0;font-size:.82em;line-height:1.6;}
+  .body blockquote{margin:.8em 0;padding:.15em 0 .15em 1.15em;border-left:2px solid var(--accent);
+                   color:var(--muted);font-style:italic;}
+  .body hr{border:none;border-top:1px solid var(--line);margin:1.3em 0;}
+  .body strong{font-weight:600;} .body a{color:var(--accent);}
+  .files{margin-top:12px;display:flex;flex-wrap:wrap;gap:7px;}
+  .files .f{font-family:var(--mono);font-size:11px;color:var(--faint);background:var(--surface);
+            border:1px solid var(--line);border-radius:7px;padding:3px 9px;}
+  footer.doc{margin-top:40px;padding-top:22px;border-top:1px solid var(--line);
+             font-family:var(--mono);font-size:11px;letter-spacing:.05em;color:var(--faint);
+             display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;}
+  footer.doc a{color:var(--muted);text-decoration:none;}
+  footer.doc a:hover{color:var(--accent);}
+</style>
+</head><body>
+<div class="page">
+  <header class="doc">
+    <a class="brand" href="__HOME__/"><img src="__HOME__/favicon.svg" alt=""> Oracle</a>
+    <h1 id="title"></h1>
+    <div class="sub" id="sub"></div>
+  </header>
+  <main id="log"></main>
+  <footer class="doc">
+    <span>A shared conversation · read-only</span>
+    <a href="__HOME__/">__HOMELABEL__ &rsaquo;</a>
+  </footer>
+</div>
+<script id="d" type="application/json">__DATA__</script>
+<script>
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function md(src){
+  if(!src)return "";
+  let s=src.replace(/\r\n/g,"\n").replace(/\r/g,"\n");
+  const code=[];s=s.replace(/```[ \t]*([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g,(m,l,b)=>{code.push(b);return "@@C"+(code.length-1)+"@@";});
+  const ic=[];s=s.replace(/`([^`\n]+)`/g,(m,c)=>{ic.push(c);return "@@I"+(ic.length-1)+"@@";});
+  const inline=t=>{t=esc(t);
+    t=t.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener nofollow">$1</a>');
+    t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/__([^_]+)__/g,"<strong>$1</strong>");
+    t=t.replace(/(^|[^*\w])\*([^*\n]+)\*/g,"$1<em>$2</em>").replace(/(^|[^_\w])_([^_\n]+)_/g,"$1<em>$2</em>");
+    t=t.replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");return t;};
+  const lines=s.split("\n");let out=[],i=0,para=[];
+  const flush=()=>{if(para.length){out.push("<p>"+para.map(inline).join("<br>")+"</p>");para=[];}};
+  while(i<lines.length){let ln=lines[i];
+    let cb=ln.match(/^@@C(\d+)@@\s*$/);if(cb){flush();out.push("<pre><code>"+esc(code[+cb[1]])+"</code></pre>");i++;continue;}
+    if(/^\s*$/.test(ln)){flush();i++;continue;}
+    let h=ln.match(/^(#{1,6})\s+(.*)$/);if(h){flush();const lv=Math.min(4,h[1].length);out.push("<h"+lv+">"+inline(h[2])+"</h"+lv+">");i++;continue;}
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){flush();out.push("<hr>");i++;continue;}
+    if(/^\s*>/.test(ln)){flush();let q=[];while(i<lines.length&&/^\s*>/.test(lines[i])){q.push(lines[i].replace(/^\s*>\s?/,""));i++;}out.push("<blockquote>"+q.map(inline).join("<br>")+"</blockquote>");continue;}
+    if(/^\s*[-*+]\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*[-*+]\s+/,""));i++;}out.push("<ul>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ul>");continue;}
+    if(/^\s*\d+\.\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*\d+\.\s+/,""));i++;}out.push("<ol>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ol>");continue;}
+    para.push(ln);i++;}
+  flush();let html=out.join("\n");
+  html=html.replace(/@@C(\d+)@@/g,(m,i)=>"<pre><code>"+esc(code[+i])+"</code></pre>").replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");
+  return html;
+}
+(function(){
+  let D;try{D=JSON.parse(document.getElementById("d").textContent);}catch(e){D={title:"Conversation",messages:[]};}
+  document.title=(D.title||"Conversation")+" · ORACLE";
+  document.getElementById("title").textContent=D.title||"Conversation";
+  const log=document.getElementById("log");
+  (D.messages||[]).forEach(m=>{
+    const sec=document.createElement("section");sec.className="turn "+(m.role==="user"?"user":"assistant");
+    const who=document.createElement("div");who.className="who";who.textContent=m.role==="user"?"Prompt":"Oracle";
+    sec.appendChild(who);
+    const body=document.createElement("div");
+    if(m.role==="assistant"){body.className="body";body.innerHTML=md(m.content||"");}
+    else{body.className="body user-body";body.textContent=m.content||"";}
+    sec.appendChild(body);
+    if(m.files&&m.files.length){const fb=document.createElement("div");fb.className="files";
+      m.files.forEach(n=>{const c=document.createElement("span");c.className="f";c.textContent="⧉ "+n;fb.appendChild(c);});
+      sec.appendChild(fb);}
+    log.appendChild(sec);
+  });
+  const sub=document.getElementById("sub");
+  const n=(D.messages||[]).length;
+  sub.textContent=n+(n===1?" message":" messages");
+})();
+</script>
+</body></html>"""
+
+SHARE_404 = (r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>not found · ORACLE</title>
+<meta name="robots" content="noindex, nofollow">
+<style>html,body{height:100%;margin:0;background:#100c08;color:#9a8c72;
+font-family:'IBM Plex Mono',ui-monospace,monospace;display:flex;align-items:center;justify-content:center;}
+.b{text-align:center;padding:30px;} .b b{display:block;color:#cf8a3c;letter-spacing:.34em;text-transform:uppercase;
+font-size:12px;margin-bottom:14px;} .b p{font-size:14px;line-height:1.7;} .b a{color:#cf8a3c;}
+@media (prefers-color-scheme:light){html,body{background:#f4ecda;color:#6a5c43;}}
+</style></head><body><div class="b"><b>Oracle</b><p>This shared link has expired or was never here.<br>
+<a href="/">return to the oracle &rsaquo;</a></p></div></body></html>""")
+
+
+def render_share_page(sh):
+    try:
+        data = json.loads(sh["data"])
+    except Exception:
+        data = {"title": sh["title"] or "Conversation", "messages": []}
+    title = (data.get("title") or "Conversation").strip() or "Conversation"
+    # OG description: first prompt, condensed
+    desc = ""
+    for m in data.get("messages", []):
+        if m.get("role") == "user" and (m.get("content") or "").strip():
+            desc = " ".join((m["content"]).split())[:180]
+            break
+    if not desc:
+        desc = "A shared conversation from ORACLE."
+    # Embed the snapshot as JSON, neutralizing any HTML-significant characters so model output
+    # cannot break out of the <script> element (defense in depth atop the client-side escaping).
+    blob = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    home_label = PUBLIC_URL.split("://", 1)[-1].split("/", 1)[0]
+    out = SHARE_PAGE_TMPL
+    out = out.replace("__TITLE__", _html_mod.escape(title, quote=True))
+    out = out.replace("__OGDESC__", _html_mod.escape(desc, quote=True))
+    out = out.replace("__HOMELABEL__", _html_mod.escape(home_label, quote=True))
+    out = out.replace("__HOME__", _html_mod.escape(PUBLIC_URL, quote=True))
+    out = out.replace("__DATA__", blob)   # user data last: can't collide with other placeholders
+    return out
 
 
 if __name__ == "__main__":

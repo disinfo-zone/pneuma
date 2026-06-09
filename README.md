@@ -18,6 +18,10 @@ Cloudflare tunnel) and share it with a few friends without exposing it to the wo
 - **In-chat branching** - regenerate or edit-and-resend forks the conversation into a tree you
   can navigate with sibling switchers, instead of spawning a new chat.
 - **Streaming** with token usage + timing, reasoning capture, markdown rendering.
+- **Continue (prefill)** - stop a stream or edit a reply, then hit *continue* to have the model
+  keep generating from where the text leaves off; the new tokens are appended in place.
+- **Public share** - publish any chat as a frozen snapshot at a clean, sign-in-free reading page
+  (`/s/<token>`). The system prompt and later messages stay private; re-snapshot or unshare anytime.
 - **Editing, folders (drag-and-drop), multi-select, search, rename, timestamps.**
 - **Thumbs up/down ratings** stored in the data and included in exports (handy for RLHF datasets).
 - **Export** a single chat (markdown or JSON) or every chat you own (JSON).
