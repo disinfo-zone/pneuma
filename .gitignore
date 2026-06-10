@@ -18,3 +18,6 @@ __pycache__/
 .server_pid.txt
 .tmp_pid.txt
 _page.js
+
+# db backups (full copies of chat.db)
+backups/

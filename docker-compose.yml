@@ -5,20 +5,27 @@ services:
     restart: unless-stopped
     ports:
       # Published on the LAN so the Cloudflare tunnel (delphi.disinfo.zone) can route to SERVER-IP:8770.
+      # If cloudflared ever runs on THIS host (or in this compose), tighten to "127.0.0.1:8770:8770".
       - "8770:8770"
     volumes:
       - ./data:/data            # SQLite db (chat.db) persists here — DO NOT delete, holds all accounts/chats/settings
+      - ./backups:/backups      # automated DB backups, kept apart from /data so one volume copy never has both
     env_file:
       - local.env               # PRIVATE secrets: oMLX endpoint + API key + KENOSIS_SESSION_SECRET (gitignored)
     environment:
       KENOSIS_DB: /data/chat.db
+      KENOSIS_BACKUP_DIR: /backups
       # Served over HTTPS at the edge by the Cloudflare tunnel, so the session cookie must be Secure.
       KENOSIS_COOKIE_SECURE: "1"
+      # The container runs as UID 10001 (non-root). One-time host setup for the volumes:
+      #   sudo chown -R 10001:10001 ./data ./backups
       # Admin is created on the first web visit (no plaintext password in this file).
       # To bootstrap one on startup instead, add:
       #   KENOSIS_ADMIN_USER: "david"
       #   KENOSIS_ADMIN_PASS: "a-strong-password"
       # KENOSIS_SESSION_DAYS: "30"
+      # Set KENOSIS_TRUST_PROXY: "0" if clients can hit this port without going through Cloudflare
+      # (the forwarded-IP headers used for login throttling are spoofable by direct clients).
 
   # ----------------------------------------------------------------------------
   # The Cloudflare tunnel (delphi.disinfo.zone) is managed outside this stack and

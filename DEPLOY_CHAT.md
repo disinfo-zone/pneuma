@@ -6,7 +6,7 @@ one SQLite file. No external services required beyond the model endpoint(s) you 
 ## Run locally (dev)
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 python kenosis_chat.py
 # open http://localhost:8770  -> first visit shows a one-time admin setup screen
 ```
@@ -17,13 +17,17 @@ Any conversations in `./chat_conversations/*.json` are imported to the admin on 
 ## Run with Docker
 
 ```bash
-# 1. edit docker-compose.yml: set KENOSIS_SESSION_SECRET, KENOSIS_ADMIN_USER/PASS
-# 2. build + start
+# 1. put KENOSIS_SESSION_SECRET (and seed endpoint/key) in local.env
+# 2. the container runs as UID 10001 (non-root) — make the volumes writable once:
+sudo mkdir -p data backups && sudo chown -R 10001:10001 data backups
+# 3. build + start
 docker compose up -d --build
-# 3. open http://<host>:8770
+# 4. open http://<host>:8770
 ```
 
-The DB persists in `./data/chat.db` on the host (the `./data:/data` volume).
+The DB persists in `./data/chat.db` on the host (the `./data:/data` volume). Automated
+backups land in `./backups` (separate volume, so a copy of `./data` alone never includes
+them) and rotate per `KENOSIS_BACKUP_KEEP`.
 
 ## Behind a Cloudflare tunnel
 
@@ -43,7 +47,18 @@ to `127.0.0.1:8770:8770`) so the app is not exposed directly on the LAN.
 - **Full gate:** every page and API requires a valid session; unauthenticated `/` redirects to `/login`.
 - **Passwords:** PBKDF2-HMAC-SHA256, 240k iterations, per-user salt. No plaintext stored.
 - **Sessions:** HMAC-signed cookies (`HttpOnly`, `SameSite=Lax`, `Secure` in prod), 30-day expiry.
-  Set a stable `KENOSIS_SESSION_SECRET` so sessions survive restarts.
+  Set a stable `KENOSIS_SESSION_SECRET` so sessions survive restarts — it is read from the
+  environment only and **never written to the database**, so DB copies/backups can't forge
+  sessions. Changing a password (your own, or an admin reset) bumps a per-user session
+  version, revoking every other signed-in device.
+- **Login throttling:** failed sign-ins are limited per source IP *and* per target account,
+  so a spoofed/rotating `CF-Connecting-IP` header can't brute-force one username. Set
+  `KENOSIS_TRUST_PROXY=0` if clients can reach the port without going through Cloudflare.
+- **API keys:** endpoint keys are stored server-side and never sent to the browser; the
+  settings UI sees a `__stored__` placeholder and only a changed value overwrites the key.
+- **Request caps:** bodies above `KENOSIS_MAX_BODY_MB` (default 32 MB) are rejected before
+  auth, and malformed `Content-Length` headers are handled defensively.
+- **Container:** runs as a non-root user (UID 10001).
 - **CSRF:** SameSite=Lax + an Origin/Referer-vs-Host check on every state-changing request.
 - **Roles:** `admin` manages endpoints/keys, global defaults, the user-visible model list, and users.
   `user` (your friends) can chat, edit their own system prompt + sampler params, and manage their
@@ -63,10 +78,14 @@ directly via `sqlite3 chat.db`.
 |-----|---------|---------|
 | `KENOSIS_PORT` | `8770` | listen port |
 | `KENOSIS_DB` | `./chat.db` | SQLite path |
-| `KENOSIS_SESSION_SECRET` | generated + stored in db | cookie signing key (set a stable one in prod) |
+| `KENOSIS_SESSION_SECRET` | ephemeral | cookie signing key — set a stable one in prod; never persisted to the DB (legacy DB copies are scrubbed when the env var is set) |
 | `KENOSIS_COOKIE_SECURE` | off | `1` marks the session cookie `Secure` (use behind HTTPS) |
 | `KENOSIS_SESSION_DAYS` | `30` | session lifetime |
 | `KENOSIS_ADMIN_USER` / `KENOSIS_ADMIN_PASS` | — | bootstrap an admin on startup (optional) |
+| `KENOSIS_BACKUP_HOURS` / `KENOSIS_BACKUP_KEEP` / `KENOSIS_BACKUP_DIR` | `24` / `7` / `./backups` | automated `VACUUM INTO` backups: cadence, retention, location; `0` hours disables |
+| `KENOSIS_TRUST_PROXY` | `1` | trust `CF-Connecting-IP`/`X-Forwarded-For` for throttle keys and logs; `0` to use the socket peer only |
+| `KENOSIS_PUBLIC_URL` | `https://delphi.disinfo.zone` | absolute base URL for share links and OG tags |
+| `KENOSIS_MAX_BODY_MB` | `32` | hard request-body cap, enforced before auth |
 | `KENOSIS_SITUATION` | `1` | append the current date (and, with tools off, a no-internet note) to the system prompt for grounding. Day-granular so it preserves prefix caching; set `0` to disable |
 
 The model endpoints themselves (URLs + API keys) are configured in-app under Settings → Endpoints,

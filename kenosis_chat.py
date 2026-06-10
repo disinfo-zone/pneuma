@@ -8,7 +8,7 @@ On first run, conversations in ./chat_conversations/*.json are imported to the a
 
 Env: KENOSIS_PORT, KENOSIS_DB, KENOSIS_ADMIN_USER/PASS, KENOSIS_SESSION_SECRET,
      KENOSIS_COOKIE_SECURE (1 behind HTTPS), KENOSIS_SESSION_DAYS.
-Dependencies: requests (everything else is the standard library).
+Dependencies: requests + pypdf for PDF attachments (everything else is the standard library).
 """
 
 import http.server
@@ -19,10 +19,12 @@ import re
 import time
 import uuid
 import base64
+import gzip
 import hmac
 import hashlib
 import glob
 import random
+import logging
 import sqlite3
 import threading
 import socket
@@ -57,9 +59,23 @@ LOGIN_MAX_FAILS = int(os.environ.get("KENOSIS_LOGIN_MAX_FAILS", "8"))
 LOGIN_WINDOW = int(os.environ.get("KENOSIS_LOGIN_WINDOW", "900"))
 
 # Automated SQLite backups (VACUUM INTO). Set KENOSIS_BACKUP_HOURS=0 to disable.
+# Backups contain the full database — point KENOSIS_BACKUP_DIR at a path *outside* anything
+# web-served or shared.
 BACKUP_HOURS = float(os.environ.get("KENOSIS_BACKUP_HOURS", "24"))
 BACKUP_KEEP = int(os.environ.get("KENOSIS_BACKUP_KEEP", "7"))
 BACKUP_DIR = os.environ.get("KENOSIS_BACKUP_DIR") or os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+
+# Hard cap on any JSON request body read into memory, applied before auth. Attachments arrive
+# base64-inside-JSON, so this sits above ATTACH_MAX_BYTES * 4/3 with headroom.
+MAX_BODY_BYTES = int(os.environ.get("KENOSIS_MAX_BODY_MB", "32")) * 1024 * 1024
+
+# Trust CF-Connecting-IP / X-Forwarded-For for the login throttle key. Correct behind the
+# Cloudflare tunnel; set KENOSIS_TRUST_PROXY=0 if clients can reach this port directly,
+# because those headers are spoofable by a direct client.
+TRUST_PROXY = os.environ.get("KENOSIS_TRUST_PROXY", "1") not in ("0", "false", "no")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("oracle")
 
 # Sent on every HTML document. Inline <script>/<style> are first-party (no user-authored scripts),
 # so 'unsafe-inline' is required; the rest locks down framing, plugins, base-uri, form targets, and
@@ -100,7 +116,6 @@ SEED_ENDPOINT = {
     "key": os.environ.get("KENOSIS_SEED_KEY", ""),
 }
 DEFAULT_MODEL = "kenosistron"
-FALLBACK_MODELS = ["kenosistron", "kenosistron-q6", "kenosistron-mtp", "kenosis-v2"]
 
 # Per-request sampler params the MLX server accepts. 'default' = the server's own default
 # (what the per-param reset clears toward). top_k / repetition_penalty are file-only on the
@@ -167,7 +182,11 @@ def db():
     if c is None:
         c = sqlite3.connect(DB_PATH, check_same_thread=False)
         c.row_factory = sqlite3.Row
+        # Writes open BEGIN IMMEDIATE transactions: a deferred read->write upgrade returns
+        # "database is locked" instantly (busy_timeout can't retry it); immediate writers queue.
+        c.isolation_level = "IMMEDIATE"
         c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")   # the standard WAL pairing; durable enough, much faster
         c.execute("PRAGMA busy_timeout=5000")
         c.execute("PRAGMA foreign_keys=ON")
         _local.conn = c
@@ -182,7 +201,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
                 pw_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
-                allowed_models TEXT, disabled INTEGER NOT NULL DEFAULT 0, persona TEXT, created TEXT NOT NULL);
+                allowed_models TEXT, disabled INTEGER NOT NULL DEFAULT 0, persona TEXT,
+                session_version INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS folders(
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, name TEXT NOT NULL,
@@ -235,6 +255,8 @@ def init_db():
         ucols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
         if "persona" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN persona TEXT")
+        if "session_version" not in ucols:   # bumped on password change to revoke old session cookies
+            c.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
         c.commit()
         seed_settings()
         if not get_setting("tree_migrated"):
@@ -286,14 +308,41 @@ def seed_settings():
     for k, v in defaults.items():
         if get_setting(k) is None:
             set_setting(k, v)
-    if get_setting("session_secret") is None:
-        set_setting("session_secret", os.environ.get("KENOSIS_SESSION_SECRET") or b64(os.urandom(32)))
+
+
+# Endpoint API keys are never sent to the browser; saved settings echo this sentinel instead,
+# and the save/test handlers swap the stored key back in when they see it.
+KEY_SENTINEL = "__stored__"
+
+
+def redacted_endpoints():
+    out = []
+    for ep in get_setting("endpoints", []):
+        ep = dict(ep)
+        if ep.get("key"):
+            ep["key"] = KEY_SENTINEL
+        out.append(ep)
+    return out
+
+
+def restore_endpoint_keys(eps):
+    """Replace KEY_SENTINEL placeholders in a submitted endpoint list with the stored keys."""
+    stored = {e.get("id"): e for e in get_setting("endpoints", [])}
+    out = []
+    for ep in (eps or []):
+        ep = dict(ep)
+        if ep.get("key") == KEY_SENTINEL:
+            ep["key"] = (stored.get(ep.get("id")) or {}).get("key", "")
+        out.append(ep)
+    return out
 
 
 def admin_settings():
-    return {k: get_setting(k) for k in
-            ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
-             "user_models", "thinking_models")}
+    s = {k: get_setting(k) for k in
+         ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
+          "user_models", "thinking_models")}
+    s["endpoints"] = redacted_endpoints()
+    return s
 
 
 def endpoint_by_id(eid):
@@ -315,8 +364,32 @@ def models_url_for(ep):
     return url.replace("/chat/completions", "/models") if "/chat/completions" in url else url.rstrip("/") + "/models"
 
 
+_SESSION_SECRET = None
+
+
 def secret_bytes():
-    return get_setting("session_secret", "").encode("utf-8")
+    """The cookie-signing secret. Preference: KENOSIS_SESSION_SECRET (never persisted) > a legacy
+    copy in the settings table (pre-hardening installs) > a fresh ephemeral value. The secret is
+    no longer written to the database, so DB copies and backups can't be used to forge sessions."""
+    global _SESSION_SECRET
+    if _SESSION_SECRET is None:
+        env = os.environ.get("KENOSIS_SESSION_SECRET")
+        legacy = get_setting("session_secret")
+        if env:
+            _SESSION_SECRET = env
+            if legacy is not None:
+                with db():
+                    db().execute("DELETE FROM settings WHERE key='session_secret'")
+                log.info("scrubbed legacy session secret from the database (env var is authoritative)")
+        elif legacy:
+            _SESSION_SECRET = legacy
+            log.warning("session secret lives in the database (legacy install); set KENOSIS_SESSION_SECRET "
+                        "and restart to keep it out of DB backups")
+        else:
+            _SESSION_SECRET = b64(os.urandom(32))
+            log.warning("KENOSIS_SESSION_SECRET is not set — using an ephemeral secret; "
+                        "sessions will not survive a restart")
+    return _SESSION_SECRET.encode("utf-8")
 
 
 # ---------------------------------------------------------------- auth
@@ -335,21 +408,29 @@ def verify_pw(pw, stored):
         return False
 
 
-def sign_session(username):
+def user_session_version(u):
+    return (u["session_version"] if "session_version" in u.keys() else 0) or 0
+
+
+def sign_session(username, version=0):
     exp = int(time.time()) + SESSION_DAYS * 86400
-    payload = b64(json.dumps({"u": username, "exp": exp}).encode("utf-8"))
+    payload = b64(json.dumps({"u": username, "exp": exp, "v": version}).encode("utf-8"))
     sig = b64(hmac.new(secret_bytes(), payload.encode("ascii"), hashlib.sha256).digest())
     return payload + "." + sig
 
 
 def parse_session(token):
+    """Valid token -> (username, session_version); anything else -> None. Tokens minted before
+    versioning carry an implicit version 0, which matches the column default."""
     try:
         payload, sig = token.split(".")
         good = b64(hmac.new(secret_bytes(), payload.encode("ascii"), hashlib.sha256).digest())
         if not hmac.compare_digest(sig, good):
             return None
         data = json.loads(ub64(payload))
-        return data.get("u") if data.get("exp", 0) >= time.time() else None
+        if data.get("exp", 0) < time.time():
+            return None
+        return (data.get("u"), data.get("v", 0))
     except Exception:
         return None
 
@@ -587,11 +668,13 @@ def search_convo_content(u, q, limit=60):
     if len(q) < 2:
         return []
     like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    # LIMIT bounds the scan: enough rows to fill `limit` distinct conversations on any realistic
+    # data, without ever walking the whole message table for a common word.
     rows = db().execute(
         "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,m.content "
         "FROM messages m JOIN conversations c ON c.id=m.convo_id "
         "WHERE c.owner_id=? AND m.role IN('user','assistant') AND m.content LIKE ? ESCAPE '\\' "
-        "ORDER BY c.updated DESC", (u["id"], like)).fetchall()
+        "ORDER BY c.updated DESC LIMIT 400", (u["id"], like)).fetchall()
     out, seen = [], set()
     for r in rows:
         if r["id"] in seen:
@@ -706,21 +789,18 @@ def convo_export(cid):
     return d
 
 
-def next_position(cid):
-    r = db().execute("SELECT MAX(position) p FROM messages WHERE convo_id=?", (cid,)).fetchone()
-    return (r["p"] + 1) if r["p"] is not None else 0
-
-
 def insert_message(cid, parent, role, content, reasoning=None, model=None, meta=None,
                    attachments=None, tool=None):
     mid = _mid()
+    # position is computed inside the INSERT so two threads writing to the same conversation
+    # can't read the same MAX() and produce duplicate positions
     db().execute(
         "INSERT INTO messages(id,convo_id,parent_id,position,role,content,reasoning,model,meta,ts,attachments,tool)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mid, cid, parent, next_position(cid), role, content, reasoning or None, model,
+        " SELECT ?,?,?,COALESCE(MAX(position),-1)+1,?,?,?,?,?,?,?,? FROM messages WHERE convo_id=?",
+        (mid, cid, parent, role, content, reasoning or None, model,
          json.dumps(meta) if meta else None, _now(),
          json.dumps(attachments) if attachments else None,
-         json.dumps(tool) if tool else None))
+         json.dumps(tool) if tool else None, cid))
     return mid
 
 
@@ -742,19 +822,21 @@ def maybe_title(cid):
 
 
 def delete_subtree(cid, mid):
-    _, by, kids = _tree(cid)
-    if mid not in by:
-        return
-    doomed, stack = set(), [mid]
-    while stack:
-        x = stack.pop()
-        doomed.add(x)
-        stack.extend(kids.get(x, []))
     c = db()
     with c:
-        c.executemany("DELETE FROM messages WHERE id=?", [(x,) for x in doomed])
+        # one recursive DELETE inside the transaction, so messages inserted concurrently can't be
+        # orphaned between a separate tree read and the delete
+        cur = c.execute(
+            "WITH RECURSIVE sub(id) AS ("
+            " SELECT id FROM messages WHERE id=? AND convo_id=?"
+            " UNION ALL"
+            " SELECT m.id FROM messages m JOIN sub s ON m.parent_id=s.id) "
+            "DELETE FROM messages WHERE convo_id=? AND id IN sub", (mid, cid, cid))
+        if cur.rowcount == 0:
+            return
         row = c.execute("SELECT active_leaf_id FROM conversations WHERE id=?", (cid,)).fetchone()
-        if row and row["active_leaf_id"] in doomed:
+        leaf = row["active_leaf_id"] if row else None
+        if leaf and not c.execute("SELECT 1 FROM messages WHERE id=? AND convo_id=?", (leaf, cid)).fetchone():
             _, by2, kids2 = _tree(cid)
             roots = kids2.get(None, [])
             c.execute("UPDATE conversations SET active_leaf_id=? WHERE id=?",
@@ -828,22 +910,45 @@ def backup_db():
     return dest
 
 
+def _latest_backup_age():
+    files = glob.glob(os.path.join(BACKUP_DIR, "chat-*.db"))
+    if not files:
+        return None
+    return time.time() - max(os.path.getmtime(f) for f in files)
+
+
 def _backup_loop():
+    interval = max(0.1, BACKUP_HOURS) * 3600
     while True:
         try:
-            dest = backup_db()
-            print("backup written: %s" % dest)
-        except Exception as e:
-            print("backup failed: %s" % e)
-        time.sleep(max(0.1, BACKUP_HOURS) * 3600)
+            con = sqlite3.connect(DB_PATH, timeout=30)
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # keep the WAL from growing unbounded
+            finally:
+                con.close()
+        except Exception:
+            log.exception("wal checkpoint failed")
+        # back up only when the newest copy is older than the interval, so container restarts
+        # don't each burn one of the BACKUP_KEEP retention slots
+        try:
+            age = _latest_backup_age()
+        except OSError:
+            age = None
+        if age is None or age >= interval:
+            try:
+                dest = backup_db()
+                log.info("backup written: %s", dest)
+            except Exception:
+                log.exception("backup failed")
+        time.sleep(min(interval, 3600))
 
 
 def start_backups():
     if BACKUP_HOURS <= 0:
-        print("automated backups disabled (KENOSIS_BACKUP_HOURS=0)")
+        log.info("automated backups disabled (KENOSIS_BACKUP_HOURS=0)")
         return
     threading.Thread(target=_backup_loop, daemon=True).start()
-    print("automated backups: every %gh -> %s (keep %d)" % (BACKUP_HOURS, BACKUP_DIR, BACKUP_KEEP))
+    log.info("automated backups: every %gh -> %s (keep %d)", BACKUP_HOURS, BACKUP_DIR, BACKUP_KEEP)
 
 
 # ---------------------------------------------------------------- model calls
@@ -1046,7 +1151,11 @@ def stream_model(ep, model, system, messages, params, tools=None, extra=None):
         except Exception:
             pass
         r = _open_stream(ep, base)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except Exception:
+        r.close()   # streamed response: without this the pooled connection leaks
+        raise
     tcalls = {}
     finish = None
     with r:
@@ -1159,13 +1268,29 @@ def _models_data(ep):
     return r.json().get("data", [])
 
 
-def fetch_models(ep):
+_MODELS_CACHE = {}   # endpoint key -> (fetched_at, [ids]); keeps /api/config from blocking on /v1/models
+_MODELS_LOCK = threading.Lock()
+
+
+def fetch_models(ep, ttl=60):
+    """Model ids from the endpoint, cached briefly per endpoint. On upstream failure the last
+    known list is served (stale beats phantom); an endpoint that was never reachable yields []
+    so the UI can say so honestly instead of listing models that don't exist."""
+    key = ep.get("id") or ep.get("url") or "?"
+    now = time.time()
+    with _MODELS_LOCK:
+        ent = _MODELS_CACHE.get(key)
+        if ent and now - ent[0] < ttl:
+            return list(ent[1])
     try:
         ids = [m["id"] for m in _models_data(ep)]
         ids.sort(key=lambda x: (not x.startswith("kenosistron"), x))
-        return ids or FALLBACK_MODELS
-    except Exception:
-        return FALLBACK_MODELS
+    except Exception as e:
+        log.warning("model list fetch failed for %s: %s", key, e)
+        ids = list(ent[1]) if ent else []
+    with _MODELS_LOCK:
+        _MODELS_CACHE[key] = (now, ids)
+    return list(ids)
 
 
 def model_contexts(ep):
@@ -1189,22 +1314,29 @@ _CTX_CACHE = {}      # endpoint id -> (fetched_at, {model: context_window}); 5-m
 _CTX_LOCK = threading.Lock()
 
 
-def context_for(ep, model, default=DEFAULT_CONTEXT):
-    """Context window for a model, cached per endpoint (model_contexts hits the network). Returns
-    `default` when the window is unknown — pass default=0 to distinguish 'unknown' from a real value."""
+def _ctx_data(ep):
+    """Cached model -> context-window map for an endpoint. The staleness check happens under the
+    lock and stamps a placeholder, so concurrent requests don't all refetch (thundering herd)."""
     key = ep.get("id") or ep.get("url") or "?"
     now = time.time()
     with _CTX_LOCK:
         ent = _CTX_CACHE.get(key)
-    if not ent or now - ent[0] >= 300:
-        try:
-            m = model_contexts(ep)
-        except Exception:
-            m = {}
-        with _CTX_LOCK:
-            _CTX_CACHE[key] = (now, m)
-        ent = (now, m)
-    return ent[1].get(model) or default
+        if ent and now - ent[0] < 300:
+            return ent[1]
+        _CTX_CACHE[key] = (now, ent[1] if ent else {})   # this thread refreshes; others use the old map
+    try:
+        m = model_contexts(ep)
+    except Exception:
+        m = ent[1] if ent else {}
+    with _CTX_LOCK:
+        _CTX_CACHE[key] = (now, m)
+    return m
+
+
+def context_for(ep, model, default=DEFAULT_CONTEXT):
+    """Context window for a model. Returns `default` when the window is unknown — pass default=0
+    to distinguish 'unknown' from a real value."""
+    return _ctx_data(ep).get(model) or default
 
 
 def shown_models(u):
@@ -1380,10 +1512,6 @@ def _resolve_public_ip(host):
     return ip
 
 
-def _assert_public_host(host):  # thin alias retained for clarity / call-sites
-    _resolve_public_ip(host)
-
-
 def safe_fetch(url):
     """Fetch a public http(s) page with SSRF guards. DNS is pinned to a validated IP (defeats
     rebinding) and every redirect hop is validated before it is followed. Returns (title, text, final_url)."""
@@ -1418,13 +1546,15 @@ def safe_fetch(url):
             url = urljoin(url, loc)                              # next hop re-validated at loop top
             continue
         ctype = r.headers.get("Content-Type", "")
-        r.raise_for_status()
-        for chunk in r.iter_content(8192):
-            raw += chunk
-            if len(raw) > FETCH_MAX_BYTES:
-                break
-        encoding = r.encoding or "utf-8"
-        r.close()
+        try:
+            r.raise_for_status()
+            for chunk in r.iter_content(8192):
+                raw += chunk
+                if len(raw) > FETCH_MAX_BYTES:
+                    break
+            encoding = r.encoding or "utf-8"
+        finally:
+            r.close()
         break
     body = raw.decode(encoding, errors="replace")
     title = ""
@@ -1572,9 +1702,16 @@ def extract_text_file(name, raw):
 
 
 # ---------------------------------------------------------------- HTTP handler
+class _BodyTooLarge(Exception):
+    pass
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        return
+    protocol_version = "HTTP/1.1"   # keep-alive: reuse the TCP connection (and its thread) across requests
+    timeout = 60                    # drop connections whose client stalls mid-request
+
+    def log_message(self, format, *args):   # noqa: A002 (matches the base-class signature)
+        log.info("%s %s", self._client_ip(), format % args)
 
     def _send(self, code, ctype, body, extra=None):
         if isinstance(body, str):
@@ -1599,13 +1736,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(200, "text/html; charset=utf-8", body,
                    [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY")])
 
+    def _html_static(self, body_bytes, gz_bytes, etag):
+        """Serve a startup-precompressed HTML page with ETag revalidation (304s + gzip)."""
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, no-cache")   # 304 must echo the 200's cache headers
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        extra = [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY"),
+                 ("ETag", etag), ("Cache-Control", "private, no-cache"), ("Vary", "Accept-Encoding")]
+        use_gz = gz_bytes is not None and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if use_gz:
+            extra.append(("Content-Encoding", "gzip"))
+        self._send(200, "text/html; charset=utf-8", gz_bytes if use_gz else body_bytes, extra)
+
     def _client_ip(self):
         # Behind the documented Cloudflare tunnel the real client IP arrives in CF-Connecting-IP;
-        # fall back to X-Forwarded-For, then the socket peer. Only used for best-effort throttling.
-        for h in ("CF-Connecting-IP", "X-Forwarded-For"):
-            v = self.headers.get(h)
-            if v:
-                return v.split(",")[0].strip()
+        # fall back to X-Forwarded-For, then the socket peer. Only used for best-effort throttling
+        # and logging. KENOSIS_TRUST_PROXY=0 ignores the (spoofable) headers entirely.
+        if TRUST_PROXY:
+            for h in ("CF-Connecting-IP", "X-Forwarded-For"):
+                v = self.headers.get(h)
+                if v:
+                    return v.split(",")[0].strip()
         return self.client_address[0] if self.client_address else "?"
 
     def _redirect(self, location):
@@ -1615,9 +1771,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _read(self):
-        n = int(self.headers.get("Content-Length", 0))
-        if not n:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:   # also rejects a negative Content-Length, which would read until EOF
             return {}
+        if n > MAX_BODY_BYTES:
+            raise _BodyTooLarge()
         try:
             return json.loads(self.rfile.read(n).decode("utf-8"))
         except Exception:
@@ -1636,11 +1797,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tok = self._cookies().get(COOKIE_NAME)
         if not tok:
             return None
-        name = parse_session(tok)
-        if not name:
+        sess = parse_session(tok)
+        if not sess or not sess[0]:
             return None
-        u = user_by_name(name)
-        return None if (u is None or u["disabled"]) else u
+        u = user_by_name(sess[0])
+        if u is None or u["disabled"]:
+            return None
+        if (sess[1] or 0) != user_session_version(u):   # password changed -> old cookies are dead
+            return None
+        return u
 
     def _set_cookie(self, token):
         a = [COOKIE_NAME + "=" + token, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=" + str(SESSION_DAYS * 86400)]
@@ -1671,7 +1836,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "default_system": get_setting("default_system", DEFAULT_SYSTEM),
             "default_params": get_setting("default_params", {}),
             "default_model": get_setting("default_model", DEFAULT_MODEL),
-            "model_contexts": model_contexts(active_endpoint()),
+            "model_contexts": _ctx_data(active_endpoint()),
             "default_context": DEFAULT_CONTEXT,
             "thinking_models": get_setting("thinking_models", []),
         }
@@ -1725,7 +1890,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with db():
                     db().execute("UPDATE shares SET views=views+1 WHERE token=?", (sh["token"],))
             except Exception:
-                pass
+                log.exception("share view-count update failed")
             return self._send(200, "text/html; charset=utf-8", render_share_page(sh),
                               [("Content-Security-Policy", CSP), ("X-Robots-Tag", "noindex, nofollow")])
 
@@ -1733,7 +1898,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             if user_count() == 0:
                 return self._redirect("/setup")
-            return self._html(PAGE) if u else self._redirect("/login")
+            return self._html_static(PAGE_BYTES, PAGE_GZ, PAGE_ETAG) if u else self._redirect("/login")
         if not u:
             return self._json(401, {"error": "auth required"})
 
@@ -1764,7 +1929,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fname = "oracle-export-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json"
             return self._send(200, "application/json; charset=utf-8",
                               json.dumps({"generated": _now(), "user": u["username"], "conversations": convos}, indent=2, ensure_ascii=False),
-                              [("Content-Disposition", "attachment; filename=" + fname)])
+                              [("Content-Disposition", 'attachment; filename="%s"' % fname)])
+
+        # full-tree export of one conversation (all branches, ratings, reasoning, tool steps)
+        m = re.fullmatch(r"/api/conversations/([^/]+)/export", path)
+        if m and valid_id(m.group(1)):
+            if get_convo(m.group(1), u) is None:
+                return self._json(404, {"error": "not found"})
+            return self._json(200, convo_export(m.group(1)))
         if path == "/api/users":
             if u["role"] != "admin":
                 return self._json(403, {"error": "admin only"})
@@ -1906,35 +2078,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ================================================== POST
     def do_POST(self):
         path = urlparse(self.path).path
-        payload = self._read()
+        try:
+            payload = self._read()
+        except _BodyTooLarge:
+            self.close_connection = True   # the unread body would poison the keep-alive stream
+            return self._json(413, {"error": "request body too large"})
 
         if path == "/api/login":
             if not self._csrf_ok():
                 return self._json(403, {"error": "bad origin"})
-            ipkey = self._client_ip()
-            retry = login_retry_after(ipkey)
+            name = (payload.get("username") or "").strip()
+            # throttle per source IP *and* per target account, so a spoofed/rotating
+            # forwarded-IP header still can't brute-force one username
+            keys = [self._client_ip()] + (["u:" + name.lower()] if name else [])
+            retry = max(login_retry_after(k) for k in keys)
             if retry:
                 return self._json(429, {"error": "too many failed attempts; try again in %d seconds" % retry},
                                   extra=[("Retry-After", str(retry))])
-            u = user_by_name((payload.get("username") or "").strip())
+            u = user_by_name(name)
             if u is None or u["disabled"] or not verify_pw(payload.get("password") or "", u["pw_hash"]):
-                login_record_fail(ipkey)
+                for k in keys:
+                    login_record_fail(k)
                 return self._json(401, {"error": "invalid username or password"})
-            login_clear(ipkey)
-            return self._json(200, {"ok": True, "me": user_public(u)}, extra=[self._set_cookie(sign_session(u["username"]))])
+            for k in keys:
+                login_clear(k)
+            return self._json(200, {"ok": True, "me": user_public(u)},
+                              extra=[self._set_cookie(sign_session(u["username"], user_session_version(u)))])
 
         if path == "/api/setup":
             if not self._csrf_ok():
                 return self._json(403, {"error": "bad origin"})
-            if user_count() > 0:
-                return self._json(403, {"error": "already set up"})
             name = (payload.get("username") or "").strip()
             pw = payload.get("password") or ""
             if not re.fullmatch(r"[A-Za-z0-9_.-]{2,32}", name):
                 return self._json(400, {"error": "username must be 2-32 chars: letters, digits, _ . -"})
             if len(pw) < 8:
                 return self._json(400, {"error": "password must be at least 8 characters"})
-            u = create_user(name, pw, role="admin")
+            with _init_lock:   # check + create atomically: two racing setups can't both make an admin
+                if user_count() > 0:
+                    return self._json(403, {"error": "already set up"})
+                u = create_user(name, pw, role="admin")
             import_legacy(u["id"])
             return self._json(200, {"ok": True, "me": user_public(u)}, extra=[self._set_cookie(sign_session(name))])
 
@@ -1968,7 +2151,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              (name, hash_pw(pw), role, allowed, _now()))
                 conn.execute("UPDATE invites SET uses=uses+1 WHERE token=?", (tok,))
             nu = user_by_name(name)
-            return self._json(200, {"ok": True, "me": user_public(nu)}, extra=[self._set_cookie(sign_session(name))])
+            return self._json(200, {"ok": True, "me": user_public(nu)},
+                              extra=[self._set_cookie(sign_session(name, user_session_version(nu)))])
 
         u = self.current_user()
         if not u:
@@ -1984,9 +2168,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(403, {"error": "current password is wrong"})
             if len(payload.get("new") or "") < 8:
                 return self._json(400, {"error": "new password must be at least 8 characters"})
+            newv = user_session_version(u) + 1   # revoke every other signed-in device
             with db():
-                db().execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(payload["new"]), u["id"]))
-            return self._json(200, {"ok": True})
+                db().execute("UPDATE users SET pw_hash=?, session_version=? WHERE id=?",
+                             (hash_pw(payload["new"]), newv, u["id"]))
+            # re-issue this session at the new version so the current device stays signed in
+            return self._json(200, {"ok": True}, extra=[self._set_cookie(sign_session(u["username"], newv))])
 
         if path == "/api/account":
             persona = (payload.get("persona") or "").strip()[:60]
@@ -2136,11 +2323,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/settings":
             if u["role"] != "admin":
                 return self._json(403, {"error": "admin only"})
-            for k in ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
+            if "endpoints" in payload:
+                set_setting("endpoints", restore_endpoint_keys(payload["endpoints"]))
+            for k in ("active_endpoint", "default_model", "default_system", "default_params",
                       "user_models", "thinking_models"):
                 if k in payload:
                     set_setting(k, payload[k])
-            return self._json(200, {"settings": admin_settings(), "all_models": fetch_models(active_endpoint())})
+            return self._json(200, {"settings": admin_settings(), "all_models": fetch_models(active_endpoint(), ttl=0)})
+
+        # connectivity test for an endpoint as edited in the form — nothing is persisted
+        if path == "/api/settings/test":
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            ep = restore_endpoint_keys([payload.get("endpoint") or {}])[0]
+            if not ep.get("url"):
+                return self._json(200, {"ok": False, "error": "no endpoint url"})
+            try:
+                ids = [m["id"] for m in _models_data(ep)]
+                return self._json(200, {"ok": True, "models": ids})
+            except Exception as e:
+                return self._json(200, {"ok": False, "error": str(e)})
 
         if path == "/api/users":
             if u["role"] != "admin":
@@ -2205,7 +2407,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if payload.get("password"):
                     if len(payload["password"]) < 8:
                         return self._json(400, {"error": "password too short"})
-                    c.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(payload["password"]), uid))
+                    # admin reset also revokes the user's existing sessions
+                    c.execute("UPDATE users SET pw_hash=?, session_version=session_version+1 WHERE id=?",
+                              (hash_pw(payload["password"]), uid))
             return self._json(200, {"users": [user_public(r) for r in c.execute("SELECT * FROM users ORDER BY id").fetchall()]})
 
         mr = re.fullmatch(r"/api/conversations/([^/]+)/messages/([^/]+)/rating", path)
@@ -2281,6 +2485,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ep, model, system, params = resolve_request(convo)
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
+        self.close_connection = True   # the ndjson stream has no Content-Length, so it can't be kept alive
         char_row = character_by_id(convo.get("character_id")) if convo.get("character_id") else None
         system = apply_macros(system, {"user": (u["persona"] if "persona" in u.keys() else None) or u["username"],
                                        "char": char_row["name"] if char_row else None, "model": model})
@@ -2375,9 +2580,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "be cut short or fail. (Automatic context compression is coming.)").format(
                             model=model, cw=ctx_win)
         except Exception:
-            pass
+            log.exception("context-window management failed; sending untrimmed (convo %s)", cid)
 
-        def persist(collected, reply, reasoning, meta):
+        def persist(collected, reply, reasoning, meta, allow_empty=True):
             with db():
                 if continue_id:
                     # append the continuation to the existing assistant message, in place
@@ -2400,7 +2605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                           reasoning=item.get("reasoning"),
                                           model=model if item["role"] == "assistant" else None,
                                           tool=item.get("tool"))
-                if reply or reasoning or not collected:
+                if reply or reasoning or (allow_empty and not collected):
                     node = insert_message(cid, node, "assistant", reply, reasoning, model, meta)
                 set_leaf(cid, node)
                 touch_convo(cid)
@@ -2437,15 +2642,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         cont_extra = {}
         if continue_id:
             cont_extra.update({"add_generation_prompt": False, "continue_final_message": True})
-        if model in set(get_setting("thinking_models", []) or []):
-            # off by default (NULL/0); the user must explicitly enable thinking per chat in tune
+        if model in set(get_setting("thinking_models", []) or []) and convo.get("think") is not None:
+            # tri-state: NULL = model default (send nothing); 1/0 = explicit per-chat on/off
             cont_extra["chat_template_kwargs"] = {"enable_thinking": convo.get("think") == 1}
         cont_extra = cont_extra or None
+
+        seg_state = {}   # live buffers of the current run_stream pass, for partial-persist on error
 
         def run_stream(cur_tools):
             # Stream a turn. Leading whitespace is held back so a *dropped* tool call (which the oMLX
             # server emits as a lone "\n") never spawns an empty bubble — the thinking dots stay up.
             parts, rparts, tcalls, used, finish = [], [], None, None, None
+            seg_state["parts"], seg_state["rparts"] = parts, rparts
             flushed = [False]
 
             def push(d):
@@ -2548,7 +2756,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not new_call:
                     force_answer = True  # model is repeating the same call — make the next pass answer
         except Exception as e:
+            # Persist what made it through before failing, so the user's message and any partial
+            # reply survive a mid-stream error instead of evaporating on reload.
+            log.exception("stream failed (convo %s)", cid)
+            partial = strip_tool_calls("".join(seg_state.get("parts") or []))
+            partial_r = "".join(seg_state.get("rparts") or [])
+            persisted = False
+            if partial or partial_r or collected or lead:
+                try:
+                    meta = (build_meta(t0, t_first[0] or None, time.time(), usage, partial)
+                            if (partial or partial_r) else None)
+                    persist(collected, partial, partial_r, meta, allow_empty=False)
+                    persisted = True
+                except Exception:
+                    log.exception("failed to persist partial reply (convo %s)", cid)
             emit({"error": "model error: " + str(e)})
+            if persisted and not gone[0]:
+                try:
+                    emit({"done": True, "convo": get_convo(cid, u)})
+                except Exception:
+                    pass
             return
 
         # never leak raw <tool_call> syntax into a final answer; if tools are off but the model
@@ -2570,6 +2797,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pass
                 return
             emit({"error": "the model returned an empty response — please try again"})
+            if lead:   # still keep the user's turn so it isn't lost on reload
+                try:
+                    persist(collected, "", "", None, allow_empty=False)
+                    emit({"done": True, "convo": get_convo(cid, u)})
+                except Exception:
+                    log.exception("failed to persist user turn after empty response (convo %s)", cid)
             return
         meta = build_meta(t0, t_first[0] or None, time.time(), usage, reply)
         meta["params"] = {k: params[k] for k in params if k in PARAM_KEYS}   # what was actually sent
@@ -3007,7 +3240,7 @@ document.getElementById("f").onsubmit=async(ev)=>{ev.preventDefault();const e=do
 PAGE_HEAD = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>oracle</title>""" + META_TAGS + r"""
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap" rel="stylesheet">
@@ -3028,7 +3261,7 @@ PAGE_HEAD = r"""<!doctype html>
     --ctrl-h:calc(24px + 24.75px * var(--rs));
     --bg:#100c08; --panel:#15100a; --surface:#1b150d; --surface2:#231b10; --surface3:#2a2114;
     --line:rgba(150,124,84,.10);
-    --text:#e8ddc5; --muted:#9a8c72; --faint:#6a6049; --dim:#544a38;
+    --text:#e8ddc5; --muted:#9a8c72; --faint:#81765b; --dim:#6b5f49;
     --accent:#cf8a3c; --accent2:#cda261; --accent-weak:rgba(207,138,60,.14);
     --user:#b49f78; --bot:#d29a4b; --danger:#c8604c; --danger-weak:rgba(200,90,70,.14); --ok:#94a05c;
     --code-bg:#0c0905; --shadow:0 24px 70px rgba(0,0,0,.55);
@@ -3039,7 +3272,7 @@ PAGE_HEAD = r"""<!doctype html>
   [data-theme="light"]{
     --bg:#f0e8d6; --panel:#e9e0cc; --surface:#e3d8c1; --surface2:#dacdb0; --surface3:#d2c3a4;
     --line:rgba(90,68,34,.14);
-    --text:#2c2316; --muted:#6a5c43; --faint:#9a8b6e; --dim:#b3a487;
+    --text:#2c2316; --muted:#6a5c43; --faint:#80714f; --dim:#94855f;
     --accent:#b26a1d; --accent2:#7d5320; --accent-weak:rgba(178,106,29,.15);
     --user:#6d5a32; --bot:#955414; --danger:#a23a2a; --danger-weak:rgba(162,58,42,.12); --ok:#5f6b2f;
     --code-bg:#e6dcc6; --shadow:0 24px 60px rgba(60,45,20,.25);
@@ -3092,6 +3325,7 @@ PAGE_HEAD = r"""<!doctype html>
   .folder-body.hidden{display:none;}
   .convo{padding:9px 30px 9px 11px;border-radius:9px;cursor:pointer;margin:2px 0;position:relative;}
   .convo:hover{background:var(--surface);}
+  .convo:focus-visible,.folder-head:focus-visible{outline:2px solid var(--accent-weak);outline-offset:-1px;background:var(--surface);}
   .convo.active{background:var(--surface2);}
   .convo .ct{font-family:var(--serif);font-size:calc(15px*var(--rs));line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .convo .cm{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:3px;letter-spacing:.03em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -3168,8 +3402,12 @@ PAGE_HEAD = r"""<!doctype html>
   .bubble ul,.bubble ol{margin:.5em 0;padding-left:1.4em;} .bubble li{margin:.25em 0;}
   .bubble a{color:var(--accent);text-underline-offset:2px;}
   .bubble code{font-family:var(--mono);font-size:.82em;background:var(--code-bg);border-radius:5px;padding:.06em .34em;}
-  .bubble pre{background:var(--code-bg);border-radius:10px;padding:13px 15px;overflow-x:auto;margin:.7em 0;}
+  .bubble pre{position:relative;background:var(--code-bg);border-radius:10px;padding:13px 15px;overflow-x:auto;margin:.7em 0;}
   .bubble pre code{background:none;padding:0;font-size:.84em;line-height:1.55;}
+  .copy-code{position:absolute;top:7px;right:7px;background:var(--surface);color:var(--faint);border:1px solid var(--line);
+             border-radius:6px;padding:3px 8px;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+             cursor:pointer;opacity:0;transition:opacity .14s,color .14s;}
+  .bubble pre:hover .copy-code,.copy-code:focus{opacity:1;} .copy-code:hover{color:var(--accent);}
   .bubble blockquote{margin:.7em 0;padding:.1em 0 .1em 1.1em;border-left:2px solid var(--surface3);color:var(--muted);font-style:italic;}
   .bubble hr{border:none;border-top:1px solid var(--line);margin:1.1em 0;}
   .bubble strong{font-weight:600;}
@@ -3184,7 +3422,7 @@ PAGE_HEAD = r"""<!doctype html>
   .meta .pill.k{color:var(--accent2);}
   .meta .pill.k.has-tip{cursor:help;text-decoration:underline dotted var(--faint);text-underline-offset:2px;}
   .actions{margin-top:11px;display:flex;gap:3px;flex-wrap:wrap;opacity:0;transition:opacity .12s;}
-  .msg:hover .actions{opacity:1;}
+  .msg:hover .actions,.msg:focus-within .actions{opacity:1;}
   .actions button{background:none;border:none;color:var(--faint);font-size:10px;letter-spacing:.07em;text-transform:uppercase;cursor:pointer;padding:4px 8px;border-radius:7px;}
   .actions button:hover{background:var(--surface);color:var(--text);}
   .actions button.danger:hover{color:var(--danger);}
@@ -3238,11 +3476,12 @@ PAGE_HEAD = r"""<!doctype html>
   .achip .rm{background:none;border:none;color:var(--faint);cursor:pointer;font-size:14px;line-height:1;padding:0;} .achip .rm:hover{color:var(--danger);}
   #composer.dragover .input-shell{outline:2px dashed var(--accent);outline-offset:3px;}
 
-  /* ---------------- scroll-to-top floating button */
-  #scrolltop{position:absolute;right:16px;bottom:92px;width:42px;height:42px;border-radius:50%;background:var(--surface2);color:var(--text);border:1px solid var(--line);box-shadow:var(--shadow);display:none;align-items:center;justify-content:center;cursor:pointer;z-index:30;opacity:.94;}
-  #scrolltop.show{display:flex;}
-  #scrolltop:hover{background:var(--surface3);opacity:1;}
-  #scrolltop .ico{width:18px;height:18px;stroke-width:2.3;}
+  /* ---------------- floating scroll buttons */
+  #scrolltop,#scrollbottom{position:absolute;right:16px;bottom:92px;width:42px;height:42px;border-radius:50%;background:var(--surface2);color:var(--text);border:1px solid var(--line);box-shadow:var(--shadow);display:none;align-items:center;justify-content:center;cursor:pointer;z-index:30;opacity:.94;}
+  #scrollbottom{bottom:144px;color:var(--accent);}
+  #scrolltop.show,#scrollbottom.show{display:flex;}
+  #scrolltop:hover,#scrollbottom:hover{background:var(--surface3);opacity:1;}
+  #scrolltop .ico,#scrollbottom .ico{width:18px;height:18px;stroke-width:2.3;}
   .msg .atts{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 9px;}
   .msg .atts details{background:var(--surface);border:1px solid var(--line);border-radius:9px;max-width:100%;}
   .msg .atts summary{cursor:pointer;list-style:none;padding:5px 9px;font-family:var(--mono);font-size:10.5px;color:var(--muted);display:flex;gap:7px;align-items:center;}
@@ -3407,6 +3646,7 @@ PAGE_HEAD = r"""<!doctype html>
   .dlg .share-actions .grow{flex:1;}
   #toast{position:fixed;bottom:96px;left:50%;transform:translateX(-50%) translateY(8px);background:var(--surface3);padding:10px 16px;border-radius:10px;font-family:var(--mono);font-size:12px;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;z-index:99;box-shadow:var(--shadow);letter-spacing:.03em;}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+  #toast.err{background:var(--danger-weak);color:var(--danger);box-shadow:var(--shadow),inset 0 0 0 1px var(--danger);}
 
   /* responsive */
   @media (max-width:860px){
@@ -3428,6 +3668,7 @@ PAGE_HEAD = r"""<!doctype html>
     .params-grid{grid-template-columns:1fr;} .barbtn .t{display:none;}
     #composer .wrap{gap:6px;}
     #scrolltop{bottom:86px;right:12px;}
+    #scrollbottom{bottom:136px;right:12px;}
   }
 </style></head>
 <body>
@@ -3483,19 +3724,20 @@ PAGE_BODY = r"""
         </div>
         <div class="chint" id="chint"></div>
       </footer>
-      <button id="scrolltop" title="scroll to top"><svg class="ico" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+      <button id="scrolltop" title="scroll to top" aria-label="scroll to top"><svg class="ico" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+      <button id="scrollbottom" title="jump to latest" aria-label="jump to latest"><svg class="ico" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></svg></button>
     </main>
   </div>
 
-  <div id="drawer" class="panel">
-    <div class="phead"><h3>chat settings</h3><button class="x" data-close-drawer>&times;</button></div>
+  <div id="drawer" class="panel" role="dialog" aria-modal="true" aria-label="chat settings">
+    <div class="phead"><h3>chat settings</h3><button class="x" data-close-drawer aria-label="close">&times;</button></div>
     <div class="pbody">
       <label class="fld"><span class="lab">character</span><select id="d_char"></select></label>
       <label class="fld" id="d_endpoint_wrap"><span class="lab">endpoint <span class="sub">(admin)</span></span><select id="d_endpoint"></select></label>
       <label class="fld"><span class="lab">model</span><select id="d_model"></select></label>
       <label class="fld"><span class="lab">system prompt <span class="sub">this chat only</span></span><textarea id="d_system" placeholder="empty = no system prompt"></textarea></label>
       <label class="fld chk"><span class="lab">web tools <span class="sub">let the model fetch web pages</span></span><label class="chkrow"><input type="checkbox" id="d_tools"> <span>enable <code>fetch_url</code> for this chat</span></label></label>
-      <label class="fld chk" id="d_think_wrap" style="display:none;"><span class="lab">thinking <span class="sub">let the model reason before answering</span></span><label class="chkrow"><input type="checkbox" id="d_think"> <span>enable extended thinking for this chat</span></label></label>
+      <label class="fld" id="d_think_wrap" style="display:none;"><span class="lab">thinking <span class="sub">let the model reason before answering</span></span><select id="d_think"><option value="">model default</option><option value="1">on</option><option value="0">off</option></select></label>
       <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span>
         <div class="preset-row"><select id="d_preset"></select><button class="mini" id="d_preset_save">save preset</button><button class="mini" id="d_preset_del" style="display:none">delete</button></div>
         <div class="params-grid" id="d_params"></div>
@@ -3506,8 +3748,8 @@ PAGE_BODY = r"""
   </div>
 
   <div id="modal">
-    <div class="modal-card">
-      <div class="mhead"><h3>settings</h3><button class="x" data-close-modal>&times;</button></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="settings">
+      <div class="mhead"><h3>settings</h3><button class="x" data-close-modal aria-label="close">&times;</button></div>
       <div class="tabs" id="tabs"></div>
       <div class="tab-body">
         <div class="tab-pane" id="tab-account">
@@ -3610,8 +3852,8 @@ PAGE_BODY = r"""
     </div>
   </div>
 
-  <div id="menu"></div>
-  <div id="dlgwrap"><div class="dlg" id="dlg"></div></div>
+  <div id="menu" role="menu"></div>
+  <div id="dlgwrap"><div class="dlg" id="dlg" role="dialog" aria-modal="true"></div></div>
   <div id="peekmodal">
     <div class="modal-card peek-card">
       <div class="mhead"><h3 id="peek-title">user</h3><div class="seg" id="peek-tabs"><button data-pt="chats" class="on">chats</button><button data-pt="chars">characters</button></div><button class="x" data-close-peek>&times;</button></div>
@@ -3626,7 +3868,39 @@ PAGE_BODY = r"""
   </div>
   <div id="backdrop"></div>
   <div id="tipbox" class="tipbox" role="tooltip"></div>
-  <div id="toast"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+"""
+
+# HTML-escape + markdown helpers shared verbatim by the app and the public share viewer; composed
+# into both pages at startup so the two copies can't drift apart. (Function declarations hoist, so
+# placement within each script doesn't matter.)
+MD_ESC_JS = r"""
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function md(src){
+  if(!src)return "";
+  let s=src.replace(/\r\n/g,"\n").replace(/\r/g,"\n");
+  const code=[];s=s.replace(/```[ \t]*([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g,(m,l,b)=>{code.push(b);return "@@C"+(code.length-1)+"@@";});
+  const ic=[];s=s.replace(/`([^`\n]+)`/g,(m,c)=>{ic.push(c);return "@@I"+(ic.length-1)+"@@";});
+  const inline=t=>{t=esc(t);
+    t=t.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener nofollow">$1</a>');
+    t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/__([^_]+)__/g,"<strong>$1</strong>");
+    t=t.replace(/(^|[^*\w])\*([^*\n]+)\*/g,"$1<em>$2</em>").replace(/(^|[^_\w])_([^_\n]+)_/g,"$1<em>$2</em>");
+    t=t.replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");return t;};
+  const lines=s.split("\n");let out=[],i=0,para=[];
+  const flush=()=>{if(para.length){out.push("<p>"+para.map(inline).join("<br>")+"</p>");para=[];}};
+  while(i<lines.length){let ln=lines[i];
+    let cb=ln.match(/^@@C(\d+)@@\s*$/);if(cb){flush();out.push("<pre><code>"+esc(code[+cb[1]])+"</code></pre>");i++;continue;}
+    if(/^\s*$/.test(ln)){flush();i++;continue;}
+    let h=ln.match(/^(#{1,6})\s+(.*)$/);if(h){flush();const lv=Math.min(4,h[1].length);out.push("<h"+lv+">"+inline(h[2])+"</h"+lv+">");i++;continue;}
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){flush();out.push("<hr>");i++;continue;}
+    if(/^\s*>/.test(ln)){flush();let q=[];while(i<lines.length&&/^\s*>/.test(lines[i])){q.push(lines[i].replace(/^\s*>\s?/,""));i++;}out.push("<blockquote>"+q.map(inline).join("<br>")+"</blockquote>");continue;}
+    if(/^\s*[-*+]\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*[-*+]\s+/,""));i++;}out.push("<ul>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ul>");continue;}
+    if(/^\s*\d+\.\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*\d+\.\s+/,""));i++;}out.push("<ol>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ol>");continue;}
+    para.push(ln);i++;}
+  flush();let html=out.join("\n");
+  html=html.replace(/@@C(\d+)@@/g,(m,i)=>"<pre><code>"+esc(code[+i])+"</code></pre>").replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");
+  return html;
+}
 """
 
 PAGE_JS1 = r"""<script>
@@ -3643,10 +3917,20 @@ const ICON_THUMB='<svg class="ico" viewBox="0 0 24 24"><path d="M14 9V5a3 3 0 0 
 const ICON_MOON='<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>';
 const ICON_SUN='<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>';
 
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtNum(n){return n==null?"?":Number(n).toLocaleString();}
 function isAdmin(){return CFG&&CFG.is_admin;}
-function toast(m,ms){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove("show"),ms||2600);}
+function toast(m,ms,cls){const t=$("#toast");t.textContent=m;t.classList.remove("err");if(cls)t.classList.add(cls);
+  t.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove("show"),ms||2600);}
+function copyText(t,okMsg){
+  const ok=()=>toast(okMsg||"copied");
+  const fail=()=>{ // fallback for non-secure (http://) contexts where the clipboard API is absent
+    try{const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";
+      document.body.appendChild(ta);ta.select();const r=document.execCommand("copy");ta.remove();
+      r?ok():toast("copy failed — select the text manually","",'err');}
+    catch(_){toast("copy failed — select the text manually","",'err');}
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(ok,fail);else fail();
+}
 async function api(method,path,body){
   const o={method,headers:{"Content-Type":"application/json"}};
   if(body!==undefined)o.body=JSON.stringify(body);
@@ -3688,16 +3972,20 @@ function curCW(){return parseInt(getComputedStyle(document.documentElement).getP
 function closeDlg(){$("#dlgwrap").classList.remove("show");$("#dlg").innerHTML="";}
 function dialog(html,onmount){return new Promise(res=>{
   const w=$("#dlgwrap"),d=$("#dlg");d.innerHTML=html;w.classList.add("show");
-  const done=v=>{closeDlg();res(v);};
+  const prev=document.activeElement;   // restore keyboard focus to the opener when the dialog closes
+  const done=v=>{closeDlg();if(prev&&prev.focus){try{prev.focus();}catch(_){}}res(v);};
   d._resolve=done;
   const esckey=e=>{if(e.key==="Escape"){document.removeEventListener("keydown",esckey);done(null);}};
   document.addEventListener("keydown",esckey);
   w.onclick=e=>{if(e.target===w){document.removeEventListener("keydown",esckey);done(null);}};
+  const f=d.querySelector("input,select,textarea")||d.querySelector("[data-ok]")||d.querySelector("button");
+  if(f)f.focus();
   if(onmount)onmount(d,done);
 });}
 function uiConfirm(message,{title="Confirm",danger=false,ok="Confirm"}={}){
   return dialog('<h4>'+esc(title)+'</h4><p>'+esc(message)+'</p><div class="dlg-btns"><button class="btn-ghost" data-x>cancel</button><button class="'+(danger?"btn-danger":"btn-primary")+'" data-ok>'+esc(ok)+'</button></div>',
-    (d,done)=>{d.querySelector("[data-x]").onclick=()=>done(false);d.querySelector("[data-ok]").onclick=()=>done(true);});
+    (d,done)=>{d.querySelector("[data-x]").onclick=()=>done(false);d.querySelector("[data-ok]").onclick=()=>done(true);
+      d.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();done(true);}};});
 }
 function uiPrompt(message,def="",{title="",ok="Save"}={}){
   return dialog((title?'<h4>'+esc(title)+'</h4>':'')+'<p>'+esc(message)+'</p><input id="dlgin" value="'+esc(def)+'"><div class="dlg-btns"><button class="btn-ghost" data-x>cancel</button><button class="btn-primary" data-ok>'+esc(ok)+'</button></div>',
@@ -3712,33 +4000,8 @@ function uiSelect(message,options,{title="Move"}={}){
       d.querySelector("[data-x]").onclick=()=>done(null);d.querySelector("[data-ok]").onclick=()=>done(sel.value);});
 }
 
-// ---------------- markdown
-function md(src){
-  if(!src)return "";
-  let s=src.replace(/\r\n/g,"\n").replace(/\r/g,"\n");
-  const code=[];s=s.replace(/```[ \t]*([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g,(m,l,b)=>{code.push(b);return "@@C"+(code.length-1)+"@@";});
-  const ic=[];s=s.replace(/`([^`\n]+)`/g,(m,c)=>{ic.push(c);return "@@I"+(ic.length-1)+"@@";});
-  const inline=t=>{t=esc(t);
-    t=t.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-    t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/__([^_]+)__/g,"<strong>$1</strong>");
-    t=t.replace(/(^|[^*\w])\*([^*\n]+)\*/g,"$1<em>$2</em>").replace(/(^|[^_\w])_([^_\n]+)_/g,"$1<em>$2</em>");
-    t=t.replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");return t;};
-  const lines=s.split("\n");let out=[],i=0,para=[];
-  const flush=()=>{if(para.length){out.push("<p>"+para.map(inline).join("<br>")+"</p>");para=[];}};
-  while(i<lines.length){let ln=lines[i];
-    let cb=ln.match(/^@@C(\d+)@@\s*$/);if(cb){flush();out.push("<pre><code>"+esc(code[+cb[1]])+"</code></pre>");i++;continue;}
-    if(/^\s*$/.test(ln)){flush();i++;continue;}
-    let h=ln.match(/^(#{1,6})\s+(.*)$/);if(h){flush();const lv=Math.min(4,h[1].length);out.push("<h"+lv+">"+inline(h[2])+"</h"+lv+">");i++;continue;}
-    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){flush();out.push("<hr>");i++;continue;}
-    if(/^\s*>/.test(ln)){flush();let q=[];while(i<lines.length&&/^\s*>/.test(lines[i])){q.push(lines[i].replace(/^\s*>\s?/,""));i++;}out.push("<blockquote>"+q.map(inline).join("<br>")+"</blockquote>");continue;}
-    if(/^\s*[-*+]\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*[-*+]\s+/,""));i++;}out.push("<ul>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ul>");continue;}
-    if(/^\s*\d+\.\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*\d+\.\s+/,""));i++;}out.push("<ol>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ol>");continue;}
-    para.push(ln);i++;}
-  flush();let html=out.join("\n");
-  html=html.replace(/@@C(\d+)@@/g,(m,i)=>"<pre><code>"+esc(code[+i])+"</code></pre>").replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");
-  return html;
-}
-
+// ---------------- markdown: see MD_ESC_JS (shared with the public share viewer)
+""" + MD_ESC_JS + r"""
 // ---------------- config
 function charById(id){return (CFG.characters||[]).find(c=>c.id===id)||null;}
 function endpointName(id){return ((CFG.settings&&CFG.settings.endpoints)||[]).find(e=>e.id===id);}
@@ -3756,6 +4019,7 @@ function rebuildModelSelect(sel,models,value){
   (models||[]).forEach(m=>{if(seen.has(m))return;seen.add(m);const o=document.createElement("option");o.value=m;o.textContent=m;sel.appendChild(o);});
   if(cur&&!seen.has(cur)){const o=document.createElement("option");o.value=cur;o.textContent=cur;sel.insertBefore(o,sel.firstChild);}
   if(cur)sel.value=cur;
+  if(!sel.options.length){const o=document.createElement("option");o.value="";o.textContent="(endpoint unreachable)";o.disabled=true;sel.appendChild(o);}
 }
 
 // ---------------- sidebar / folders / multiselect
@@ -3777,6 +4041,8 @@ function renderTree(){
     fol.innerHTML='<div class="folder-head'+(col?' collapsed':'')+'"><span class="tw">&#9662;</span><span class="fname">'+esc(f.name)+'</span><span class="cnt">'+items.length+'</span><button class="fmenu">&#8943;</button></div><div class="folder-body'+(col?' hidden':'')+'"></div>';
     const head=fol.querySelector(".folder-head"),body=fol.querySelector(".folder-body");
     head.onclick=e=>{if(e.target.classList.contains("fmenu"))return;collapsed[f.id]=!collapsed[f.id];renderTree();};
+    head.tabIndex=0;
+    head.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();collapsed[f.id]=!collapsed[f.id];renderTree();}});
     head.querySelector(".fmenu").onclick=e=>{e.stopPropagation();folderMenu(e,f);};
     items.forEach(c=>body.appendChild(convoRow(c)));
     setupDrop(fol,f.id);tree.appendChild(fol);
@@ -3810,6 +4076,9 @@ function convoRow(c){
     (ch?esc((ch.avatar?ch.avatar+" ":"")+ch.name)+' · ':'')+esc(c.model||"")+' · '+relTime(c.updated)+'</div><button class="cmenu">&#8943;</button>';
   d.onclick=e=>{if(e.target.classList.contains("cmenu"))return;
     if(selMode){toggleSel(c.id,d);return;}openConvo(c.id);closeSidebar();};
+  d.tabIndex=0;d.setAttribute("role","button");
+  d.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();
+    if(selMode){toggleSel(c.id,d);}else{openConvo(c.id);closeSidebar();}}});
   d.querySelector(".cmenu").onclick=e=>{e.stopPropagation();convoMenu(e,c);};
   d.addEventListener("dragstart",e=>{e.dataTransfer.setData("text/plain",c.id);d.classList.add("dragging");});
   d.addEventListener("dragend",()=>d.classList.remove("dragging"));
@@ -3892,7 +4161,7 @@ async function shareDialog(c){
             '<button class="btn-primary" data-x>done</button>'+
           '</div>';
         const inp=body.querySelector("#shareUrl");
-        body.querySelector('[data-s="copy"]').onclick=()=>{inp.focus();inp.select();navigator.clipboard.writeText(st.url).then(()=>toast("link copied"),()=>toast("select & copy the link"));};
+        body.querySelector('[data-s="copy"]').onclick=()=>{inp.focus();inp.select();copyText(st.url,"link copied");};
         body.querySelector('[data-s="update"]').onclick=async(e)=>{e.target.disabled=true;try{st=await api("POST","/api/conversations/"+c.id+"/share");render();toast("snapshot updated to the current thread");}catch(err){toast(err.message);render();}};
         body.querySelector('[data-s="unshare"]').onclick=async(e)=>{e.target.disabled=true;try{st=await api("DELETE","/api/conversations/"+c.id+"/share");render();toast("link disabled");}catch(err){toast(err.message);render();}};
         body.querySelector('[data-x]').onclick=()=>done(null);
@@ -3909,9 +4178,14 @@ async function shareDialog(c){
 }
 
 async function exportChat(id,fmt){
-  const c=await api("GET","/api/conversations/"+id);
+  if(fmt==="json"){
+    // full tree: every branch, plus ratings / reasoning / tool steps (same shape as export-all)
+    const full=await api("GET","/api/conversations/"+id+"/export");
+    const safe=(full.title||"chat").replace(/[^a-z0-9]+/gi,"-").slice(0,50).replace(/^-|-$/g,"")||"chat";
+    download(safe+".json",JSON.stringify(full,null,2),"application/json");return;
+  }
+  const c=await api("GET","/api/conversations/"+id);   // markdown: the active thread as prose
   const safe=(c.title||"chat").replace(/[^a-z0-9]+/gi,"-").slice(0,50).replace(/^-|-$/g,"")||"chat";
-  if(fmt==="json"){download(safe+".json",JSON.stringify(c,null,2),"application/json");return;}
   let out="# "+(c.title||"untitled")+"\n\n";
   (c.messages||[]).forEach(m=>{out+="## "+(m.role==="user"?(CFG.me.username||"user"):"oracle")+"  ·  "+(m.ts||"")+"\n\n"+(m.content||"")+"\n\n";});
   download(safe+".md",out,"text/markdown");
@@ -3939,6 +4213,12 @@ function syncBar(){
 }
 function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clientHeight<40;}
 function scrollDown(){const l=$("#log");l.scrollTop=l.scrollHeight;}
+let _scrollQueued=false;
+function scheduleScroll(){   // rAF-coalesced autoscroll: one layout per frame however fast tokens arrive
+  if(!autoScroll||_scrollQueued)return;
+  _scrollQueued=true;
+  requestAnimationFrame(()=>{_scrollQueued=false;if(autoScroll)scrollDown();});
+}
 function renderConvo(opts){
   opts=opts||{};
   const stick=(opts.stick!==undefined)?opts.stick:autoScroll;
@@ -3948,8 +4228,17 @@ function renderConvo(opts){
   const msgs=(current.messages||[]).filter(m=>m.role==="user"||m.role==="assistant");
   if(!msgs.length)wrap.innerHTML='<div class="empty"><div class="glyph">&rsaquo;_</div><h2>new conversation</h2><p>say something to begin</p></div>';
   else current.messages.forEach((m,i)=>{if(m.role==="user"||m.role==="assistant"||m.role==="tool")wrap.appendChild(msgEl(m,i));});
+  addCodeCopy(wrap);
   log.appendChild(wrap);
   if(stick){autoScroll=true;scrollDown();}else log.scrollTop=prev;
+}
+function addCodeCopy(root){
+  root.querySelectorAll(".bubble pre").forEach(pre=>{
+    if(pre.querySelector(".copy-code"))return;
+    const b=document.createElement("button");b.className="copy-code";b.type="button";b.textContent="copy";
+    b.onclick=e=>{e.stopPropagation();const code=pre.querySelector("code");copyText(code?code.textContent:pre.textContent,"code copied");};
+    pre.appendChild(b);
+  });
 }
 function paramsTipText(m){
   const x=m&&m.meta;if(!x)return "";
@@ -4008,8 +4297,8 @@ function msgEl(m,i){
   return d;
 }
 function handleAction(act,m,d,btn){
-  if(act==="copy"){navigator.clipboard.writeText(m.content);toast("copied");return;}
-  if(act==="raw"){const b=d.querySelector(".bubble");if(b.classList.contains("raw")){b.classList.remove("raw");b.innerHTML=md(m.content);btn.textContent="raw";}else{b.classList.add("raw");b.textContent=m.content;btn.textContent="markdown";}return;}
+  if(act==="copy"){copyText(m.content);return;}
+  if(act==="raw"){const b=d.querySelector(".bubble");if(b.classList.contains("raw")){b.classList.remove("raw");b.innerHTML=md(m.content);addCodeCopy(d);btn.textContent="raw";}else{b.classList.add("raw");b.textContent=m.content;btn.textContent="markdown";}return;}
   if(act==="edit"){startEdit(m,d);return;}
   if(act==="regen"){regenerate(m);return;}
   if(act==="continue"){continueMsg(m);return;}
@@ -4143,17 +4432,19 @@ async function streamRequest(path,body,handlers,signal){
   const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),signal});
   if(r.status===401){location.href="/login";throw new Error("session expired");}
   if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||("HTTP "+r.status));}
-  const reader=r.body.getReader(),dec=new TextDecoder();let buf="",result=null;
+  const reader=r.body.getReader(),dec=new TextDecoder();let buf="",result=null,errMsg=null;
   while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});
     let nl;while((nl=buf.indexOf("\n"))>=0){const line=buf.slice(0,nl);buf=buf.slice(nl+1);if(!line.trim())continue;
       let o;try{o=JSON.parse(line);}catch(_){continue;}
-      if(o.error)throw new Error(o.error);else if(o.delta!==undefined)handlers.onDelta(o.delta);
+      if(o.error)errMsg=o.error;   // keep reading: a `done` with the persisted partial may follow
+      else if(o.delta!==undefined)handlers.onDelta(o.delta);
       else if(o.reasoning!==undefined)handlers.onReason(o.reasoning);
       else if(o.status!==undefined)handlers.onStatus&&handlers.onStatus(o.status);
       else if(o.tool_call)handlers.onToolCall&&handlers.onToolCall(o.tool_call);
       else if(o.tool_result)handlers.onToolResult&&handlers.onToolResult(o.tool_result);
       else if(o.notice!==undefined)handlers.onNotice&&handlers.onNotice(o.notice);
       else if(o.done)result=o;}}
+  if(errMsg){const ex=new Error(errMsg);ex.convo=result&&result.convo;throw ex;}
   return result;
 }
 async function streamTurn(body){
@@ -4169,8 +4460,15 @@ async function streamTurn(body){
       onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
       onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;
           if(L.reasonBox&&racc&&!L.reasonCollapsed){L.reasonBox.open=false;L.reasonCollapsed=true;}}  // answer began -> fold the reasoning
-        L.acc=(L.acc||"")+d;L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();},
-      onReason:r=>{const L=bubble();racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}if(L.reason){L.reason.textContent=racc;}if(autoScroll)scrollDown();},
+        L.acc=(L.acc||"")+d;
+        // append just the new text instead of re-assigning the whole reply each token (O(n) not O(n²));
+        // the full rewrite only happens in the rare case a <tool_call> tag must be stripped out
+        if(L.acc.indexOf("<tool_call>")>=0)L.bubble.textContent=stripTC(L.acc);
+        else L.bubble.appendChild(document.createTextNode(d));
+        scheduleScroll();},
+      onReason:r=>{const L=bubble();racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}
+        if(L.reason)L.reason.appendChild(document.createTextNode(r));
+        scheduleScroll();},
       onToolCall:tc=>{clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(autoScroll)scrollDown();},
       onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();},
       onNotice:msg=>{showNotice(msg);toast("context window reached",6000);}
@@ -4190,24 +4488,44 @@ function stopStream(){
   api("POST","/api/conversations/"+current.id+"/stop").catch(()=>{});
   if(activeController){const c=activeController;clearTimeout(_stopFallback);_stopFallback=setTimeout(()=>{try{c.abort();}catch(_){}},4000);}
 }
-async function runStream(body,optimistic){
+function showStreamError(msg){
+  const w=liveWrap();const n=document.createElement("div");n.className="ctx-notice";
+  n.textContent="✕ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
+}
+async function runStream(body,optimistic,restore){
   if(busy||!current)return;setBusy(true);
   if(optimistic)optimistic();
   try{const {res,stopped}=await streamTurn(body);
     if(res&&res.convo){current=res.convo;renderConvo();}else await openConvo(current.id);
     refreshList();
-  }catch(e){toast(e.message);try{await openConvo(current.id);}catch(_){}}
+  }catch(e){
+    const kept=!!e.convo;   // server persisted the turn (incl. any partial reply) before failing
+    if(kept){current=e.convo;renderConvo({stick:false});}
+    else{try{await openConvo(current.id);}catch(_){}}
+    showStreamError(e.message||"stream failed");
+    if(!kept&&restore)restore();   // nothing saved server-side -> put the draft back
+    toast(e.message||"stream failed",4000,'err');
+    refreshList();
+  }
   finally{setBusy(false);$("#input").focus();}
 }
 async function send(){
   const text=$("#input").value.trim();const atts=pendingReady();
-  if((!text&&!atts.length)||busy)return;
+  if((!text&&!atts.length)||busy||send._creating)return;
   if(pendingAtt.some(a=>a.busy)){toast("still reading a file…");return;}
-  if(!current){current=await api("POST","/api/conversations",{system:CFG.default_system,model:$("#modelsel").value||CFG.default_model});}
+  if(!current){
+    send._creating=true;   // a double-click during the await must not create two conversations
+    try{current=await api("POST","/api/conversations",{system:CFG.default_system,model:$("#modelsel").value||CFG.default_model});}
+    catch(e){toast(e.message,4000,'err');return;}
+    finally{send._creating=false;}
+  }
   $("#input").value="";$("#input").style.height="auto";
   const sendAtts=atts.map(a=>({name:a.name,text:a.text}));
+  const restorable=pendingAtt.slice();
   clearPending();
-  runStream({content:text,attachments:sendAtts},()=>{current.messages.push({id:"tmp",role:"user",content:text,attachments:sendAtts,ts:new Date().toISOString()});renderConvo({stick:true});});
+  runStream({content:text,attachments:sendAtts},
+    ()=>{current.messages.push({id:"tmp",role:"user",content:text,attachments:sendAtts,ts:new Date().toISOString()});renderConvo({stick:true});},
+    ()=>{$("#input").value=text;pendingAtt=restorable;renderPending();$("#input").dispatchEvent(new Event("input"));});
 }
 function regenerate(m){
   const idx=current.messages.findIndex(x=>x.id===m.id);
@@ -4225,7 +4543,13 @@ function resendEdited(mid,newContent){
 }
 
 async function openConvo(id){current=await api("GET","/api/conversations/"+id);renderConvo({stick:true});renderTree();}
-async function newChat(){current=await api("POST","/api/conversations",{system:CFG.default_system,model:CFG.default_model});renderConvo();refreshList();$("#input").focus();closeSidebar();}
+async function newChat(){
+  // reuse an existing empty conversation instead of stacking blank rows in the sidebar
+  const empty=convoCache.find(c=>!c.turns&&!c.character_id);
+  if(empty){await openConvo(empty.id);$("#input").focus();closeSidebar();return;}
+  current=await api("POST","/api/conversations",{system:CFG.default_system,model:CFG.default_model});
+  renderConvo();refreshList();$("#input").focus();closeSidebar();
+}
 
 function editTitle(){
   if(!current)return;const t=$("#title");if(t.classList.contains("editing"))return;
@@ -4385,18 +4709,18 @@ async function openDrawer(){
   $("#d_system").oninput=applySystem;
   $("#d_tools").checked=!!current.tools;
   $("#d_tools").onchange=()=>applyDrawer({tools:$("#d_tools").checked});
-  $("#d_think").onchange=()=>applyDrawer({think:$("#d_think").checked?1:0});
+  $("#d_think").onchange=()=>{const v=$("#d_think").value;applyDrawer({think:v===""?null:(v==="1"?1:0)});};
   syncThinkRow();
   buildParamsGrid($("#d_params"),current.params||{});
   buildPresetSelect();
   showOverlay($("#drawer"));
 }
 function syncThinkRow(){
-  // only show the thinking toggle for models an admin has marked thinking-capable site-wide
+  // only show the thinking control for models an admin has marked thinking-capable site-wide
   const model=($("#d_model").value)||(current&&current.model)||"";
   const ok=(CFG.thinking_models||[]).includes(model);
   $("#d_think_wrap").style.display=ok?"":"none";
-  if(ok)$("#d_think").checked=!!(current&&current.think===1);   // off by default; on only when explicitly enabled
+  if(ok)$("#d_think").value=(current&&current.think===1)?"1":(current&&current.think===0)?"0":"";   // tri-state
 }
 async function refreshDrawerModels(endpointId,value){
   let models=CFG.models;
@@ -4510,7 +4834,11 @@ function renderEndpoints(){
     card.querySelector(".radio-active input").onchange=()=>{CFG.settings.active_endpoint=ep.id;};
     card.querySelector("[data-del]").onclick=()=>{if(CFG.settings.endpoints.length<=1){toast("keep at least one");return;}CFG.settings.endpoints.splice(idx,1);if(CFG.settings.active_endpoint===ep.id)CFG.settings.active_endpoint=CFG.settings.endpoints[0].id;renderEndpoints();};
     card.querySelector("[data-test]").onclick=async()=>{const st=card.querySelector(".status");st.textContent="testing…";collectEndpoints();
-      try{await api("POST","/api/settings",{endpoints:CFG.settings.endpoints});const r=await api("GET","/api/models?endpoint="+encodeURIComponent(ep.id));st.textContent="ok · "+r.models.length+" models";st.style.color="var(--ok)";}catch(e){st.textContent="x "+e.message;st.style.color="var(--danger)";}};
+      // tests the endpoint as currently edited in the form — nothing is saved as a side effect
+      try{const r=await api("POST","/api/settings/test",{endpoint:CFG.settings.endpoints[+card.dataset.idx]});
+        if(r.ok){st.textContent="ok · "+r.models.length+" models";st.style.color="var(--ok)";}
+        else{st.textContent="x "+(r.error||"failed");st.style.color="var(--danger)";}
+      }catch(e){st.textContent="x "+e.message;st.style.color="var(--danger)";}};
     list.appendChild(card);
   });
 }
@@ -4583,6 +4911,7 @@ async function openPeekConvo(cid){
   V.innerHTML="";const wrap=document.createElement("div");wrap.className="wrap";
   (convo.messages||[]).forEach(m=>{if(m.role==="user"||m.role==="assistant"||m.role==="tool")wrap.appendChild(peekMsgEl(m,charName,userName));});
   if(!wrap.children.length)wrap.innerHTML='<div class="peek-hint">empty conversation</div>';
+  addCodeCopy(wrap);
   V.appendChild(wrap);V.scrollTop=0;
 }
 function renderPeekChars(){
@@ -4615,10 +4944,7 @@ function inviteExpiryText(iv){
   const hrs=Math.max(1,Math.floor(ms/3600000));
   return "expires in "+hrs+" hr"+(hrs>1?"s":"");
 }
-function copyInvite(url){
-  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(()=>toast("link copied"),()=>toast("copy failed — select the link"));
-  else toast("select the link and copy");
-}
+function copyInvite(url){copyText(url,"link copied");}
 function renderInvites(){
   const list=$("#invite-list");list.innerHTML="";
   if(!inviteCache.length){list.innerHTML='<div style="color:var(--faint);font-family:var(--mono);font-size:11px;margin-bottom:10px;">no invite links yet.</div>';return;}
@@ -4645,9 +4971,7 @@ async function createInvite(){
     max_uses:$("#iv_uses").value.trim()?parseInt($("#iv_uses").value,10):null,
     note:$("#iv_note").value.trim()};
   try{const r=await api("POST","/api/invites",body);inviteCache=r.invites;$("#invite-edit").style.display="none";renderInvites();
-    const url=inviteUrl(r.token);
-    if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(()=>toast("invite link created · copied"),()=>toast("invite link created"));
-    else toast("invite link created");}catch(e){toast(e.message);}
+    copyText(inviteUrl(r.token),"invite link created · copied");}catch(e){toast(e.message);}
 }
 // account
 async function changePassword(){const o=$("#ac_old").value,n=$("#ac_new").value,n2=$("#ac_new2").value;
@@ -4660,11 +4984,13 @@ async function deleteAccount(){
   if(c===null)return;if(c!==CFG.me.username){toast("username did not match");return;}
   try{await api("DELETE","/api/account");location.href="/login";}catch(e){toast(e.message);}}
 
-// ---------------- overlays
-function showOverlay(p){$("#backdrop").classList.add("show");p.classList.add("show");}
-function closeOverlay(p){p.classList.remove("show");if(!$("#modal").classList.contains("show"))$("#backdrop").classList.remove("show");}
-function showModal(){$("#backdrop").classList.add("show");$("#modal").classList.add("show");}
-function closeModal(){$("#modal").classList.remove("show");if(!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");}
+// ---------------- overlays (focus moves in on open and back to the opener on close)
+function _focusInto(p){p._prevFocus=document.activeElement;const f=p.querySelector("button,input,select,textarea");if(f)f.focus();}
+function _focusBack(p){if(p._prevFocus&&p._prevFocus.focus){try{p._prevFocus.focus();}catch(_){}}p._prevFocus=null;}
+function showOverlay(p){$("#backdrop").classList.add("show");p.classList.add("show");_focusInto(p);}
+function closeOverlay(p){p.classList.remove("show");if(!$("#modal").classList.contains("show"))$("#backdrop").classList.remove("show");_focusBack(p);}
+function showModal(){const m=$("#modal");$("#backdrop").classList.add("show");m.classList.add("show");_focusInto(m);}
+function closeModal(){const m=$("#modal");m.classList.remove("show");if(!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");_focusBack(m);}
 function openSidebar(){$("#sidebar").classList.add("show");$("#backdrop").classList.add("show");}
 function closeSidebar(){$("#sidebar").classList.remove("show");if(!$("#modal").classList.contains("show")&&!$("#drawer").classList.contains("show"))$("#backdrop").classList.remove("show");}
 function closeAll(){$("#drawer").classList.remove("show");closeModal();$("#peekmodal").classList.remove("show");peekData=null;$("#sidebar").classList.remove("show");$("#backdrop").classList.remove("show");hideMenu();}
@@ -4752,7 +5078,7 @@ $("#fileinput").onchange=e=>{const fs=[...e.target.files];e.target.value="";if(f
   comp.addEventListener("dragleave",e=>{e.preventDefault();if(--dc<=0){dc=0;comp.classList.remove("dragover");}});
   comp.addEventListener("drop",e=>{e.preventDefault();dc=0;comp.classList.remove("dragover");const fs=[...((e.dataTransfer&&e.dataTransfer.files)||[])];if(fs.length)uploadFiles(fs);});
 })();
-(function(){const log=$("#log"),btn=$("#scrolltop");if(!log||!btn)return;
+(function(){const log=$("#log"),btn=$("#scrolltop"),down=$("#scrollbottom");if(!log||!btn)return;
   let last=0;
   log.addEventListener("scroll",()=>{
     const st=log.scrollTop;
@@ -4760,10 +5086,17 @@ $("#fileinput").onchange=e=>{const fs=[...e.target.files];e.target.value="";if(f
     if(nearBottom())autoScroll=true;      // back at the bottom -> resume following
     last=st;
     btn.classList.toggle("show",st>500);
+    if(down)down.classList.toggle("show",!nearBottom()&&log.scrollHeight-log.clientHeight>200);
   });
   btn.onclick=()=>{autoScroll=false;log.scrollTo({top:0,behavior:"smooth"});};
+  if(down)down.onclick=()=>{autoScroll=true;scrollDown();down.classList.remove("show");};
 })();
-document.addEventListener("keydown",e=>{if(e.key==="Escape"){if($("#dlgwrap").classList.contains("show"))return;closeAll();}});
+document.addEventListener("keydown",e=>{
+  const mod=e.ctrlKey||e.metaKey;
+  if(mod&&!e.shiftKey&&e.key.toLowerCase()==="k"){e.preventDefault();if(innerWidth<=860)openSidebar();$("#searchbox").focus();$("#searchbox").select();return;}
+  if(mod&&e.shiftKey&&e.key.toLowerCase()==="o"){e.preventDefault();if(!busy)newChat();return;}
+  if(e.key==="Escape"){if($("#dlgwrap").classList.contains("show"))return;closeAll();}
+});
 
 (async function init(){
   applyTheme(localStorage.getItem("oracle_theme")||"dark");
@@ -4771,13 +5104,24 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape"){if($("#dlgwrap").cl
   applyFS(parseFloat(localStorage.getItem("oracle_fs"))||1);
   applyCW(parseInt(localStorage.getItem("oracle_cw"))||840);
   applySidebar();initResize();
-  try{await loadConfig();}catch(e){toast("load failed: "+e.message);return;}
+  try{await loadConfig();}catch(e){
+    $("#log").innerHTML='<div class="wrap"><div class="empty"><div class="glyph">!</div><h2>could not load</h2>'+
+      '<p>'+esc(e.message||"network error")+'</p>'+
+      '<p style="margin-top:14px;"><button class="btn-ghost" onclick="location.reload()">retry</button></p></div></div>';
+    return;
+  }
+  if(!CFG.models.length)toast("model endpoint unreachable — check Settings → Endpoints",6000,'err');
   await refreshList();renderEmpty();
   if(convoCache.length){try{await openConvo(convoCache[0].id);}catch(_){}}
 })();
 </script></body></html>"""
 
 PAGE = PAGE_HEAD + PAGE_BODY + PAGE_JS1 + PAGE_JS2 + PAGE_JS3
+
+# Precompressed once at startup: the ~140 KB page gzips ~4x, and the ETag turns repeat loads into 304s.
+PAGE_BYTES = PAGE.encode("utf-8")
+PAGE_GZ = gzip.compress(PAGE_BYTES, 9)
+PAGE_ETAG = '"' + hashlib.sha1(PAGE_BYTES).hexdigest() + '"'
 
 
 # ---------------------------------------------------------------- public share viewer
@@ -4905,33 +5249,7 @@ SHARE_PAGE_TMPL = r"""<!doctype html>
 </div>
 <button id="totop" type="button" aria-label="Scroll to top" title="Back to top">&uarr;</button>
 <script id="d" type="application/json">__DATA__</script>
-<script>
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function md(src){
-  if(!src)return "";
-  let s=src.replace(/\r\n/g,"\n").replace(/\r/g,"\n");
-  const code=[];s=s.replace(/```[ \t]*([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g,(m,l,b)=>{code.push(b);return "@@C"+(code.length-1)+"@@";});
-  const ic=[];s=s.replace(/`([^`\n]+)`/g,(m,c)=>{ic.push(c);return "@@I"+(ic.length-1)+"@@";});
-  const inline=t=>{t=esc(t);
-    t=t.replace(/\[([^\]]+)\]\((https?:[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener nofollow">$1</a>');
-    t=t.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/__([^_]+)__/g,"<strong>$1</strong>");
-    t=t.replace(/(^|[^*\w])\*([^*\n]+)\*/g,"$1<em>$2</em>").replace(/(^|[^_\w])_([^_\n]+)_/g,"$1<em>$2</em>");
-    t=t.replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");return t;};
-  const lines=s.split("\n");let out=[],i=0,para=[];
-  const flush=()=>{if(para.length){out.push("<p>"+para.map(inline).join("<br>")+"</p>");para=[];}};
-  while(i<lines.length){let ln=lines[i];
-    let cb=ln.match(/^@@C(\d+)@@\s*$/);if(cb){flush();out.push("<pre><code>"+esc(code[+cb[1]])+"</code></pre>");i++;continue;}
-    if(/^\s*$/.test(ln)){flush();i++;continue;}
-    let h=ln.match(/^(#{1,6})\s+(.*)$/);if(h){flush();const lv=Math.min(4,h[1].length);out.push("<h"+lv+">"+inline(h[2])+"</h"+lv+">");i++;continue;}
-    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){flush();out.push("<hr>");i++;continue;}
-    if(/^\s*>/.test(ln)){flush();let q=[];while(i<lines.length&&/^\s*>/.test(lines[i])){q.push(lines[i].replace(/^\s*>\s?/,""));i++;}out.push("<blockquote>"+q.map(inline).join("<br>")+"</blockquote>");continue;}
-    if(/^\s*[-*+]\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*[-*+]\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*[-*+]\s+/,""));i++;}out.push("<ul>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ul>");continue;}
-    if(/^\s*\d+\.\s+/.test(ln)){flush();let it=[];while(i<lines.length&&/^\s*\d+\.\s+/.test(lines[i])){it.push(lines[i].replace(/^\s*\d+\.\s+/,""));i++;}out.push("<ol>"+it.map(x=>"<li>"+inline(x)+"</li>").join("")+"</ol>");continue;}
-    para.push(ln);i++;}
-  flush();let html=out.join("\n");
-  html=html.replace(/@@C(\d+)@@/g,(m,i)=>"<pre><code>"+esc(code[+i])+"</code></pre>").replace(/@@I(\d+)@@/g,(m,i)=>"<code>"+esc(ic[+i])+"</code>");
-  return html;
-}
+<script>""" + MD_ESC_JS + r"""
 (function(){
   let D;try{D=JSON.parse(document.getElementById("d").textContent);}catch(e){D={title:"Conversation",messages:[]};}
   document.title=(D.title||"Conversation")+" · ORACLE";
@@ -5027,13 +5345,16 @@ def render_share_page(sh):
 
 if __name__ == "__main__":
     init_db()
+    secret_bytes()   # resolve (and, with env set, scrub the legacy DB copy of) the session secret now
     bootstrap_admin()
     start_backups()
+    # the OG/touch icons render in a slow pure-Python pixel loop — warm them off the request path
+    threading.Thread(target=lambda: (og_image_png(), apple_icon_png()), daemon=True).start()
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
-    print("ORACLE chat on http://localhost:%d" % PORT)
-    print("database: %s" % DB_PATH)
+    log.info("ORACLE chat on http://localhost:%d", PORT)
+    log.info("database: %s", DB_PATH)
     if user_count() == 0:
-        print("no users yet -> open the page to create the first admin (or set KENOSIS_ADMIN_USER/PASS)")
+        log.info("no users yet -> open the page to create the first admin (or set KENOSIS_ADMIN_USER/PASS)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
