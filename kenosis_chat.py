@@ -138,10 +138,11 @@ SEED_ENDPOINT = {
 }
 DEFAULT_MODEL = "kenosistron"
 
-# Per-request sampler params the MLX server accepts. 'default' = the server's own default
-# (what the per-param reset clears toward). top_k remains file-only on the server; repetition_penalty
-# is accepted per-request by current oMLX (verified: no reload, applied at inference time) and matters
-# a lot: model files that bake one in will progressively starve function words on long outputs.
+# Per-request sampler params. 'default' = the server's own default (what the per-param reset
+# clears toward). repetition_penalty is accepted per-request by current oMLX (verified: no reload,
+# applied at inference time) and matters a lot: model files that bake one in will progressively
+# starve function words on long outputs. top_k is honored per-request by vLLM/llama.cpp and newer
+# oMLX; older oMLX builds silently ignore it (verify with a temp=0 A/B if unsure).
 PARAM_SPECS = [
     {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 4,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
      "tip": "Controls randomness. Higher values (e.g. 1.2) make replies more creative and varied; lower values (e.g. 0.7) make them more focused and predictable. 0 always picks the single most likely token."},
@@ -149,6 +150,8 @@ PARAM_SPECS = [
      "tip": "Nucleus sampling. Each step only considers the most likely tokens whose probabilities add up to this fraction. 0.9 keeps the top 90% of the probability mass; lower means more focused. Often tuned instead of temperature."},
     {"key": "min_p",             "label": "min_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.04,
      "tip": "Minimum probability, relative to the top token. Discards any token less likely than this fraction of the most likely one. Higher values (e.g. 0.1) prune unlikely tokens harder, keeping output coherent even at high temperature."},
+    {"key": "top_k",             "label": "top_k",             "type": "int",   "min": 0,  "max": 200, "step": 1,   "ph": "server default", "slider": True,  "default": 0,
+     "tip": "Each step only considers the K most likely tokens. 0 disables the cap. A blunter cousin of top_p/min_p — mostly useful as a hard safety rail at very high temperatures. Note: some backends (older oMLX) ignore this per-request."},
     {"key": "xtc_probability",   "label": "xtc_probability",   "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.6,
      "tip": "Exclude Top Choices: the chance, per token, of applying XTC. XTC removes the most-probable tokens (those above the threshold), always leaving at least one, to reduce clichés and boost creativity. 0 disables it."},
     {"key": "xtc_threshold",     "label": "xtc_threshold",     "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.1,
