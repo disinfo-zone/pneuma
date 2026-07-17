@@ -1,2 +1,5 @@
 requests>=2.32,<3
 pypdf>=5,<7
+# Web push notifications (optional at runtime — the feature hides itself if this is missing).
+# Pulls `cryptography` for VAPID signing + payload encryption.
+pywebpush>=2,<3

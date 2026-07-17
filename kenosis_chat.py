@@ -11,7 +11,11 @@ Env: KENOSIS_PORT, KENOSIS_DB, KENOSIS_ADMIN_USER/PASS, KENOSIS_SESSION_SECRET,
 Dependencies: requests + pypdf for PDF attachments (everything else is the standard library).
 """
 
+import ast
+import functools as _functools
 import http.server
+import math
+import operator
 import socketserver
 import json
 import os
@@ -77,13 +81,22 @@ TRUST_PROXY = os.environ.get("KENOSIS_TRUST_PROXY", "1") not in ("0", "false", "
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("oracle")
 
-# Sent on every HTML document. Inline <script>/<style> are first-party (no user-authored scripts),
-# so 'unsafe-inline' is required; the rest locks down framing, plugins, base-uri, form targets, and
-# where the page may load/connect. Google Fonts is the only third-party origin.
-CSP = ("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
-       "form-action 'self'; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; "
-       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-       "script-src 'self' 'unsafe-inline'; connect-src 'self'")
+# Sent on every HTML document. Inline <style> stays 'unsafe-inline' (style attributes everywhere),
+# but inline <script> blocks are allowed by SHA-256 hash instead of 'unsafe-inline' — injected
+# script text that isn't byte-identical to our own blocks won't execute. Pages are static
+# constants, so hashes are computed once per page and cached.
+CSP_TMPL = ("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+            "form-action 'self'; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "script-src 'self' %s; connect-src 'self'")
+
+
+@_functools.lru_cache(maxsize=64)
+def csp_for(html):
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
+    hashes = " ".join("'sha256-%s'" % base64.b64encode(hashlib.sha256(s.encode("utf-8")).digest()).decode("ascii")
+                      for s in scripts if s.strip())
+    return CSP_TMPL % (hashes or "'none'")
 
 # Attachments (uploaded files folded into a user turn) and the web-fetch tool.
 DEFAULT_CONTEXT = 8192               # fallback context window when /v1/models doesn't report one
@@ -225,6 +238,8 @@ def init_db():
                 token TEXT PRIMARY KEY, created_by INTEGER, role TEXT NOT NULL DEFAULT 'user',
                 allowed_models TEXT, max_uses INTEGER, uses INTEGER NOT NULL DEFAULT 0,
                 expires INTEGER, note TEXT, created TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS push_subs(
+                endpoint TEXT PRIMARY KEY, user_id INTEGER NOT NULL, sub TEXT NOT NULL, created TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS shares(
                 token TEXT PRIMARY KEY, convo_id TEXT NOT NULL, owner_id INTEGER NOT NULL,
                 title TEXT, data TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0,
@@ -255,13 +270,80 @@ def init_db():
         ucols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
         if "persona" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN persona TEXT")
+        if "totp_secret" not in ucols:   # base32 TOTP secret; NULL = 2FA off
+            c.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
         if "session_version" not in ucols:   # bumped on password change to revoke old session cookies
             c.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
+        if "ctx_summary" not in ccols:      # rolling summary of turns dropped by the sliding window
+            c.execute("ALTER TABLE conversations ADD COLUMN ctx_summary TEXT")
+        if "ctx_summary_upto" not in ccols:  # id of the last message that summary covers
+            c.execute("ALTER TABLE conversations ADD COLUMN ctx_summary_upto TEXT")
         c.commit()
+        init_fts()
         seed_settings()
         if not get_setting("tree_migrated"):
             migrate_tree()
             set_setting("tree_migrated", "1")
+
+
+FTS_OK = False   # set by init_fts(); when False, search falls back to LIKE and knowledge retrieval is off
+
+
+def init_fts():
+    """FTS5 index over message bodies (instant ranked search) and character knowledge chunks
+    (BM25 retrieval). Kept in sync by triggers. SQLite builds without FTS5 degrade gracefully."""
+    global FTS_OK
+    c = db()
+    try:
+        c.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content, convo_id UNINDEXED, msg_id UNINDEXED, tokenize='unicode61');
+            CREATE TRIGGER IF NOT EXISTS msg_fts_ins AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(content, convo_id, msg_id)
+                VALUES (COALESCE(new.content,''), new.convo_id, new.id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS msg_fts_del AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE msg_id = old.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS msg_fts_upd AFTER UPDATE OF content ON messages BEGIN
+                DELETE FROM messages_fts WHERE msg_id = old.id;
+                INSERT INTO messages_fts(content, convo_id, msg_id)
+                VALUES (COALESCE(new.content,''), new.convo_id, new.id);
+            END;
+            CREATE TABLE IF NOT EXISTS knowledge(
+                id TEXT PRIMARY KEY, character_id TEXT NOT NULL, name TEXT,
+                chars INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                chunk, character_id UNINDEXED, doc_id UNINDEXED, name UNINDEXED, tokenize='unicode61');
+            CREATE TABLE IF NOT EXISTS knowledge_vec(
+                doc_id TEXT NOT NULL, idx INTEGER NOT NULL, character_id TEXT NOT NULL,
+                chunk TEXT, vec TEXT, PRIMARY KEY(doc_id, idx));
+            """
+        )
+        if not get_setting("fts_built"):
+            with c:
+                c.execute("DELETE FROM messages_fts")
+                c.execute("INSERT INTO messages_fts(content, convo_id, msg_id) "
+                          "SELECT COALESCE(content,''), convo_id, id FROM messages")
+            set_setting("fts_built", "1")
+        FTS_OK = True
+    except sqlite3.OperationalError as e:
+        log.warning("FTS5 unavailable (%s) — search uses LIKE scans; character knowledge disabled", e)
+        FTS_OK = False
+
+
+def _fts_match_query(q, all_terms=True):
+    """User text -> FTS5 MATCH string. Quoted terms (last as prefix) ANDed for search;
+    OR-joined for knowledge recall."""
+    terms = re.findall(r"\w+", q or "", re.UNICODE)[:12]
+    if all_terms:
+        if not terms:
+            return None
+        quoted = ['"%s"' % t for t in terms[:-1]] + ['"%s"*' % terms[-1]]
+        return " ".join(quoted)               # implicit AND
+    terms = [t for t in terms if len(t) > 2]
+    return " OR ".join('"%s"' % t for t in terms) or None
 
 
 def migrate_tree():
@@ -304,6 +386,7 @@ def seed_settings():
         "endpoints": [dict(SEED_ENDPOINT)], "active_endpoint": SEED_ENDPOINT["id"],
         "default_model": DEFAULT_MODEL, "default_system": DEFAULT_SYSTEM,
         "default_params": {}, "user_models": [DEFAULT_MODEL], "thinking_models": [],
+        "search_url": "", "utility_model": "", "vision_models": [], "embed_model": "",
     }
     for k, v in defaults.items():
         if get_setting(k) is None:
@@ -340,7 +423,7 @@ def restore_endpoint_keys(eps):
 def admin_settings():
     s = {k: get_setting(k) for k in
          ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
-          "user_models", "thinking_models")}
+          "user_models", "thinking_models", "search_url", "utility_model", "vision_models", "embed_model")}
     s["endpoints"] = redacted_endpoints()
     return s
 
@@ -406,6 +489,35 @@ def verify_pw(pw, stored):
         return hmac.compare_digest(h, ub64(hash_b64))
     except Exception:
         return False
+
+
+# ---- TOTP two-factor (stdlib only; RFC 6238, SHA-1, 6 digits, 30s step)
+def totp_gen_secret():
+    return base64.b32encode(os.urandom(20)).decode("ascii").rstrip("=")
+
+
+def totp_code(secret_b32, t=None, step=30, digits=6):
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    counter = int((time.time() if t is None else t) // step)
+    h = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    o = h[-1] & 0xF
+    return str((int.from_bytes(h[o:o + 4], "big") & 0x7FFFFFFF) % (10 ** digits)).zfill(digits)
+
+
+def totp_verify(secret_b32, code, window=1):
+    code = re.sub(r"\D", "", code or "")
+    if len(code) != 6 or not secret_b32:
+        return False
+    now = time.time()
+    try:
+        return any(hmac.compare_digest(totp_code(secret_b32, now + i * 30), code)
+                   for i in range(-window, window + 1))
+    except Exception:
+        return False
+
+
+def user_totp_secret(u):
+    return (u["totp_secret"] if "totp_secret" in u.keys() else None) or ""
 
 
 def user_session_version(u):
@@ -499,6 +611,7 @@ def user_public(u):
     return {"id": u["id"], "username": u["username"], "role": u["role"],
             "allowed_models": json.loads(u["allowed_models"]) if u["allowed_models"] else [],
             "persona": (u["persona"] or "") if "persona" in u.keys() else "",
+            "totp": bool(user_totp_secret(u)),
             "disabled": bool(u["disabled"]), "created": u["created"]}
 
 
@@ -569,11 +682,24 @@ def delete_user_cascade(uid):
         c.execute("DELETE FROM messages WHERE convo_id IN (SELECT id FROM conversations WHERE owner_id=?)", (uid,))
         c.execute("DELETE FROM conversations WHERE owner_id=?", (uid,))
         c.execute("DELETE FROM folders WHERE owner_id=?", (uid,))
+        if FTS_OK:
+            c.execute("DELETE FROM knowledge_fts WHERE doc_id IN (SELECT id FROM knowledge WHERE character_id IN"
+                      " (SELECT id FROM characters WHERE owner_id=? AND scope='private'))", (uid,))
+            c.execute("DELETE FROM knowledge WHERE character_id IN"
+                      " (SELECT id FROM characters WHERE owner_id=? AND scope='private')", (uid,))
         c.execute("DELETE FROM characters WHERE owner_id=? AND scope='private'", (uid,))
         c.execute("DELETE FROM users WHERE id=?", (uid,))
 
 
 # ---------------------------------------------------------------- characters
+def knowledge_list(char_id):
+    try:
+        rows = db().execute("SELECT id,name,chars FROM knowledge WHERE character_id=? ORDER BY created", (char_id,)).fetchall()
+    except sqlite3.OperationalError:   # FTS5-less build never created the table
+        return []
+    return [{"id": r["id"], "name": r["name"], "chars": r["chars"]} for r in rows]
+
+
 def visible_characters(u):
     rows = db().execute(
         "SELECT * FROM characters WHERE scope='site' OR owner_id=? ORDER BY scope DESC, name COLLATE NOCASE", (u["id"],)
@@ -581,6 +707,7 @@ def visible_characters(u):
     return [{"id": r["id"], "name": r["name"], "avatar": r["avatar"] or "", "model": r["model"],
              "scope": r["scope"], "owner_id": r["owner_id"], "system": r["system"] or "",
              "params": json.loads(r["params"]) if r["params"] else None,
+             "knowledge": knowledge_list(r["id"]),
              "editable": (r["owner_id"] == u["id"]) or (u["role"] == "admin")} for r in rows]
 
 
@@ -663,18 +790,33 @@ def _snippet(content, q, span=140):
 
 def search_convo_content(u, q, limit=60):
     """Conversations of `u` with a message body matching `q`, each with one snippet. Title-only
-    matching is handled client-side; this is the full-text half."""
+    matching is handled client-side; this is the full-text half. Uses the FTS5 index (instant,
+    ranked) with the old LIKE scan as fallback."""
     q = (q or "").strip()
     if len(q) < 2:
         return []
-    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-    # LIMIT bounds the scan: enough rows to fill `limit` distinct conversations on any realistic
-    # data, without ever walking the whole message table for a common word.
-    rows = db().execute(
-        "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,m.content "
-        "FROM messages m JOIN conversations c ON c.id=m.convo_id "
-        "WHERE c.owner_id=? AND m.role IN('user','assistant') AND m.content LIKE ? ESCAPE '\\' "
-        "ORDER BY c.updated DESC LIMIT 400", (u["id"], like)).fetchall()
+    rows = None
+    if FTS_OK:
+        match = _fts_match_query(q)
+        if match:
+            try:
+                rows = db().execute(
+                    "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,m.content "
+                    "FROM messages_fts f JOIN messages m ON m.id=f.msg_id "
+                    "JOIN conversations c ON c.id=f.convo_id "
+                    "WHERE messages_fts MATCH ? AND c.owner_id=? AND m.role IN('user','assistant') "
+                    "ORDER BY c.updated DESC LIMIT 400", (match, u["id"])).fetchall()
+            except sqlite3.OperationalError:
+                rows = None   # e.g. query text FTS can't parse — fall through to LIKE
+    if rows is None:
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        # LIMIT bounds the scan: enough rows to fill `limit` distinct conversations on any realistic
+        # data, without ever walking the whole message table for a common word.
+        rows = db().execute(
+            "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,m.content "
+            "FROM messages m JOIN conversations c ON c.id=m.convo_id "
+            "WHERE c.owner_id=? AND m.role IN('user','assistant') AND m.content LIKE ? ESCAPE '\\' "
+            "ORDER BY c.updated DESC LIMIT 400", (u["id"], like)).fetchall()
     out, seen = [], set()
     for r in rows:
         if r["id"] in seen:
@@ -747,16 +889,17 @@ def active_path(cid, active_leaf):
     return out
 
 
-def chain_content(cid, node_id):
+def chain_content(cid, node_id, by=None):
     if node_id is None:
         return []
-    _, by, _ = _tree(cid)
+    if by is None:   # callers with a fresh _tree() in hand pass it to skip the re-query
+        _, by, _ = _tree(cid)
     seq, cur = [], node_id
     while cur is not None and cur in by:
         seq.append(by[cur])
         cur = by[cur]["parent_id"]
     seq.reverse()
-    return [{"role": r["role"], "content": r["content"] or "",
+    return [{"id": r["id"], "role": r["role"], "content": r["content"] or "",
              "attachments": json.loads(r["attachments"]) if r["attachments"] else None,
              "tool": json.loads(r["tool"]) if r["tool"] else None} for r in seq]
 
@@ -770,6 +913,8 @@ def get_convo(cid, u=None):
             "endpoint_id": r["endpoint_id"], "params": json.loads(r["params"]) if r["params"] else {},
             "character_id": r["character_id"], "active_leaf_id": r["active_leaf_id"],
             "tools": bool(r["tools"]), "think": r["think"],
+            "ctx_summary": r["ctx_summary"] if "ctx_summary" in r.keys() else None,
+            "ctx_summary_upto": r["ctx_summary_upto"] if "ctx_summary_upto" in r.keys() else None,
             "created": r["created"], "updated": r["updated"],
             "messages": active_path(cid, r["active_leaf_id"])}
 
@@ -900,6 +1045,24 @@ def backup_db():
         con.execute("VACUUM INTO ?", (dest,))
     finally:
         con.close()
+    # Verify the copy actually opens and passes an integrity check — a backup that can't restore
+    # is worse than none, because it looks like insurance. A bad copy is deleted and logged loudly.
+    try:
+        chk = sqlite3.connect(dest)
+        try:
+            ok = chk.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            users = chk.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        finally:
+            chk.close()
+        if not ok or users < 1:
+            raise ValueError("integrity check failed" if not ok else "no users in backup")
+    except Exception as e:
+        log.error("backup verification FAILED for %s: %s — deleting the bad copy", dest, e)
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
     if BACKUP_KEEP > 0:
         old = sorted(glob.glob(os.path.join(BACKUP_DIR, "chat-*.db")))[:-BACKUP_KEEP]
         for f in old:
@@ -960,19 +1123,32 @@ def _msg_tokens(m):
     t = est_tokens(m.get("content"))
     for a in (m.get("attachments") or []):
         t += est_tokens(a.get("text"))
+        if a.get("image"):
+            t += 1024   # rough per-image cost; varies by model/resolution
     return t
 
 
 # Our token estimate is a crude chars/4. After each reply the server reports the *real* prompt token
 # count, so we learn a per-model correction factor (real / estimated) and apply it to future context
 # trim / cap decisions — they then track the model's actual tokenizer instead of a fixed guess.
-_TOK_CAL = {}
+# Persisted to the settings table so calibration survives restarts instead of resetting to 1.0.
+_TOK_CAL = None   # model -> factor; lazy-loaded under _TOK_CAL_LOCK
 _TOK_CAL_LOCK = threading.Lock()
+
+
+def _tok_cal():
+    global _TOK_CAL
+    if _TOK_CAL is None:
+        try:
+            _TOK_CAL = {str(k): float(v) for k, v in (get_setting("tok_factors") or {}).items()}
+        except Exception:
+            _TOK_CAL = {}
+    return _TOK_CAL
 
 
 def tok_factor(model):
     with _TOK_CAL_LOCK:
-        return _TOK_CAL.get(model, 1.0)
+        return _tok_cal().get(model, 1.0)
 
 
 def update_tok_factor(model, real_tokens, est):
@@ -980,8 +1156,14 @@ def update_tok_factor(model, real_tokens, est):
         return
     obs = max(0.4, min(4.0, real_tokens / est))   # clamp wild outliers
     with _TOK_CAL_LOCK:
-        cur = _TOK_CAL.get(model)
-        _TOK_CAL[model] = obs if cur is None else (0.7 * cur + 0.3 * obs)   # EMA toward the latest reading
+        cal = _tok_cal()
+        cur = cal.get(model)
+        cal[model] = obs if cur is None else (0.7 * cur + 0.3 * obs)   # EMA toward the latest reading
+        snapshot = dict(cal)
+    try:
+        set_setting("tok_factors", snapshot)   # one tiny upsert per reply; WAL makes this cheap
+    except Exception:
+        log.warning("could not persist token calibration", exc_info=True)
 
 
 def _attach_block(attachments):
@@ -1006,8 +1188,10 @@ def _roll_dice(spec):
 
 
 def apply_macros(text, ctx):
-    """SillyTavern-style {{macros}} for the system prompt. ctx provides user/char/model; time/date
-    are resolved at send time. Unknown macros are left untouched."""
+    """SillyTavern-style {{macros}} for the system prompt. ctx provides user/char/model; the date
+    is resolved at send time. Deliberately no time-of-day macros: they'd change the system prompt
+    (position 0 of the prompt) every request and defeat server prefix caching; everything here is
+    day-granular or per-conversation-stable. Unknown macros are left untouched."""
     if not text or "{{" not in text:
         return text
     now = datetime.now().astimezone()
@@ -1017,8 +1201,6 @@ def apply_macros(text, ctx):
         "character": ctx.get("char") or "Assistant",
         "model": ctx.get("model") or "",
         "newline": "\n",
-        "time": now.strftime("%H:%M"),
-        "isotime": now.strftime("%H:%M:%S"),
         "date": now.strftime("%Y-%m-%d"),
         "isodate": now.strftime("%Y-%m-%d"),
         "weekday": now.strftime("%A"),
@@ -1047,7 +1229,7 @@ def apply_macros(text, ctx):
     return re.sub(r"\{\{\s*([^{}]+?)\s*\}\}", repl, text)
 
 
-def build_api_messages(system, messages):
+def build_api_messages(system, messages, vision=False):
     api = []
     if system and system.strip():
         api.append({"role": "system", "content": system})
@@ -1064,23 +1246,39 @@ def build_api_messages(system, messages):
             content = m.get("content", "")
             if role == "assistant" and content and "<tool_call>" in content:
                 content = strip_tool_calls(content)  # don't feed leaked tool-call text back as an example
-            block = _attach_block(m.get("attachments"))
+            atts = m.get("attachments") or []
+            block = _attach_block(atts)
             if block:
                 content = block + ("\n\n" + content if content else "")
+            images = [a.get("image") for a in atts if isinstance(a, dict) and a.get("image")]
+            if images and vision and role == "user":
+                # OpenAI-style multimodal parts; only for models the admin marked vision-capable
+                parts = ([{"type": "text", "text": content}] if content else [])
+                parts += [{"type": "image_url", "image_url": {"url": img}} for img in images]
+                api.append({"role": role, "content": parts})
+                continue
+            if images:   # non-vision model (or assistant turn): note the images textually
+                note = "\n".join("[attached image: %s]" % (a.get("name") or "image")
+                                 for a in atts if isinstance(a, dict) and a.get("image"))
+                content = (note + "\n\n" + content) if content else note
             api.append({"role": role, "content": content})
     return api
 
 
-# Appended to the system prompt only when web tools are on. Static text → part of the cacheable
-# prefix, so it never costs a cache hit. Targets the exact failure modes the recovery code handles.
-TOOL_GUIDE = (
-    "# Web access\n"
-    "You can call the fetch_url function to read a public web page or a plain-text/JSON URL. "
-    "Use it when the user shares a link, or when a good answer needs current or online information you "
-    "don't reliably know. Pass the full absolute http(s) URL. Ground your answer only in what you "
-    "actually fetched — quote or summarize it — and never invent URLs, page contents, or citations. "
-    "If a fetch fails or you have no URL to use, say so plainly instead of guessing."
-)
+# Appended to the system prompt only when web tools are on. Stable text per admin config → part of
+# the cacheable prefix (it only changes when the admin toggles search on/off), so it never costs a
+# per-turn cache hit. Targets the exact failure modes the recovery code handles.
+def tool_guide():
+    g = ("# Tools\n"
+         "You can call the fetch_url function to read a public web page or a plain-text/JSON URL. "
+         "Use it when the user shares a link, or when a good answer needs current or online information you "
+         "don't reliably know. Pass the full absolute http(s) URL. ")
+    if (get_setting("search_url") or "").strip():
+        g += ("You can call web_search(query) to find pages, then fetch_url the promising results. ")
+    g += ("You can call calculate(expression) for exact arithmetic instead of computing it yourself. "
+          "Ground your answers only in what you actually fetched — quote or summarize it — and never invent "
+          "URLs, page contents, or citations. If a tool fails, say so plainly instead of guessing.")
+    return g
 
 # Default-on; admins can set KENOSIS_SITUATION=0 to stop injecting the date/no-internet note.
 SITUATION_NOTE = os.environ.get("KENOSIS_SITUATION", "1") not in ("0", "false", "no", "")
@@ -1103,7 +1301,7 @@ def compose_system(system, tools_on):
     if s:
         parts.append(s)
     if tools_on:
-        parts.append(TOOL_GUIDE)
+        parts.append(tool_guide())
     if SITUATION_NOTE:
         line = "Current date: " + _today_str() + "."
         if not tools_on:
@@ -1131,26 +1329,46 @@ def _open_stream(ep, body):
     headers = {"Content-Type": "application/json"}
     if ep.get("key"):
         headers["Authorization"] = "Bearer " + ep["key"]
-    return requests.post(ep["url"], headers=headers, json=body, stream=True, timeout=REQUEST_TIMEOUT)
+    # (connect, read) split: a dead/unreachable endpoint fails in seconds instead of holding the
+    # request for the full generation budget; the read half still allows long gaps between tokens.
+    return requests.post(ep["url"], headers=headers, json=body, stream=True, timeout=(10, REQUEST_TIMEOUT))
 
 
-def stream_model(ep, model, system, messages, params, tools=None, extra=None):
-    base = {"model": model, "messages": build_api_messages(system, messages), "stream": True}
+def stream_model(ep, model, system, messages, params, tools=None, extra=None, tool_choice="auto", vision=False):
+    base = {"model": model, "messages": build_api_messages(system, messages, vision=vision), "stream": True}
     base.update(params)
     if tools:
         base["tools"] = tools
-        base["tool_choice"] = "auto"
-    body = dict(base)
+        base["tool_choice"] = tool_choice
+    so = {"include_usage": True}
+    # Graduated fallback on 4xx, shedding one risky field per step so a picky server never
+    # silently loses usage reporting (which feeds token calibration) along with the hints:
+    #   1. base + best-effort hints (continue_final_message etc.) + stream_options
+    #   2. base + stream_options                      (only if hints were present)
+    #   3. tools/tool_choice stripped + stream_options (only for non-auto tool_choice)
+    #   4. bare base
+    first = dict(base)
     if extra:
-        body.update(extra)   # best-effort hints (e.g. continue_final_message); dropped on fallback
-    body["stream_options"] = {"include_usage": True}
-    r = _open_stream(ep, body)
-    if r.status_code >= 400:
+        first.update(extra)
+    first["stream_options"] = so
+    attempts = [first]
+    if extra:
+        attempts.append(dict(base, stream_options=so))
+    if tools and tool_choice != "auto":
+        nt = {k: v for k, v in base.items() if k not in ("tools", "tool_choice")}
+        attempts.append(dict(nt, stream_options=so))
+        attempts.append(nt)
+    else:
+        attempts.append(base)
+    r = _open_stream(ep, attempts[0])
+    for b in attempts[1:]:
+        if r.status_code < 400:
+            break
         try:
             r.close()
         except Exception:
             pass
-        r = _open_stream(ep, base)
+        r = _open_stream(ep, b)
     try:
         r.raise_for_status()
     except Exception:
@@ -1158,6 +1376,7 @@ def stream_model(ep, model, system, messages, params, tools=None, extra=None):
         raise
     tcalls = {}
     finish = None
+    r.encoding = "utf-8"   # SSE bodies are UTF-8; without a charset in Content-Type, requests would decode as ISO-8859-1
     with r:
         for raw in r.iter_lines(decode_unicode=True):
             if not raw or not raw.startswith("data:"):
@@ -1201,10 +1420,10 @@ def stream_model(ep, model, system, messages, params, tools=None, extra=None):
     yield {"finish": finish}
 
 
-def call_model_nonstream(ep, model, system, messages, params, tools):
+def call_model_nonstream(ep, model, system, messages, params, tools, vision=False):
     """One non-streaming completion. The oMLX server returns structured tool_calls reliably this
     way (its streaming tool parser can silently drop a call), so it's the recovery path."""
-    body = {"model": model, "messages": build_api_messages(system, messages), "stream": False}
+    body = {"model": model, "messages": build_api_messages(system, messages, vision=vision), "stream": False}
     body.update(params)
     if tools:
         body["tools"] = tools
@@ -1212,7 +1431,7 @@ def call_model_nonstream(ep, model, system, messages, params, tools):
     headers = {"Content-Type": "application/json"}
     if ep.get("key"):
         headers["Authorization"] = "Bearer " + ep["key"]
-    r = requests.post(ep["url"], headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    r = requests.post(ep["url"], headers=headers, json=body, timeout=(10, REQUEST_TIMEOUT))
     r.raise_for_status()
     d = r.json()
     ch = (d.get("choices") or [{}])[0]
@@ -1237,9 +1456,16 @@ def clean_title(s):
     return s[:64].strip()
 
 
+def utility_model(fallback):
+    """Model for background utility calls (titles, context summaries). Admin-configurable so a
+    small always-loaded model can do the chores instead of the (possibly huge) chat model."""
+    return (get_setting("utility_model") or "").strip() or fallback
+
+
 def generate_title(ep, model, user_text, assistant_text=""):
     """Ask the model for a short Title-Case name. Clean (no persona) prompt + low temp so even a
     creative model returns just a title. Returns "" on any failure (caller falls back to first line)."""
+    model = utility_model(model)
     sys = ("You write a concise 3-5 word title in Title Case for a conversation. "
            "Reply with ONLY the title — no quotes, no punctuation, no preamble or explanation.")
     prompt = "Write a title for a conversation that begins with this message:\n\n" + (user_text or "")[:1500]
@@ -1257,6 +1483,221 @@ def generate_title(ep, model, user_text, assistant_text=""):
         return clean_title(out)
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------- web push (optional)
+# Requires pywebpush (pulls `cryptography`); when absent the feature simply stays hidden.
+try:
+    from pywebpush import webpush, WebPushException
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    PUSH_OK = True
+except Exception:
+    PUSH_OK = False
+
+
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+
+def vapid_keys():
+    """(private_b64url, public_b64url) VAPID pair, generated once and stored in settings."""
+    if not PUSH_OK:
+        return None, None
+    kp = get_setting("vapid_keys")
+    if not kp:
+        priv = _ec.generate_private_key(_ec.SECP256R1())
+        d = priv.private_numbers().private_value.to_bytes(32, "big")
+        pub = priv.public_key().public_numbers()
+        raw = b"\x04" + pub.x.to_bytes(32, "big") + pub.y.to_bytes(32, "big")
+        kp = {"private": _b64url(d), "public": _b64url(raw)}
+        set_setting("vapid_keys", kp)
+    return kp["private"], kp["public"]
+
+
+def push_notify(user_id, title, body, cid=None):
+    """Send a web-push to every subscription of a user; dead subscriptions are pruned. Runs in a
+    background thread — never on the request path."""
+    if not PUSH_OK:
+        return
+
+    def worker():
+        priv, _ = vapid_keys()
+        subs = db().execute("SELECT endpoint, sub FROM push_subs WHERE user_id=?", (user_id,)).fetchall()
+        payload = json.dumps({"title": title, "body": (body or "")[:160], "cid": cid})
+        for row in subs:
+            try:
+                webpush(subscription_info=json.loads(row["sub"]), data=payload,
+                        vapid_private_key=priv, vapid_claims={"sub": "mailto:admin@" + urlparse(PUBLIC_URL).netloc},
+                        ttl=600)
+            except WebPushException as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code in (404, 410):   # subscription expired/revoked
+                    with db():
+                        db().execute("DELETE FROM push_subs WHERE endpoint=?", (row["endpoint"],))
+                else:
+                    log.warning("push failed (%s): %s", code, e)
+            except Exception:
+                log.exception("push failed")
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# Automatic context compression: when the sliding window drops turns, fold them into a rolling
+# per-conversation summary (stored on the conversation) that rides along in the system prompt.
+# KENOSIS_COMPRESS=0 restores plain dropping.
+COMPRESS = os.environ.get("KENOSIS_COMPRESS", "1") not in ("0", "false", "no", "")
+
+
+def summarize_dropped(ep, model, prior_summary, msgs):
+    """One non-streaming call folding newly-dropped turns into the rolling summary. Returns the
+    new summary text, or the prior one on failure/empty."""
+    model = utility_model(model)
+    lines = []
+    for m in msgs:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "").strip()
+        if content:
+            lines.append(("User: " if m["role"] == "user" else "Assistant: ") + content[:4000])
+    if not lines:
+        return prior_summary
+    sys = ("You maintain a running summary of a long conversation. Fold the prior summary and the new "
+           "excerpt into ONE updated summary of at most 250 words. Keep names, facts, decisions, "
+           "preferences, story/argument state, and open questions; drop pleasantries and repetition. "
+           "Reply with ONLY the summary text.")
+    parts = []
+    if prior_summary:
+        parts.append("Prior summary:\n" + prior_summary[:4000])
+    parts.append("New excerpt:\n" + "\n\n".join(lines)[:24000])
+    body = {"model": model, "stream": False, "max_tokens": 400, "temperature": 0.3,
+            "messages": [{"role": "system", "content": sys},
+                         {"role": "user", "content": "\n\n---\n\n".join(parts)}]}
+    headers = {"Content-Type": "application/json"}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    r = requests.post(ep["url"], headers=headers, json=body, timeout=(10, 180))
+    r.raise_for_status()
+    out = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    return out.strip() or prior_summary
+
+
+def ensure_summary(convo, ep, model, dropped_msgs):
+    """Rolling summary covering `dropped_msgs` (the window's dropped prefix, oldest first).
+    Reuses the stored summary without any model call when it already covers everything dropped —
+    which, thanks to trim hysteresis, is the common case — so the system prompt stays byte-stable
+    (and cacheable) between trim events."""
+    ids = [m.get("id") for m in dropped_msgs if m.get("id")]
+    if not ids:
+        return None
+    stored, upto = convo.get("ctx_summary"), convo.get("ctx_summary_upto")
+    if stored and upto in ids:
+        new_msgs = dropped_msgs[ids.index(upto) + 1:]
+        if not new_msgs:
+            return stored
+    else:
+        stored, new_msgs = None, dropped_msgs   # first trim, or a branch the stored summary doesn't cover
+    s = summarize_dropped(ep, model, stored, new_msgs)
+    if s and s != stored:
+        with db():
+            db().execute("UPDATE conversations SET ctx_summary=?, ctx_summary_upto=? WHERE id=?",
+                         (s, ids[-1], convo["id"]))
+    return s
+
+
+def embed_texts(texts):
+    """Embed texts via the active endpoint's /v1/embeddings using the admin-configured embed model.
+    Returns a list of vectors, or raises. Only called when `embed_model` is set."""
+    ep = active_endpoint()
+    model = (get_setting("embed_model") or "").strip()
+    if not model:
+        raise ValueError("no embed model configured")
+    url = ep.get("url", "")
+    url = url.replace("/chat/completions", "/embeddings") if "/chat/completions" in url else url.rstrip("/") + "/embeddings"
+    headers = {"Content-Type": "application/json"}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    r = requests.post(url, headers=headers, json={"model": model, "input": texts}, timeout=(6, 60))
+    r.raise_for_status()
+    data = sorted(r.json().get("data") or [], key=lambda d: d.get("index", 0))
+    return [d["embedding"] for d in data]
+
+
+def _cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-9
+    nb = math.sqrt(sum(x * x for x in b)) or 1e-9
+    return dot / (na * nb)
+
+
+def knowledge_snippets(char_id, query, limit=4, budget=4000):
+    """Best knowledge chunks for a character this turn. BM25 always; when an embed model is
+    configured (and chunks have stored vectors) the two rankings are fused (reciprocal rank),
+    so paraphrased questions still hit. Returns display-ready strings."""
+    if not FTS_OK or not char_id:
+        return []
+    ranked = []   # list of (chunk, name) in preference order
+
+    match = _fts_match_query(query, all_terms=False)
+    bm25_rows = []
+    if match:
+        try:
+            bm25_rows = db().execute(
+                "SELECT chunk, name FROM knowledge_fts WHERE knowledge_fts MATCH ? AND character_id=? "
+                "ORDER BY bm25(knowledge_fts) LIMIT 8", (match, char_id)).fetchall()
+        except sqlite3.OperationalError:
+            bm25_rows = []
+
+    vec_rows = []
+    if (get_setting("embed_model") or "").strip():
+        try:
+            cand = db().execute("SELECT chunk, vec, doc_id FROM knowledge_vec WHERE character_id=?",
+                                (char_id,)).fetchall()
+            if cand:
+                qv = embed_texts([query[:2000]])[0]
+                names = {k["id"]: k["name"] for k in
+                         db().execute("SELECT id,name FROM knowledge WHERE character_id=?", (char_id,)).fetchall()}
+                scored = sorted(((_cosine(qv, json.loads(r["vec"])), r) for r in cand),
+                                key=lambda t: -t[0])[:8]
+                vec_rows = [{"chunk": r["chunk"], "name": names.get(r["doc_id"], "notes")} for _, r in scored]
+        except Exception as e:
+            log.warning("embedding retrieval failed (BM25 only): %s", e)
+
+    # reciprocal-rank fusion of the two lists, deduped by chunk text
+    scores = {}
+    for rank_list in (bm25_rows, vec_rows):
+        for i, r in enumerate(rank_list):
+            key = (r["chunk"] or "").strip()
+            if not key:
+                continue
+            e = scores.setdefault(key, {"score": 0.0, "name": r["name"] or "notes"})
+            e["score"] += 1.0 / (i + 3)
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1]["score"])
+
+    out, used = [], 0
+    for chunk, info in ranked[:limit * 2]:
+        if len(out) >= limit or used + len(chunk) > budget:
+            continue
+        out.append("(%s) %s" % (info["name"], chunk))
+        used += len(chunk)
+    return out
+
+
+def _chunk_text(text, target=1200):
+    """Split document text into ~target-char chunks on paragraph boundaries."""
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    chunks, cur = [], ""
+    for p in paras:
+        if len(p) > target * 2:   # giant paragraph: hard-split
+            for i in range(0, len(p), target):
+                chunks.append(p[i:i + target])
+            continue
+        if cur and len(cur) + len(p) + 2 > target:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = (cur + "\n\n" + p) if cur else p
+    if cur:
+        chunks.append(cur)
+    return chunks[:2000]
 
 
 def _models_data(ep):
@@ -1347,6 +1788,47 @@ def shown_models(u):
     return [m for m in allm if m in set(wl)] or list(wl)
 
 
+def usage_stats():
+    """Aggregate per-model usage from stored message meta (nothing new is instrumented).
+    30-day and all-time buckets: replies, tokens, avg tok/s, avg ttft, avg cache-hit rate."""
+    cutoff = (datetime.now().astimezone().timestamp()) - 30 * 86400
+    agg = {}
+    rows = db().execute("SELECT model, meta, ts FROM messages WHERE role='assistant' AND meta IS NOT NULL").fetchall()
+    for r in rows:
+        try:
+            m = json.loads(r["meta"])
+        except Exception:
+            continue
+        recent = False
+        try:
+            recent = datetime.fromisoformat(r["ts"]).timestamp() >= cutoff
+        except Exception:
+            pass
+        b = agg.setdefault(r["model"] or "?", {"model": r["model"] or "?", "replies": 0, "tokens": 0,
+                                               "tps": [], "ttft": [], "cache": [], "replies_30d": 0, "tokens_30d": 0})
+        b["replies"] += 1
+        b["tokens"] += m.get("completion_tokens") or 0
+        if recent:
+            b["replies_30d"] += 1
+            b["tokens_30d"] += m.get("completion_tokens") or 0
+        if m.get("tps"):
+            b["tps"].append(m["tps"])
+        if m.get("ttft_ms") is not None:
+            b["ttft"].append(m["ttft_ms"])
+        if m.get("cached_tokens") is not None and m.get("prompt_tokens"):
+            b["cache"].append(m["cached_tokens"] / m["prompt_tokens"])
+    out = []
+    for b in agg.values():
+        out.append({"model": b["model"], "replies": b["replies"], "tokens": b["tokens"],
+                    "replies_30d": b["replies_30d"], "tokens_30d": b["tokens_30d"],
+                    "avg_tps": round(sum(b["tps"]) / len(b["tps"]), 1) if b["tps"] else None,
+                    "avg_ttft_ms": round(sum(b["ttft"]) / len(b["ttft"])) if b["ttft"] else None,
+                    "avg_cache_pct": round(100 * sum(b["cache"]) / len(b["cache"])) if b["cache"] else None})
+    out.sort(key=lambda x: -x["replies"])
+    return {"models": out, "totals": {"replies": sum(x["replies"] for x in out),
+                                      "tokens": sum(x["tokens"] for x in out)}}
+
+
 def build_meta(t0, t_first, t1, usage, reply):
     usage = usage or {}
     comp = usage.get("completion_tokens")
@@ -1354,9 +1836,11 @@ def build_meta(t0, t_first, t1, usage, reply):
     if est:
         comp = max(1, round(len(reply) / 4))
     gen = (t1 - t_first) if t_first else (t1 - t0)
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     return {"elapsed_ms": round((t1 - t0) * 1000),
             "ttft_ms": round((t_first - t0) * 1000) if t_first else None,
             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": comp,
+            "cached_tokens": cached,   # server-reported prompt-cache hit (None if not reported)
             "tokens_est": est, "tps": round((comp / gen) if gen > 0 else 0, 1)}
 
 
@@ -1616,7 +2100,7 @@ def strip_tool_calls(text):
     return text.strip()
 
 
-TOOLS_SPEC = [{
+FETCH_TOOL = {
     "type": "function",
     "function": {
         "name": "fetch_url",
@@ -1629,7 +2113,105 @@ TOOLS_SPEC = [{
             "required": ["url"],
         },
     },
-}]
+}
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": ("Search the web and return the top results (title, URL, snippet). Use this to "
+                        "find current information or pages to read; follow up with fetch_url on a "
+                        "promising result when you need the full text."),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "The search query."}},
+            "required": ["query"],
+        },
+    },
+}
+CALC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": ("Evaluate an arithmetic expression exactly (+ - * / // % ** parentheses, and "
+                        "functions like sqrt, sin, cos, log, exp, floor, ceil; constants pi and e). "
+                        "Use this instead of doing nontrivial arithmetic yourself."),
+        "parameters": {
+            "type": "object",
+            "properties": {"expression": {"type": "string", "description": "e.g. (17.5*365)/sqrt(2)"}},
+            "required": ["expression"],
+        },
+    },
+}
+
+
+def tools_spec():
+    """The tool list offered to the model. web_search appears only when an admin has configured a
+    SearXNG endpoint, so the model is never offered a tool that can't work."""
+    spec = [FETCH_TOOL, CALC_TOOL]
+    if (get_setting("search_url") or "").strip():
+        spec.insert(1, SEARCH_TOOL)
+    return spec
+
+
+# ---- calculator: whitelisted-AST arithmetic — no names, attributes, or subscripts are reachable
+_CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+             ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+             ast.Mod: operator.mod, ast.Pow: operator.pow}
+_CALC_FUNCS = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+               "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+               "log": math.log, "log10": math.log10, "log2": math.log2, "exp": math.exp,
+               "abs": abs, "round": round, "floor": math.floor, "ceil": math.ceil,
+               "min": min, "max": max, "degrees": math.degrees, "radians": math.radians,
+               "factorial": math.factorial}
+_CALC_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
+
+
+def safe_calc(expr):
+    expr = (expr or "").strip()[:400].replace("^", "**")   # models often write ^ for power
+    tree = ast.parse(expr, mode="eval")
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return n.value
+        if isinstance(n, ast.Name) and n.id in _CALC_CONSTS:
+            return _CALC_CONSTS[n.id]
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            v = ev(n.operand)
+            return v if isinstance(n.op, ast.UAdd) else -v
+        if isinstance(n, ast.BinOp) and type(n.op) in _CALC_OPS:
+            a, b = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and (abs(b) > 4096 or abs(a) > 1e100):
+                raise ValueError("exponent out of range")
+            return _CALC_OPS[type(n.op)](a, b)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in _CALC_FUNCS and not n.keywords:
+            args = [ev(a) for a in n.args]
+            if n.func.id == "factorial" and (args and (args[0] > 5000 or args[0] < 0)):
+                raise ValueError("factorial out of range")
+            return _CALC_FUNCS[n.func.id](*args)
+        raise ValueError("unsupported expression element: %s" % type(n).__name__)
+
+    return ev(tree)
+
+
+def run_web_search(query):
+    """Query the admin-configured SearXNG instance; returns readable top results for the model."""
+    base = (get_setting("search_url") or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("web search is not configured on this server")
+    r = requests.get(base + "/search", params={"q": query, "format": "json"},
+                     headers={"User-Agent": "oracle-chat/1.0"}, timeout=(6, FETCH_TIMEOUT))
+    r.raise_for_status()
+    results = (r.json().get("results") or [])[:6]
+    if not results:
+        return "No results found for: %s" % query, 0
+    lines = []
+    for i, res in enumerate(results, 1):
+        lines.append("%d. %s\n   %s\n   %s" % (i, (res.get("title") or "").strip()[:200],
+                                               (res.get("url") or "").strip()[:400],
+                                               " ".join(((res.get("content") or "").split()))[:400]))
+    return "Search results for \"%s\":\n\n%s" % (query, "\n\n".join(lines)), len(results)
 
 
 _URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
@@ -1651,7 +2233,27 @@ def execute_tool(name, args, fallback_url=None):
     """Run one tool call. Tolerant of the names tool-trained models invent (fetch__fetch, fetch__fetcher,
     browse, …) and recovers the URL from conversation context when the model omits it. Returns (text, ui)."""
     nm = (name or "").lower()
-    url = _url_from_args(args if isinstance(args, dict) else {})
+    if not isinstance(args, dict):
+        args = {}
+    if nm in ("calculate", "calc", "calculator", "math", "evaluate"):
+        expr = str(args.get("expression") or args.get("expr") or args.get("input") or "")
+        try:
+            val = safe_calc(expr)
+            out = repr(val) if isinstance(val, int) else ("%.12g" % val)
+            return ("%s = %s" % (expr.strip(), out), {"ok": True, "summary": "%s = %s" % (expr.strip()[:60], out[:40])})
+        except Exception as e:
+            return ("Error evaluating '%s': %s" % (expr[:200], e), {"ok": False, "summary": "calc error"})
+    if nm in ("web_search", "search", "websearch", "search_web", "google"):
+        query = str(args.get("query") or args.get("q") or args.get("input") or "").strip()
+        if not query:
+            return ("Error: no query given. Call web_search again with a \"query\" argument.",
+                    {"ok": False, "summary": "no query"})
+        try:
+            text, n = run_web_search(query)
+            return text, {"ok": True, "summary": "%d results: %s" % (n, query[:80])}
+        except Exception as e:
+            return "Error searching for '%s': %s" % (query[:120], e), {"ok": False, "summary": str(e)}
+    url = _url_from_args(args)
     looks_fetch = (nm in _FETCH_ALIASES) or any(k in nm for k in _FETCHY)
     if looks_fetch or url:
         if not url:
@@ -1666,7 +2268,7 @@ def execute_tool(name, args, fallback_url=None):
                     {"ok": True, "url": final, "title": title, "chars": len(text), "summary": title or final})
         except Exception as e:
             return "Error fetching %s: %s" % (url, e), {"ok": False, "url": url, "summary": str(e)}
-    return ("Error: unknown tool '%s'. The only available tool is fetch_url(url)." % name,
+    return ("Error: unknown tool '%s'. Available tools: %s." % (name, ", ".join(t["function"]["name"] for t in tools_spec())),
             {"ok": False, "summary": "unknown tool: %s" % name})
 
 
@@ -1734,7 +2336,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _html(self, body):
         self._send(200, "text/html; charset=utf-8", body,
-                   [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY")])
+                   [("Content-Security-Policy", csp_for(body)), ("X-Frame-Options", "DENY")])
 
     def _html_static(self, body_bytes, gz_bytes, etag):
         """Serve a startup-precompressed HTML page with ETag revalidation (304s + gzip)."""
@@ -1746,7 +2348,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        extra = [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY"),
+        extra = [("Content-Security-Policy", PAGE_CSP), ("X-Frame-Options", "DENY"),
                  ("ETag", etag), ("Cache-Control", "private, no-cache"), ("Vary", "Accept-Encoding")]
         use_gz = gz_bytes is not None and "gzip" in (self.headers.get("Accept-Encoding") or "")
         if use_gz:
@@ -1770,7 +2372,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _read_chunked(self):
+        """Decode a Transfer-Encoding: chunked request body. BaseHTTPRequestHandler never does
+        this itself, and Cloudflare forwards some client uploads chunked (e.g. Safari over
+        HTTP/2/3 with no upfront length); without decoding, the handler saw an empty body and
+        the unread chunk bytes were misparsed as the next request line on the kept-alive
+        connection ("Bad request syntax ('28')")."""
+        data = bytearray()
+        while True:
+            line = self.rfile.readline(1024)
+            if not line.endswith(b"\n"):
+                raise ValueError("malformed chunk size line")
+            size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while True:   # consume optional trailers up to the terminating blank line
+                    t = self.rfile.readline(1024)
+                    if t in (b"\r\n", b"\n", b""):
+                        break
+                return bytes(data)
+            if len(data) + size > MAX_BODY_BYTES:
+                raise _BodyTooLarge()
+            remaining = size
+            while remaining:
+                piece = self.rfile.read(min(remaining, 65536))
+                if not piece:
+                    raise ValueError("truncated chunk")
+                data.extend(piece)
+                remaining -= len(piece)
+            self.rfile.read(2)   # CRLF after each chunk
+
     def _read(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            try:
+                raw = self._read_chunked()
+            except _BodyTooLarge:
+                raise
+            except Exception:
+                self.close_connection = True   # partially-read body would poison the keep-alive stream
+                return {}
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                return {}
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
@@ -1839,6 +2482,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "model_contexts": _ctx_data(active_endpoint()),
             "default_context": DEFAULT_CONTEXT,
             "thinking_models": get_setting("thinking_models", []),
+            "vision_models": get_setting("vision_models", []),
         }
         if u["role"] == "admin":
             payload["settings"] = admin_settings()
@@ -1851,6 +2495,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/favicon.ico":
             return self._send(204, "image/x-icon", b"")
+        if path == "/healthz":   # for container orchestration; no auth, reveals nothing
+            try:
+                db().execute("SELECT 1")
+                return self._json(200, {"ok": True})
+            except Exception:
+                return self._json(500, {"ok": False})
+        if path == "/manifest.webmanifest":
+            return self._send(200, "application/manifest+json", MANIFEST_JSON,
+                              [("Cache-Control", "public, max-age=86400")])
+        if path == "/sw.js":
+            return self._send(200, "application/javascript; charset=utf-8", SW_JS,
+                              [("Cache-Control", "no-cache")])
         if path == "/favicon.svg":
             return self._send(200, "image/svg+xml; charset=utf-8", FAVICON_SVG,
                               [("Cache-Control", "public, max-age=604800")])
@@ -1885,14 +2541,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sh = share_by_token(m.group(1))
             if sh is None:
                 return self._send(404, "text/html; charset=utf-8", SHARE_404,
-                                  [("Content-Security-Policy", CSP)])
+                                  [("Content-Security-Policy", csp_for(SHARE_404))])
             try:
                 with db():
                     db().execute("UPDATE shares SET views=views+1 WHERE token=?", (sh["token"],))
             except Exception:
                 log.exception("share view-count update failed")
-            return self._send(200, "text/html; charset=utf-8", render_share_page(sh),
-                              [("Content-Security-Policy", CSP), ("X-Robots-Tag", "noindex, nofollow")])
+            page = render_share_page(sh)
+            return self._send(200, "text/html; charset=utf-8", page,
+                              [("Content-Security-Policy", csp_for(page)), ("X-Robots-Tag", "noindex, nofollow")])
 
         u = self.current_user()
         if path == "/":
@@ -1906,6 +2563,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, self.config_payload(u))
         if path == "/api/me":
             return self._json(200, {"me": user_public(u), "is_admin": u["role"] == "admin"})
+        if path == "/api/push/key":
+            _, pub = vapid_keys()
+            return self._json(200, {"key": pub})   # None -> push unavailable on this server
+        if path == "/api/stats":
+            if u["role"] != "admin":
+                return self._json(403, {"error": "admin only"})
+            return self._json(200, usage_stats())
         if path == "/api/models":
             qs = parse_qs(parsed.query)
             if u["role"] == "admin":
@@ -2033,6 +2697,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 c.execute("DELETE FROM folders WHERE id=? AND owner_id=?", (m.group(1), u["id"]))
             return self._json(200, {"folders": list_folders(u)})
 
+        m = re.fullmatch(r"/api/characters/([^/]+)/knowledge/([^/]+)", path)
+        if m:
+            ch = character_by_id(m.group(1))
+            if ch is None or not (ch["owner_id"] == u["id"] or u["role"] == "admin"):
+                return self._json(404, {"error": "not found"})
+            with db():
+                db().execute("DELETE FROM knowledge WHERE id=? AND character_id=?", (m.group(2), ch["id"]))
+                db().execute("DELETE FROM knowledge_fts WHERE doc_id=?", (m.group(2),))
+                db().execute("DELETE FROM knowledge_vec WHERE doc_id=?", (m.group(2),))
+            return self._json(200, {"ok": True, "knowledge": knowledge_list(ch["id"])})
+
         m = re.fullmatch(r"/api/characters/([^/]+)", path)
         if m:
             ch = character_by_id(m.group(1))
@@ -2042,6 +2717,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(403, {"error": "not yours"})
             with db():
                 db().execute("DELETE FROM characters WHERE id=?", (m.group(1),))
+                if FTS_OK:
+                    db().execute("DELETE FROM knowledge WHERE character_id=?", (m.group(1),))
+                    db().execute("DELETE FROM knowledge_fts WHERE character_id=?", (m.group(1),))
+                    db().execute("DELETE FROM knowledge_vec WHERE character_id=?", (m.group(1),))
             return self._json(200, {"characters": visible_characters(u)})
 
         m = re.fullmatch(r"/api/presets/([^/]+)", path)
@@ -2100,6 +2779,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for k in keys:
                     login_record_fail(k)
                 return self._json(401, {"error": "invalid username or password"})
+            secret = user_totp_secret(u)
+            if secret:
+                if not (payload.get("totp") or "").strip():
+                    return self._json(200, {"ok": False, "totp_required": True})
+                if not totp_verify(secret, payload.get("totp")):
+                    for k in keys:   # wrong codes count toward the same throttle as wrong passwords
+                        login_record_fail(k)
+                    return self._json(401, {"error": "invalid authentication code", "totp_required": True})
             for k in keys:
                 login_clear(k)
             return self._json(200, {"ok": True, "me": user_public(u)},
@@ -2180,6 +2867,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with db():
                 db().execute("UPDATE users SET persona=? WHERE id=?", (persona or None, u["id"]))
             return self._json(200, {"me": user_public(user_by_id(u["id"]))})
+
+        # ---- TOTP 2FA. Setup is stateless: the server hands out a candidate secret, and confirm
+        # only persists it after the user proves their authenticator produces matching codes.
+        if path == "/api/account/totp/setup":
+            secret = totp_gen_secret()
+            uri = "otpauth://totp/ORACLE:%s?secret=%s&issuer=ORACLE" % (u["username"], secret)
+            return self._json(200, {"secret": secret, "uri": uri})
+        if path == "/api/account/totp/confirm":
+            secret = (payload.get("secret") or "").strip()
+            if not re.fullmatch(r"[A-Z2-7]{16,64}", secret):
+                return self._json(400, {"error": "bad secret"})
+            if not totp_verify(secret, payload.get("code")):
+                return self._json(400, {"error": "that code doesn't match — check your authenticator app"})
+            with db():
+                db().execute("UPDATE users SET totp_secret=? WHERE id=?", (secret, u["id"]))
+            return self._json(200, {"ok": True, "me": user_public(user_by_id(u["id"]))})
+        if path == "/api/account/totp/disable":
+            if not verify_pw(payload.get("password") or "", u["pw_hash"]):
+                return self._json(403, {"error": "password is wrong"})
+            with db():
+                db().execute("UPDATE users SET totp_secret=NULL WHERE id=?", (u["id"],))
+            return self._json(200, {"ok": True, "me": user_public(user_by_id(u["id"]))})
+
+        # ---- web-push subscriptions (per browser, per user)
+        if path == "/api/push/subscribe":
+            sub = payload.get("subscription")
+            if not (isinstance(sub, dict) and sub.get("endpoint", "").startswith("https://")):
+                return self._json(400, {"error": "bad subscription"})
+            with db():
+                db().execute("INSERT INTO push_subs(endpoint,user_id,sub,created) VALUES(?,?,?,?)"
+                             " ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, sub=excluded.sub",
+                             (sub["endpoint"][:2000], u["id"], json.dumps(sub), _now()))
+            return self._json(200, {"ok": True})
+        if path == "/api/push/unsubscribe":
+            with db():
+                db().execute("DELETE FROM push_subs WHERE endpoint=? AND user_id=?",
+                             (str(payload.get("endpoint") or "")[:2000], u["id"]))
+            return self._json(200, {"ok": True})
 
         if path == "/api/extract":
             name = (payload.get("name") or "file").strip()
@@ -2267,6 +2992,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     db().execute("UPDATE folders SET name=? WHERE id=? AND owner_id=?", (name, mf.group(1), u["id"]))
             return self._json(200, {"folders": list_folders(u)})
 
+        m = re.fullmatch(r"/api/characters/([^/]+)/knowledge", path)
+        if m:
+            if not FTS_OK:
+                return self._json(400, {"error": "knowledge needs SQLite FTS5, which this server's build lacks"})
+            ch = character_by_id(m.group(1))
+            if ch is None or not (ch["owner_id"] == u["id"] or u["role"] == "admin"):
+                return self._json(404, {"error": "not found"})
+            name = str(payload.get("name") or "file")[:200]
+            try:
+                raw = ub64(payload.get("data") or "")
+            except Exception:
+                return self._json(400, {"error": "bad file data"})
+            if len(raw) > ATTACH_MAX_BYTES:
+                return self._json(413, {"error": "file too large"})
+            try:
+                text = extract_text_file(name, raw)[:ATTACH_MAX_CHARS]
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            kid = "k-" + uuid.uuid4().hex[:10]
+            chunks = _chunk_text(text)
+            vecs = []
+            if (get_setting("embed_model") or "").strip():
+                try:
+                    vecs = embed_texts(chunks)
+                except Exception as e:
+                    log.warning("knowledge embedding failed (doc stays keyword-searchable): %s", e)
+            with db():
+                db().execute("INSERT INTO knowledge(id,character_id,name,chars,created) VALUES(?,?,?,?,?)",
+                             (kid, ch["id"], name, len(text), _now()))
+                for i, chunk in enumerate(chunks):
+                    db().execute("INSERT INTO knowledge_fts(chunk,character_id,doc_id,name) VALUES(?,?,?,?)",
+                                 (chunk, ch["id"], kid, name))
+                    if i < len(vecs):
+                        db().execute("INSERT INTO knowledge_vec(doc_id,idx,character_id,chunk,vec) VALUES(?,?,?,?,?)",
+                                     (kid, i, ch["id"], chunk, json.dumps(vecs[i])))
+            return self._json(200, {"ok": True, "knowledge": knowledge_list(ch["id"])})
+
+        if path == "/api/import":
+            convs = payload.get("conversations")
+            if not isinstance(convs, list) or not convs:
+                return self._json(400, {"error": "no conversations to import"})
+            made = 0
+            for cv in convs[:500]:
+                if not isinstance(cv, dict):
+                    continue
+                msgs = [msg for msg in (cv.get("messages") or [])
+                        if isinstance(msg, dict) and msg.get("role") in ("system", "user", "assistant")
+                        and isinstance(msg.get("content"), str) and msg["content"].strip()]
+                if not msgs:
+                    continue
+                imp_system = ""
+                if msgs[0]["role"] == "system":
+                    imp_system = msgs.pop(0)["content"]
+                if not msgs:
+                    continue
+                title = str(cv.get("title") or "").strip()[:120] or title_from(
+                    next((msg["content"] for msg in msgs if msg["role"] == "user"), "imported"))
+                icid = _cid()
+                now = _now()
+                c = db()
+                with c:
+                    c.execute("INSERT INTO conversations(id,owner_id,title,system,model,created,updated)"
+                              " VALUES(?,?,?,?,?,?,?)",
+                              (icid, u["id"], title, imp_system,
+                               get_setting("default_model") or DEFAULT_MODEL, now, now))
+                    prev = None
+                    for msg in msgs[:4000]:
+                        prev = insert_message(icid, prev, msg["role"], msg["content"].strip()[:ATTACH_MAX_CHARS])
+                    c.execute("UPDATE conversations SET active_leaf_id=? WHERE id=?", (prev, icid))
+                made += 1
+            return self._json(200, {"ok": True, "imported": made})
+
         if path == "/api/characters":
             ch = payload.get("character") or payload
             scope = ch.get("scope", "private")
@@ -2326,7 +3123,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "endpoints" in payload:
                 set_setting("endpoints", restore_endpoint_keys(payload["endpoints"]))
             for k in ("active_endpoint", "default_model", "default_system", "default_params",
-                      "user_models", "thinking_models"):
+                      "user_models", "thinking_models", "search_url", "utility_model",
+                      "vision_models", "embed_model"):
                 if k in payload:
                     set_setting(k, payload[k])
             return self._json(200, {"settings": admin_settings(), "all_models": fetch_models(active_endpoint(), ttl=0)})
@@ -2457,6 +3255,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sets.append("think=?"); args.append(None if payload["think"] is None else (1 if payload["think"] else 0))
             if "params" in payload:
                 sets.append("params=?"); args.append(json.dumps(payload["params"] or {}))
+            if "ctx_summary" in payload:   # user-edited rolling summary; clearing resets the window anchor too
+                txt = (payload["ctx_summary"] or "").strip()
+                sets.append("ctx_summary=?"); args.append(txt or None)
+                if not txt:
+                    sets.append("ctx_summary_upto=?"); args.append(None)
             if "folder_id" in payload:
                 sets.append("folder_id=?"); args.append(payload["folder_id"] or None)
             if "title" in payload and (payload["title"] or "").strip():
@@ -2474,8 +3277,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _sanitize_attachments(raw):
         out = []
         for a in (raw or [])[:12]:
-            if isinstance(a, dict) and a.get("text"):
+            if not isinstance(a, dict):
+                continue
+            if a.get("text"):
                 out.append({"name": str(a.get("name") or "file")[:200], "text": a["text"][:ATTACH_MAX_CHARS]})
+            elif isinstance(a.get("image"), str) and a["image"].startswith("data:image/") \
+                    and ";base64," in a["image"][:64] and len(a["image"]) <= 8 * 1024 * 1024:
+                out.append({"name": str(a.get("name") or "image")[:200], "image": a["image"]})
         return out
 
     def _stream(self, cid, payload, u):
@@ -2483,13 +3291,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if convo is None:
             return self._json(404, {"error": "not found"})
         ep, model, system, params = resolve_request(convo)
+        if payload.get("model"):   # per-turn override ("regenerate with…"); the message records the real model
+            model = str(payload["model"])
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
         self.close_connection = True   # the ndjson stream has no Content-Length, so it can't be kept alive
         char_row = character_by_id(convo.get("character_id")) if convo.get("character_id") else None
         system = apply_macros(system, {"user": (u["persona"] if "persona" in u.keys() else None) or u["username"],
                                        "char": char_row["name"] if char_row else None, "model": model})
-        tools = TOOLS_SPEC if convo.get("tools") else None
+        tools = tools_spec() if convo.get("tools") else None
+        vision_on = model in set(get_setting("vision_models") or [])
         clear_stop(cid)   # drop any stale stop flag from a prior run on this conversation
 
         _, by, _ = _tree(cid)
@@ -2510,7 +3321,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "can only continue an assistant message"})
             cont_prefix = content if payload.get("content") is not None else (tc["content"] or "")
             parent = tc["parent_id"]
-            ctx = chain_content(cid, parent) + [{"role": "assistant", "content": cont_prefix}]
+            ctx = chain_content(cid, parent, by) + [{"role": "assistant", "content": cont_prefix}]
             lead, title_after = None, False
             tools = None
         elif regenerate_id or payload.get("regenerate"):
@@ -2519,7 +3330,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if tr is None or tr["role"] != "assistant":
                 return self._json(400, {"error": "nothing to regenerate"})
             parent = tr["parent_id"]
-            ctx = chain_content(cid, parent)
+            ctx = chain_content(cid, parent, by)
             lead, title_after = None, False
         elif edit_user_id:
             tu = by.get(edit_user_id)
@@ -2527,18 +3338,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "cannot edit/resend that message"})
             new_content = content or tu["content"]
             parent = tu["parent_id"]
-            ctx = chain_content(cid, parent) + [{"role": "user", "content": new_content, "attachments": attachments or None}]
+            ctx = chain_content(cid, parent, by) + [{"role": "user", "content": new_content, "attachments": attachments or None}]
             lead, title_after = ("user", new_content, attachments), True
         else:
             if not content and not attachments:
                 return self._json(400, {"error": "empty message"})
             parent = convo.get("active_leaf_id")
-            ctx = chain_content(cid, parent) + [{"role": "user", "content": content, "attachments": attachments or None}]
+            ctx = chain_content(cid, parent, by) + [{"role": "user", "content": content, "attachments": attachments or None}]
             lead, title_after = ("user", content, attachments), True
 
-        # Finalize the system prompt against the *effective* tool state (continue mode turns tools off).
+        # Finalize the system prompt against the conversation's own tool setting — NOT the effective
+        # one (continue mode drops the tools *spec* from the API call, but the system text must stay
+        # byte-identical to normal turns or the server's prefix/KV cache misses on the whole prompt).
         # Date stays day-granular so this whole block remains a stable, cacheable prefix within a day.
-        system = compose_system(system, tools is not None)
+        system = compose_system(system, bool(convo.get("tools")))
+
+        # Character knowledge (BM25 over uploaded files): retrieved per-turn and appended to the
+        # LAST user message in the sent copy — the tail of the prompt — so the cacheable prefix
+        # (system + earlier turns) is untouched. The stored chat never contains the injection.
+        if char_row and FTS_OK:
+            try:
+                last_user = next((m for m in reversed(ctx) if m.get("role") == "user"), None)
+                if last_user and (last_user.get("content") or "").strip():
+                    snips = knowledge_snippets(convo.get("character_id"), last_user["content"])
+                    if snips:
+                        last_user["content"] += ("\n\n[Reference notes from this character's knowledge "
+                                                 "files — use if relevant:\n" + "\n---\n".join(snips) + "\n]")
+            except Exception:
+                log.exception("knowledge retrieval failed (convo %s)", cid)
 
         # Context-window management. When the conversation outgrows the model's window we slide it:
         # drop the oldest turns from what we *send* (keeping the system prompt + most recent turns)
@@ -2548,37 +3375,90 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # window is known, so a missing/flaky /v1/models never trims or throttles a big model.
         ctx_notice = None
         sent_est_raw = None   # uncalibrated chars/4 estimate of what we sent (for post-reply learning)
+        ctx_win, budget, want, factor, sys_est = 0, 0, MAX_TOKENS, 1.0, 0
+        raw_of = lambda msgs: sys_est + sum(_msg_tokens(m) for m in msgs)
+        est_of = lambda msgs: round(raw_of(msgs) * factor)
+
+        def retrim(msgs):
+            """Drop oldest turns until msgs fits the budget (with hysteresis — see below). Returns
+            the number dropped. Never drops the final message; never leaves an orphaned non-user
+            turn at the window start."""
+            n = 0
+            if est_of(msgs) > budget:
+                low_water = int(budget * 0.75)
+                while len(msgs) > 1 and est_of(msgs) > low_water:
+                    msgs.pop(0); n += 1
+                while len(msgs) > 1 and msgs[0].get("role") != "user":
+                    msgs.pop(0); n += 1
+            return n
+
         try:
             ctx_win = context_for(ep, model, default=0)
             if ctx_win > 0:
                 want = int(params.get("max_tokens", MAX_TOKENS) or MAX_TOKENS)
                 factor = tok_factor(model)   # learned correction toward this model's real tokenizer
                 sys_est = est_tokens(system)
-                raw = lambda: sys_est + sum(_msg_tokens(m) for m in ctx)
-                est = lambda: round(raw() * factor)
                 budget = ctx_win - CTX_REPLY_RESERVE - CTX_MARGIN   # tokens left for the history
+                # Trim with hysteresis: once over budget, cut down to ~75% of it in one go. Popping
+                # exactly to the budget would shift the window start every turn, changing the prompt
+                # prefix each time and defeating the server's prefix/KV cache for the whole rest of
+                # the conversation; a deeper cut keeps the prefix stable for many turns between trims.
+                pre_trim = list(ctx)
                 dropped = 0
-                # never drop the final message (the current turn / continue prefill)
-                while len(ctx) > 1 and est() > budget:
-                    ctx.pop(0); dropped += 1
-                # don't start the window on an orphaned tool result or a dangling non-user turn
-                while len(ctx) > 1 and ctx[0].get("role") != "user":
-                    ctx.pop(0); dropped += 1
-                sent_est_raw = raw()
-                prompt_est = est()
+                compressed = None
+                # Anchored window: once a conversation has overflowed, the previous trim's boundary
+                # (ctx_summary_upto = last summarized message) is reused as long as the window after
+                # it still fits. This keeps the sent prompt byte-identical at the front across turns
+                # (prefix-cache hits) and reuses the stored summary with no extra model call. Only
+                # when the window outgrows the budget again does the boundary advance — one fresh
+                # trim + one incremental summary fold, then stable again.
+                SUM_HDR = "\n\n# Earlier conversation (rolling summary)\n"
+                anchor = convo.get("ctx_summary_upto") if COMPRESS else None
+                stored_sum = convo.get("ctx_summary") if COMPRESS else None
+                if anchor and stored_sum:
+                    ids0 = [m.get("id") for m in ctx]
+                    if anchor in ids0:
+                        cut = ids0.index(anchor) + 1
+                        window = ctx[cut:]
+                        se = est_tokens(system + SUM_HDR + stored_sum)
+                        if window and round((se + sum(_msg_tokens(m) for m in window)) * factor) <= budget:
+                            system = system + SUM_HDR + stored_sum
+                            sys_est = se
+                            del ctx[:cut]
+                            dropped, compressed = cut, stored_sum
+                if not dropped:
+                    dropped = retrim(ctx)
+                    if dropped and COMPRESS:
+                        # Fold the newly dropped turns into the rolling summary (incremental: the
+                        # stored summary is extended, not rebuilt, when the boundary just advanced).
+                        try:
+                            compressed = ensure_summary(convo, ep, model, pre_trim[:dropped])
+                        except Exception:
+                            log.exception("context compression failed; dropping plainly (convo %s)", cid)
+                        if compressed:
+                            system = system + SUM_HDR + compressed
+                            sys_est = est_tokens(system)
+                            retrim(ctx)   # the summary itself consumes budget; re-check
+                sent_est_raw = raw_of(ctx)
+                prompt_est = est_of(ctx)
                 room = ctx_win - prompt_est - CTX_MARGIN
                 params["max_tokens"] = max(64, min(want, room if room > 64 else 64))
-                if dropped:
+                if dropped and compressed:
+                    ctx_notice = (
+                        "This conversation outgrew {model}'s ~{cw:,}-token context window; the {n} oldest "
+                        "message{s} compressed into a rolling summary the model sees instead — your "
+                        "saved chat is unchanged.").format(
+                            model=model, cw=ctx_win, n=dropped, s=" was" if dropped == 1 else "s were")
+                elif dropped:
                     ctx_notice = (
                         "This conversation outgrew {model}'s ~{cw:,}-token context window, so the {n} "
                         "oldest message{s} dropped from what the model sees this turn — your saved chat "
-                        "is unchanged. (Automatic context compression is coming.)").format(
+                        "is unchanged.").format(
                             model=model, cw=ctx_win, n=dropped, s=" was" if dropped == 1 else "s were")
                 elif room < CTX_REPLY_RESERVE:   # a single huge final turn we can't trim around
                     ctx_notice = (
                         "This message nearly fills {model}'s ~{cw:,}-token context window; the reply may "
-                        "be cut short or fail. (Automatic context compression is coming.)").format(
-                            model=model, cw=ctx_win)
+                        "be cut short or fail.").format(model=model, cw=ctx_win)
         except Exception:
             log.exception("context-window management failed; sending untrimmed (convo %s)", cid)
 
@@ -2649,7 +3529,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         seg_state = {}   # live buffers of the current run_stream pass, for partial-persist on error
 
-        def run_stream(cur_tools):
+        def run_stream(cur_tools, cur_choice="auto"):
             # Stream a turn. Leading whitespace is held back so a *dropped* tool call (which the oMLX
             # server emits as a lone "\n") never spawns an empty bubble — the thinking dots stay up.
             parts, rparts, tcalls, used, finish = [], [], None, None, None
@@ -2668,7 +3548,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         t_first[0] = time.time()
                     emit({"delta": "".join(parts)})
 
-            for ev in stream_model(ep, model, system, work, params, tools=cur_tools, extra=cont_extra):
+            for ev in stream_model(ep, model, system, work, params, tools=cur_tools, extra=cont_extra,
+                                   tool_choice=cur_choice, vision=vision_on):
                 if "delta" in ev:
                     push(ev["delta"])
                 elif "reasoning" in ev:
@@ -2698,14 +3579,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         force_answer = False
         try:
             for it in range(TOOL_MAX_ITERS + 1):
-                cur_tools = tools if (it < TOOL_MAX_ITERS and not force_answer) else None  # force a text answer
+                # Final round (or a repeated identical call): force a text answer via tool_choice
+                # "none" while KEEPING the tools schema in the request — the schema is rendered into
+                # the templated prompt, so dropping it would invalidate the KV cache built by this
+                # very turn's earlier rounds. stream_model falls back to a no-tools request for
+                # servers that reject a non-auto tool_choice.
+                answer_only = (it >= TOOL_MAX_ITERS or force_answer)
+                cur_tools = tools
+                cur_choice = "none" if answer_only else "auto"
                 if cur_tools:
                     emit({"status": "reading the results…" if collected else "thinking…"})
+                if it and ctx_win > 0:
+                    # fetched tool results grew the prompt beyond what the pre-turn budget saw;
+                    # re-trim and re-clamp max_tokens so this pass can't overflow the window
+                    retrim(work)
+                    room2 = ctx_win - est_of(work) - CTX_MARGIN
+                    params["max_tokens"] = max(64, min(want, room2 if room2 > 64 else 64))
                 # Always stream first — a real text answer streams cleanly token-by-token.
-                seg_reply, seg_reason, tcalls, used, finish = run_stream(cur_tools)
+                seg_reply, seg_reason, tcalls, used, finish = run_stream(cur_tools, cur_choice)
                 if used:
                     usage = used
-                if cur_tools and not tcalls:
+                if cur_tools and not answer_only and not tcalls:
                     if seg_reply and "<tool_call>" in seg_reply:           # tool call leaked as text
                         parsed = parse_text_tool_calls(seg_reply)
                         if parsed:
@@ -2713,7 +3607,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # the streaming tool parser dropped the call -> recover via reliable non-streaming
                     if not tcalls and not gone[0] and not stop_requested(cid) and (finish == "tool_calls" or not seg_reply.strip()):
                         try:
-                            c2, r2, t2, u2, _ = call_model_nonstream(ep, model, system, work, params, cur_tools)
+                            c2, r2, t2, u2, _ = call_model_nonstream(ep, model, system, work, params, cur_tools,
+                                                                     vision=vision_on)
                         except Exception:
                             c2, r2, t2, u2 = "", "", None, None
                         if u2:
@@ -2727,7 +3622,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if not t_first[0]:
                                 t_first[0] = time.time()
                             emit({"delta": c2})
-                if gone[0] or stop_requested(cid) or not tcalls:
+                if gone[0] or stop_requested(cid) or not tcalls or answer_only:
                     reply, reasoning = seg_reply, seg_reason
                     break
                 emit({"tool_turn": True})
@@ -2805,6 +3700,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     log.exception("failed to persist user turn after empty response (convo %s)", cid)
             return
         meta = build_meta(t0, t_first[0] or None, time.time(), usage, reply)
+        push_notify(u["id"], convo.get("title") or "reply finished", reply, cid)
         meta["params"] = {k: params[k] for k in params if k in PARAM_KEYS}   # what was actually sent
         pn = matching_preset_name(u, model, convo.get("params") or {})
         if pn:
@@ -2816,16 +3712,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         persist(collected, reply, reasoning, meta)
 
         # On the very first exchange, summarize a short title (replacing the first-line fallback).
-        # Skip the extra title-gen model call when the user stopped, so stop feels immediate.
+        # Runs in a background thread AFTER `done` is emitted: the extra title-gen model call
+        # (seconds on a warm model, much longer on a cold one) must not delay the finished reply.
+        # The client re-fetches the title shortly after `done`. Skipped when the user stopped.
         if lead and parent is None and not gone[0] and not stop_requested(cid):
             utext = lead[1]
             atts = lead[2] or []
             if atts and atts[0].get("text"):
                 utext = (utext + "\n\n" + atts[0]["text"]) if utext else atts[0]["text"]
-            title = generate_title(ep, model, utext, reply)
-            if title:
-                with db():
-                    db().execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
+
+            def _title_bg(utext=utext, reply=reply):
+                title = generate_title(ep, model, utext, reply)
+                if title:
+                    with db():
+                        db().execute("UPDATE conversations SET title=? WHERE id=?", (title, cid))
+            threading.Thread(target=_title_bg, daemon=True).start()
 
         if not gone[0]:
             try:
@@ -2918,6 +3819,7 @@ META_TAGS = (
     '<link rel="icon" type="image/svg+xml" href="/favicon.svg">' +
     '<link rel="alternate icon" type="image/png" sizes="180x180" href="/apple-touch-icon.png">' +
     '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' +
+    '<link rel="manifest" href="/manifest.webmanifest">' +
     '<meta property="og:type" content="website">' +
     '<meta property="og:site_name" content="ORACLE">' +
     '<meta property="og:title" content="ORACLE">' +
@@ -2935,6 +3837,50 @@ META_TAGS = (
     '<meta name="twitter:image" content="' + PUBLIC_URL + '/og-image.png">' +
     '<meta name="twitter:image:alt" content="' + _OG_ALT + '">'
 )
+
+# ---------------------------------------------------------------- PWA (installable app shell)
+MANIFEST_JSON = json.dumps({
+    "name": "ORACLE", "short_name": "ORACLE", "start_url": "/", "scope": "/",
+    "display": "standalone", "background_color": "#100c08", "theme_color": "#100c08",
+    "icons": [{"src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+              {"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"}],
+})
+
+# Network-first with cache fallback for the shell and icons; API, auth, and share pages are never
+# touched so nothing dynamic or private is served stale.
+SW_JS = r"""
+const C="oracle-shell-v1";
+self.addEventListener("install",e=>self.skipWaiting());
+self.addEventListener("activate",e=>{e.waitUntil(caches.keys()
+  .then(ks=>Promise.all(ks.filter(k=>k!==C).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));});
+self.addEventListener("fetch",e=>{
+  const u=new URL(e.request.url);
+  if(e.request.method!=="GET"||u.origin!==location.origin)return;
+  const p=u.pathname;
+  if(p.startsWith("/api/")||p.startsWith("/s/")||p==="/login"||p==="/setup"||p.startsWith("/invite"))return;
+  e.respondWith(fetch(e.request).then(r=>{
+    if(r.ok){const cp=r.clone();caches.open(C).then(c=>c.put(e.request,cp));}
+    return r;
+  }).catch(()=>caches.match(e.request).then(m=>m||Response.error())));
+});
+self.addEventListener("push",e=>{
+  let d={};try{d=e.data?e.data.json():{};}catch(_){}
+  e.waitUntil((async()=>{
+    // suppress the banner when the app is already visible — the in-page toast covers that case
+    const cs=await self.clients.matchAll({type:"window",includeUncontrolled:true});
+    if(cs.some(c=>c.visibilityState==="visible"))return;
+    await self.registration.showNotification(d.title||"ORACLE",{body:d.body||"reply finished",tag:"oracle-push",data:d});
+  })());
+});
+self.addEventListener("notificationclick",e=>{
+  e.notification.close();
+  e.waitUntil((async()=>{
+    const cs=await self.clients.matchAll({type:"window",includeUncontrolled:true});
+    if(cs.length){cs[0].focus();return;}
+    await self.clients.openWindow("/");
+  })());
+});
+"""
 
 _BRAND_LOCK = threading.Lock()
 _BRAND_CACHE = {}
@@ -3171,14 +4117,20 @@ LOGIN_PAGE = (r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <p class="lede">This instance is private. Enter your credentials to continue.</p>
   <label>Username</label><input id="u" autocomplete="username" autofocus>
   <label>Password</label><input id="p" type="password" autocomplete="current-password">
+  <div id="totp_row" style="display:none;"><label>Authentication code</label>
+    <input id="t" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code"></div>
   <button type="submit">Enter</button>
   <div class="err" id="e"></div>
 </form>
 <script>
 document.getElementById("f").onsubmit=async(ev)=>{ev.preventDefault();const e=document.getElementById("e");e.textContent="";
- try{const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})});
-  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||"sign in failed");location.href="/";
+ try{const body={username:document.getElementById("u").value,password:document.getElementById("p").value};
+  const t=document.getElementById("t").value.trim();if(t)body.totp=t;
+  const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(j.totp_required&&!j.ok){document.getElementById("totp_row").style.display="block";
+    document.getElementById("t").focus();if(j.error)e.textContent=j.error;return;}
+  if(!r.ok)throw new Error(j.error||"sign in failed");location.href="/";
  }catch(err){e.textContent=err.message;}};
 </script></body></html>""")
 
@@ -3247,6 +4199,9 @@ PAGE_HEAD = r"""<!doctype html>
 <script>
 (function(){try{var d=document.documentElement,L=localStorage;
  d.setAttribute('data-theme',L.getItem('oracle_theme')||'dark');
+ var pa=L.getItem('oracle_palette');
+ if(pa==='custom'){try{var cv=JSON.parse(L.getItem('oracle_custom_vars')||'{}');for(var ck in cv)d.style.setProperty(ck,cv[ck]);}catch(e){}}
+ else if(pa&&pa!=='sepia')d.setAttribute('data-palette',pa);
  var fs=L.getItem('oracle_fs');if(fs)d.style.setProperty('--rs',fs);
  var w=L.getItem('oracle_sbw');if(w)d.style.setProperty('--sbw',w+'px');
  var cw=L.getItem('oracle_cw');if(cw)d.style.setProperty('--cw',cw+'px');
@@ -3262,7 +4217,7 @@ PAGE_HEAD = r"""<!doctype html>
     --bg:#100c08; --panel:#15100a; --surface:#1b150d; --surface2:#231b10; --surface3:#2a2114;
     --line:rgba(150,124,84,.10);
     --text:#e8ddc5; --muted:#9a8c72; --faint:#81765b; --dim:#6b5f49;
-    --accent:#cf8a3c; --accent2:#cda261; --accent-weak:rgba(207,138,60,.14);
+    --accent:#cf8a3c; --accent2:#cda261; --accent-weak:rgba(207,138,60,.14); --on-accent:#1a1206;
     --user:#b49f78; --bot:#d29a4b; --danger:#c8604c; --danger-weak:rgba(200,90,70,.14); --ok:#94a05c;
     --code-bg:#0c0905; --shadow:0 24px 70px rgba(0,0,0,.55);
     --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
@@ -3277,6 +4232,65 @@ PAGE_HEAD = r"""<!doctype html>
     --user:#6d5a32; --bot:#955414; --danger:#a23a2a; --danger-weak:rgba(162,58,42,.12); --ok:#5f6b2f;
     --code-bg:#e6dcc6; --shadow:0 24px 60px rgba(60,45,20,.25);
     color-scheme:light;
+  }
+  /* ---- color schemes: a palette re-tints the whole variable set; sepia (no attribute) is the
+     original brown/amber. Each palette defines dark + light; anything not overridden falls back
+     to the base theme blocks above. Stored per browser (oracle_palette). */
+  [data-theme="dark"][data-palette="slate"]{
+    --bg:#0b0e13; --panel:#10141b; --surface:#151b24; --surface2:#1c2430; --surface3:#232d3c;
+    --line:rgba(110,140,180,.10);
+    --text:#d9e1ec; --muted:#8496ac; --faint:#6b7c92; --dim:#57667a;
+    --accent:#6aa1d8; --accent2:#9db8d4; --accent-weak:rgba(106,161,216,.14); --on-accent:#0b0e13;
+    --user:#93a5ba; --bot:#74a8d8; --ok:#7d9d68; --code-bg:#080a0e;
+  }
+  [data-theme="light"][data-palette="slate"]{
+    --bg:#e9edf2; --panel:#e0e6ee; --surface:#d7dfe8; --surface2:#cad4e0; --surface3:#bdc9d8;
+    --line:rgba(60,90,130,.14);
+    --text:#232b35; --muted:#52627a; --faint:#68788e; --dim:#8090a4;
+    --accent:#2f6cab; --accent2:#24507e; --accent-weak:rgba(47,108,171,.15); --on-accent:#f2f5f9;
+    --user:#4b5b70; --bot:#2a6096; --ok:#4f7a4f; --code-bg:#dde4ee; --shadow:0 24px 60px rgba(20,30,45,.22);
+  }
+  [data-theme="dark"][data-palette="moss"]{
+    --bg:#0c100b; --panel:#111710; --surface:#161e15; --surface2:#1d271b; --surface3:#253122;
+    --line:rgba(130,160,110,.10);
+    --text:#dfe8d8; --muted:#90a385; --faint:#748767; --dim:#5e6f53;
+    --accent:#8fb573; --accent2:#b0c898; --accent-weak:rgba(143,181,115,.14); --on-accent:#0c100b;
+    --user:#a2b092; --bot:#97bd78; --ok:#94a05c; --code-bg:#080b07;
+  }
+  [data-theme="light"][data-palette="moss"]{
+    --bg:#eaeee1; --panel:#e0e6d3; --surface:#d6dec7; --surface2:#c9d4b6; --surface3:#bbc9a6;
+    --line:rgba(80,100,50,.15);
+    --text:#262d1d; --muted:#5a684a; --faint:#70805c; --dim:#879673;
+    --accent:#52803a; --accent2:#3c5f28; --accent-weak:rgba(82,128,58,.15); --on-accent:#f3f6ec;
+    --user:#57654a; --bot:#47732c; --ok:#5f6b2f; --code-bg:#e0e6d2; --shadow:0 24px 60px rgba(30,40,20,.22);
+  }
+  [data-theme="dark"][data-palette="iris"]{
+    --bg:#0e0c14; --panel:#131019; --surface:#191521; --surface2:#211c2c; --surface3:#2a2438;
+    --line:rgba(150,130,190,.11);
+    --text:#e2dcee; --muted:#948aab; --faint:#786f8f; --dim:#615a76;
+    --accent:#a488e8; --accent2:#bfadde; --accent-weak:rgba(164,136,232,.14); --on-accent:#0e0c14;
+    --user:#a49ac0; --bot:#ac90e8; --ok:#7d9d68; --code-bg:#0a0810;
+  }
+  [data-theme="light"][data-palette="iris"]{
+    --bg:#ece9f2; --panel:#e3deec; --surface:#d9d3e5; --surface2:#ccc4dc; --surface3:#beb4d1;
+    --line:rgba(90,70,130,.14);
+    --text:#292234; --muted:#5c5175; --faint:#71678b; --dim:#877ea0;
+    --accent:#6a4cbe; --accent2:#4e3790; --accent-weak:rgba(106,76,190,.14); --on-accent:#f4f2f9;
+    --user:#574d70; --bot:#5f41b2; --ok:#5f7a3f; --code-bg:#e2ddec; --shadow:0 24px 60px rgba(35,25,55,.22);
+  }
+  [data-theme="dark"][data-palette="ash"]{
+    --bg:#0e0f11; --panel:#131417; --surface:#191a1e; --surface2:#212226; --surface3:#292a30;
+    --line:rgba(150,155,170,.10);
+    --text:#e3e5e8; --muted:#92959d; --faint:#767a82; --dim:#60636b;
+    --accent:#aab6c4; --accent2:#c4ccd6; --accent-weak:rgba(170,182,196,.14); --on-accent:#0e0f11;
+    --user:#a0a5ad; --bot:#b4bfcb; --ok:#8a9a70; --code-bg:#0a0b0c;
+  }
+  [data-theme="light"][data-palette="ash"]{
+    --bg:#ebebec; --panel:#e2e2e4; --surface:#d9d9dc; --surface2:#cdcdd1; --surface3:#c1c1c6;
+    --line:rgba(70,72,80,.14);
+    --text:#26272b; --muted:#595c63; --faint:#6f7279; --dim:#85888f;
+    --accent:#4c5a68; --accent2:#363f4a; --accent-weak:rgba(76,90,104,.15); --on-accent:#f4f4f6;
+    --user:#4f545c; --bot:#3e4f5e; --ok:#56713f; --code-bg:#e1e1e4; --shadow:0 24px 60px rgba(25,27,32,.22);
   }
   *{box-sizing:border-box;}
   html,body{height:100%;}
@@ -3302,7 +4316,7 @@ PAGE_HEAD = r"""<!doctype html>
   .side-act{padding:8px 12px 10px;display:flex;flex-direction:column;gap:8px;}
   #newbtn{width:100%;padding:11px;background:var(--accent-weak);color:var(--accent);border:none;border-radius:10px;
           font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;cursor:pointer;font-weight:600;}
-  #newbtn:hover{background:var(--accent);color:#1a1206;}
+  #newbtn:hover{background:var(--accent);color:var(--on-accent);}
   .side-act .row{display:flex;gap:8px;}
   .searchwrap{position:relative;}
   #searchbox{width:100%;background:var(--surface);color:var(--text);border:none;border-radius:9px;padding:9px 30px 9px 11px;font-family:var(--mono);font-size:12px;}
@@ -3429,7 +4443,7 @@ PAGE_HEAD = r"""<!doctype html>
   .edit-area{width:100%;background:var(--code-bg);color:var(--text);border:none;border-radius:10px;padding:12px 13px;font-size:calc(16px*var(--rs));font-family:var(--read-font);line-height:1.6;resize:vertical;min-height:96px;}
   .edit-area:focus{outline:2px solid var(--accent-weak);}
   .edit-row{display:flex;gap:8px;margin-top:8px;}
-  .btn-primary{background:var(--accent);color:#1a1206;border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
+  .btn-primary{background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
   .btn-primary:hover{filter:brightness(1.07);}
   .btn-ghost{background:var(--surface2);color:var(--muted);border:none;border-radius:8px;padding:8px 15px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
   .btn-ghost:hover{background:var(--surface3);color:var(--text);}
@@ -3509,7 +4523,7 @@ PAGE_HEAD = r"""<!doctype html>
   input[type=checkbox]:hover{border-color:var(--accent);}
   input[type=checkbox]:focus-visible{outline:2px solid var(--accent-weak);outline-offset:1px;}
   input[type=checkbox]:checked{background:var(--accent);border-color:var(--accent);}
-  input[type=checkbox]:checked::after{content:"";width:9px;height:9px;clip-path:polygon(14% 46%,0 60%,40% 100%,100% 18%,86% 6%,38% 70%);background:#1a1206;}
+  input[type=checkbox]:checked::after{content:"";width:9px;height:9px;clip-path:polygon(14% 46%,0 60%,40% 100%,100% 18%,86% 6%,38% 70%);background:var(--on-accent);}
 
   /* ---------------- overlays */
   #backdrop{position:fixed;inset:0;background:rgba(8,6,3,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:50;}
@@ -3615,6 +4629,18 @@ PAGE_HEAD = r"""<!doctype html>
   .seg{display:inline-flex;background:var(--bg);border-radius:9px;padding:3px;gap:3px;}
   .seg button{background:none;border:none;color:var(--muted);padding:7px 14px;border-radius:7px;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;}
   .seg button.on{background:var(--surface2);color:var(--text);}
+  .seg .pdot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0;}
+  #palseg{flex-wrap:wrap;}
+  .cpick{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);cursor:pointer;}
+  .cpick input[type=color]{width:32px;height:24px;border:1px solid var(--line);border-radius:6px;background:none;padding:1px;cursor:pointer;}
+  .stats-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  .stats-table th{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);}
+  .stats-table td{padding:6px 8px;border-bottom:1px solid var(--line);color:var(--text);}
+  .stats-table td.mono{font-family:var(--mono);font-size:11px;}
+  .krow{display:flex;gap:10px;align-items:center;font-family:var(--mono);font-size:11.5px;color:var(--muted);padding:5px 0;border-bottom:1px solid var(--line);}
+  .krow .kn{color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .krow .kc{color:var(--faint);flex:0 0 auto;}
+  .atts .attimg{max-width:min(340px,100%);max-height:340px;border-radius:10px;display:block;margin:6px 0;}
   .danger-zone{margin-top:24px;padding:14px;border-radius:11px;background:var(--danger-weak);}
   .danger-zone .dz-t{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--danger);margin-bottom:8px;}
   .danger-zone p{font-family:var(--mono);font-size:11px;color:var(--muted);margin:0 0 10px;line-height:1.5;}
@@ -3655,7 +4681,7 @@ PAGE_HEAD = r"""<!doctype html>
     #app.sbcollapsed #sidebar{display:flex;}
     #resizer{display:none;}
     .menubtn{display:flex;} #revealbtn{display:none!important;} #collapsebtn{display:none;}
-    #charchip,select.msel{display:none;}
+    #charchip{display:none;} select.msel{max-width:31vw;}
     .wrap,.chint,#pending{padding:0 16px;}
     .bubble{font-size:calc(17px*var(--rs));}
     /* tap a message to reveal its actions (instead of always-on hover) */
@@ -3716,7 +4742,7 @@ PAGE_BODY = r"""
         <div id="pending"></div>
         <div class="wrap">
           <button id="attachbtn" title="attach a file (PDF, text, markdown)"><svg class="ico" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.19 9.19a1 1 0 0 1-1.41-1.41l8.49-8.49"/></svg></button>
-          <input type="file" id="fileinput" multiple accept=".pdf,.txt,.md,.markdown,.text,.csv,.tsv,.json,.log,.rst,.yaml,.yml" style="display:none">
+          <input type="file" id="fileinput" multiple accept=".pdf,.txt,.md,.markdown,.text,.csv,.tsv,.json,.log,.rst,.yaml,.yml,image/png,image/jpeg,image/webp,image/gif" style="display:none">
           <div class="input-shell">
             <textarea id="input" rows="1" placeholder="say something…   (enter to send, shift+enter for newline)"></textarea>
           </div>
@@ -3738,6 +4764,10 @@ PAGE_BODY = r"""
       <label class="fld"><span class="lab">system prompt <span class="sub">this chat only</span></span><textarea id="d_system" placeholder="empty = no system prompt"></textarea></label>
       <label class="fld chk"><span class="lab">web tools <span class="sub">let the model fetch web pages</span></span><label class="chkrow"><input type="checkbox" id="d_tools"> <span>enable <code>fetch_url</code> for this chat</span></label></label>
       <label class="fld" id="d_think_wrap" style="display:none;"><span class="lab">thinking <span class="sub">let the model reason before answering</span></span><select id="d_think"><option value="">model default</option><option value="1">on</option><option value="0">off</option></select></label>
+      <div class="fld" id="d_summary_wrap" style="display:none;"><span class="lab">context summary <span class="sub">what the model sees in place of trimmed history — edit or clear it</span></span>
+        <textarea id="d_summary" rows="5"></textarea>
+        <div class="params-foot"><button class="mini" id="d_summary_save">save summary</button><button class="mini danger" id="d_summary_clear">clear (forget)</button></div>
+      </div>
       <div class="fld params-section"><span class="lab">sampler parameters <span class="sub">blank = server default</span></span>
         <div class="preset-row"><select id="d_preset"></select><button class="mini" id="d_preset_save">save preset</button><button class="mini" id="d_preset_del" style="display:none">delete</button></div>
         <div class="params-grid" id="d_params"></div>
@@ -3756,6 +4786,23 @@ PAGE_BODY = r"""
           <div class="lbl" style="margin-bottom:10px;">your name</div>
           <label class="fld"><span class="lab">display name <span class="sub">fills <code>{{user}}</code> in prompts · blank = your username</span></span><input type="text" id="ac_persona" maxlength="60" placeholder="e.g. Alex"></label>
           <div class="edit-row" style="margin-top:10px;"><button class="btn-primary" id="ac_persona_save">save name</button></div>
+          <div class="lbl" style="margin:24px 0 10px;">security</div>
+          <div id="totp_off">
+            <button class="mini" id="totp_enable">enable two-factor (TOTP)</button>
+            <div class="hintbox" style="margin-top:8px;">Adds a 6-digit authenticator code to sign-in. If you lose the authenticator, an admin must clear it in the database.</div>
+          </div>
+          <div id="totp_setup" style="display:none;">
+            <div class="hintbox">Add this secret to your authenticator app (manual entry), then confirm with a code:</div>
+            <div class="mono" id="totp_secret" style="margin:8px 0;user-select:all;word-break:break-all;"></div>
+            <div style="display:flex;gap:8px;align-items:center;"><input type="text" id="totp_code" inputmode="numeric" placeholder="123456" style="max-width:120px;"><button class="mini" id="totp_confirm">confirm &amp; enable</button><button class="mini" id="totp_cancel">cancel</button></div>
+          </div>
+          <div id="totp_on" style="display:none;">
+            <div class="hintbox">Two-factor is <b>on</b> for this account.</div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:8px;"><input type="password" id="totp_pw" placeholder="password" style="max-width:180px;"><button class="mini danger" id="totp_disable">disable 2FA</button></div>
+          </div>
+          <div style="margin-top:14px;" id="push_wrap">
+            <label class="chkrow" style="cursor:pointer;"><input type="checkbox" id="push_toggle"> <span>push notifications on this device (even with the tab closed)</span></label>
+          </div>
           <div class="lbl" style="margin:24px 0 10px;">change password</div>
           <label class="fld"><span class="lab">current password</span><input type="password" id="ac_old"></label>
           <label class="fld"><span class="lab">new password <span class="sub">(min 8)</span></span><input type="password" id="ac_new"></label>
@@ -3763,6 +4810,9 @@ PAGE_BODY = r"""
           <div class="edit-row" style="margin-top:14px;"><button class="btn-primary" id="ac_save">change password</button></div>
           <div class="lbl" style="margin:24px 0 8px;">your data</div>
           <button class="mini" id="exportall">export all my chats (json)</button>
+          <div style="margin-top:10px;"><button class="mini" id="imp_btn" type="button">import chats from file&#8230;</button>
+            <input type="file" id="imp_file" style="display:none" accept=".json,.jsonl" multiple></div>
+          <div class="hintbox" style="margin-top:8px;">Accepts a ChatGPT export (<code>conversations.json</code>), a SillyTavern chat (<code>.jsonl</code>), or any JSON with a <code>messages</code> list of <code>{role, content}</code>.</div>
           <div class="danger-zone">
             <div class="dz-t">danger zone</div>
             <p>Delete your account and every conversation, folder, and private character you own. This cannot be undone.</p>
@@ -3771,6 +4821,16 @@ PAGE_BODY = r"""
         </div>
         <div class="tab-pane" id="tab-appearance">
           <label class="fld"><span class="lab">theme</span><div class="seg" id="themeseg"><button data-th="dark" class="on">dark</button><button data-th="light">light</button></div></label>
+          <label class="fld"><span class="lab">color</span><div class="seg" id="palseg"><button data-pal="sepia" class="on"><span class="pdot" style="background:#cf8a3c"></span>sepia</button><button data-pal="slate"><span class="pdot" style="background:#6aa1d8"></span>slate</button><button data-pal="moss"><span class="pdot" style="background:#8fb573"></span>moss</button><button data-pal="iris"><span class="pdot" style="background:#a488e8"></span>iris</button><button data-pal="ash"><span class="pdot" style="background:#aab6c4"></span>ash</button><button data-pal="custom"><span class="pdot" style="background:conic-gradient(#c85a46,#cf8a3c,#94a05c,#6aa1d8,#a488e8,#c85a46)"></span>custom</button></div></label>
+          <div id="custwrap" style="display:none;margin:2px 0 6px;">
+            <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;">
+              <label class="cpick"><input type="color" id="cp_bg"><span>background</span></label>
+              <label class="cpick"><input type="color" id="cp_text"><span>text</span></label>
+              <label class="cpick"><input type="color" id="cp_accent"><span>accent</span></label>
+              <button class="mini" id="cp_reset">reset</button>
+            </div>
+            <div class="hintbox" style="margin-top:8px;">Pick three colors — surfaces, borders, and bubbles are derived from them. Custom overrides the light/dark toggle.</div>
+          </div>
           <label class="fld"><span class="lab">body text</span><div class="seg" id="fontseg"><button data-f="serif" class="on">serif</button><button data-f="sans">sans</button><button data-f="mono">mono</button></div></label>
           <label class="fld"><span class="lab">text size</span>
             <div class="pgrow" style="gap:8px;"><button class="mini" id="fs_minus">A-</button><input type="range" id="fs_range" min="0.85" max="1.5" step="0.05" style="flex:1;accent-color:var(--accent);"><button class="mini" id="fs_plus">A+</button><button class="mini" id="fs_reset">reset</button></div>
@@ -3789,7 +4849,12 @@ PAGE_BODY = r"""
             <label class="fld"><span class="lab">mark <span class="sub">1-2 chars/glyph, optional</span></span><input type="text" id="ch_avatar" maxlength="2" placeholder="A"></label>
             <label class="fld"><span class="lab">default model <span class="sub">optional</span></span><select id="ch_model"></select></label>
             <label class="fld"><span class="lab">system prompt</span><textarea id="ch_system"></textarea></label>
-            <div class="hintbox" style="margin-top:8px;">Macros (resolved when sending): <code>{{user}}</code> <code>{{char}}</code> <code>{{model}}</code> <code>{{time}}</code> <code>{{date}}</code> <code>{{weekday}}</code> <code>{{random:a,b,c}}</code> <code>{{roll:2d6}}</code> <code>{{newline}}</code></div>
+            <div class="hintbox" style="margin-top:8px;">Macros (resolved when sending): <code>{{user}}</code> <code>{{char}}</code> <code>{{model}}</code> <code>{{date}}</code> <code>{{weekday}}</code> <code>{{random:a,b,c}}</code> <code>{{roll:2d6}}</code> <code>{{newline}}</code></div>
+            <div class="fld" style="margin-top:12px;"><span class="lab">knowledge <span class="sub">documents searched each turn; best matches are shown to the model</span></span>
+              <div id="ch_klist"></div>
+              <div style="margin-top:6px;"><button class="mini" id="ch_kadd" type="button">+ add document</button>
+                <input type="file" id="ch_kfile" style="display:none" multiple accept=".txt,.md,.markdown,.text,.csv,.tsv,.json,.log,.rst,.yaml,.yml,.pdf"></div>
+            </div>
             <div class="toggle-row" id="ch_sitewrap" style="display:none;"><input type="checkbox" id="ch_site"><label for="ch_site" style="cursor:pointer;">make site-wide (all users, read-only to them)</label></div>
             <div class="edit-row" style="margin-top:14px;"><button class="btn-primary" id="ch_save">save character</button><button class="btn-ghost" id="ch_cancel">cancel</button></div>
           </div>
@@ -3808,10 +4873,22 @@ PAGE_BODY = r"""
           <div class="fld"><span class="lab">default sampler parameters</span><div class="params-grid" id="def_params"></div>
             <div class="params-foot"><button class="mini" id="def_defaults">server defaults</button><button class="mini" id="def_clear">clear</button></div>
           </div>
+          <label class="fld"><span class="lab">web search endpoint <span class="sub">SearXNG base URL (JSON api enabled) · blank disables the web_search tool</span></span>
+            <input type="text" id="def_search" placeholder="https://searx.example.com"></label>
           <div class="fld"><span class="lab">thinking-capable models <span class="sub">show a per-chat thinking toggle for these</span></span>
             <div class="hintbox" style="margin-top:6px;">Only enable for models whose chat template supports it (e.g. Qwen3, DeepSeek-R1). Sends <code>enable_thinking</code> to the endpoint.</div>
             <div class="model-pick" id="tm_pick"></div>
           </div>
+          <div class="fld"><span class="lab">vision-capable models <span class="sub">image attachments are sent as pixels to these; others get a text note</span></span>
+            <div class="model-pick" id="vm_pick"></div>
+          </div>
+          <label class="fld"><span class="lab">utility model <span class="sub">for titles + context summaries · blank = the chat's own model</span></span>
+            <input type="text" id="def_utility" placeholder="e.g. a small always-loaded model"></label>
+          <label class="fld"><span class="lab">embedding model <span class="sub">enables hybrid (semantic) knowledge retrieval via /v1/embeddings · blank = keyword only</span></span>
+            <input type="text" id="def_embed" placeholder="e.g. nomic-embed-text"></label>
+        </div>
+        <div class="tab-pane" id="tab-stats">
+          <div id="stats-body"></div>
         </div>
         <div class="tab-pane" id="tab-users">
           <div id="user-list"></div>
@@ -3907,7 +4984,11 @@ PAGE_JS1 = r"""<script>
 "use strict";
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 let CFG=null, current=null, busy=false, activeController=null;
-let convoCache=[], folderCache=[], collapsed={}, selMode=false, selected=new Set();
+let convoCache=[], folderCache=[], selMode=false, selected=new Set();
+let collapsed={};try{collapsed=JSON.parse(localStorage.getItem("oracle_collapsed"))||{};}catch(_){}
+function toggleFolder(id){collapsed[id]=!collapsed[id];if(!collapsed[id])delete collapsed[id];
+  try{localStorage.setItem("oracle_collapsed",JSON.stringify(collapsed));}catch(_){}
+  renderTree();}
 let pendingAtt=[];
 let autoScroll=true;   // pinned to bottom; user scrolling up unpins until they return to the bottom
 
@@ -3959,6 +5040,48 @@ function applyTheme(t){document.documentElement.setAttribute("data-theme",t);loc
   $("#themeicon").innerHTML=(t==="dark")?ICON_MOON:ICON_SUN;
   $$("#themeseg button").forEach(b=>b.classList.toggle("on",b.dataset.th===t));}
 function curTheme(){return document.documentElement.getAttribute("data-theme")||"dark";}
+// ---- custom palette: three picked colors; everything else derived so the scheme stays coherent
+const CUSTOM_DEFAULT={bg:"#100c08",text:"#e8ddc5",accent:"#cf8a3c"};
+function hex2rgb(h){h=(h||"").replace("#","");if(h.length===3)h=h.split("").map(c=>c+c).join("");const n=parseInt(h,16)||0;return [n>>16&255,n>>8&255,n&255];}
+function rgb2hex(r,g,b){return "#"+[r,g,b].map(v=>Math.round(Math.max(0,Math.min(255,v))).toString(16).padStart(2,"0")).join("");}
+function cmix(a,b,t){const A=hex2rgb(a),B=hex2rgb(b);return rgb2hex(A[0]+(B[0]-A[0])*t,A[1]+(B[1]-A[1])*t,A[2]+(B[2]-A[2])*t);}
+function clum(h){const c=hex2rgb(h);return (0.2126*c[0]+0.7152*c[1]+0.0722*c[2])/255;}
+function crgba(h,a){const c=hex2rgb(h);return "rgba("+c[0]+","+c[1]+","+c[2]+","+a+")";}
+function customVars(c){
+  const dark=clum(c.bg)<0.5;
+  return {"--bg":c.bg,"--text":c.text,"--accent":c.accent,
+    "--panel":cmix(c.bg,c.text,0.03),"--surface":cmix(c.bg,c.text,0.06),
+    "--surface2":cmix(c.bg,c.text,0.10),"--surface3":cmix(c.bg,c.text,0.14),
+    "--line":crgba(c.text,0.12),
+    "--muted":cmix(c.text,c.bg,0.35),"--faint":cmix(c.text,c.bg,0.48),"--dim":cmix(c.text,c.bg,0.58),
+    "--accent2":cmix(c.accent,c.text,0.35),"--accent-weak":crgba(c.accent,0.14),
+    "--on-accent":clum(c.accent)>0.45?"#141210":"#f6f4ef",
+    "--user":cmix(c.text,c.bg,0.2),"--bot":cmix(c.accent,c.text,0.15),
+    "--code-bg":dark?cmix(c.bg,"#000000",0.35):cmix(c.bg,"#000000",0.05),
+    "color-scheme":dark?"dark":"light"};
+}
+function getCustom(){try{return Object.assign({},CUSTOM_DEFAULT,JSON.parse(localStorage.getItem("oracle_custom")||"{}"));}catch(_){return Object.assign({},CUSTOM_DEFAULT);}}
+function applyCustom(){
+  const v=customVars(getCustom()),s=document.documentElement.style;
+  for(const k in v)s.setProperty(k,v[k]);
+  // pre-derived map for the pre-paint boot script, so a reload can apply it without any color math
+  try{localStorage.setItem("oracle_custom_vars",JSON.stringify(v));}catch(_){}
+}
+function clearCustom(){
+  const s=document.documentElement.style;
+  Object.keys(customVars(CUSTOM_DEFAULT)).forEach(k=>s.removeProperty(k));
+}
+function applyPalette(p){
+  if(!p)p="sepia";
+  const d=document.documentElement;
+  if(p==="custom"){d.removeAttribute("data-palette");applyCustom();}
+  else{clearCustom();if(p==="sepia")d.removeAttribute("data-palette");else d.setAttribute("data-palette",p);}
+  localStorage.setItem("oracle_palette",p);
+  $$("#palseg button").forEach(b=>b.classList.toggle("on",b.dataset.pal===p));
+  const w=$("#custwrap");if(w)w.style.display=(p==="custom")?"block":"none";
+  if(p==="custom"){const c=getCustom();if($("#cp_bg")){$("#cp_bg").value=c.bg;$("#cp_text").value=c.text;$("#cp_accent").value=c.accent;}}
+}
+function curPalette(){return localStorage.getItem("oracle_palette")||"sepia";}
 function applyFS(v){v=Math.max(0.85,Math.min(1.5,v));document.documentElement.style.setProperty("--rs",v);localStorage.setItem("oracle_fs",v);
   const r=$("#fs_range");if(r)r.value=v;}
 function curFS(){return parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--rs"))||1;}
@@ -4040,9 +5163,9 @@ function renderTree(){
     const col=collapsed[f.id];
     fol.innerHTML='<div class="folder-head'+(col?' collapsed':'')+'"><span class="tw">&#9662;</span><span class="fname">'+esc(f.name)+'</span><span class="cnt">'+items.length+'</span><button class="fmenu">&#8943;</button></div><div class="folder-body'+(col?' hidden':'')+'"></div>';
     const head=fol.querySelector(".folder-head"),body=fol.querySelector(".folder-body");
-    head.onclick=e=>{if(e.target.classList.contains("fmenu"))return;collapsed[f.id]=!collapsed[f.id];renderTree();};
+    head.onclick=e=>{if(e.target.classList.contains("fmenu"))return;toggleFolder(f.id);};
     head.tabIndex=0;
-    head.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();collapsed[f.id]=!collapsed[f.id];renderTree();}});
+    head.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggleFolder(f.id);}});
     head.querySelector(".fmenu").onclick=e=>{e.stopPropagation();folderMenu(e,f);};
     items.forEach(c=>body.appendChild(convoRow(c)));
     setupDrop(fol,f.id);tree.appendChild(fol);
@@ -4258,6 +5381,7 @@ function metaLine(m){
   if(x.elapsed_ms!=null)b.push('<span class="pill">'+(x.elapsed_ms/1000).toFixed(1)+'s</span>');
   if(x.completion_tokens!=null)b.push('<span class="pill" title="'+(x.tokens_est?'estimated':'reported')+'">'+(x.tokens_est?"~":"")+fmtNum(x.completion_tokens)+' tok</span>');
   if(x.tps)b.push('<span class="pill">'+x.tps+' tok/s</span>');
+  if(x.cached_tokens!=null&&x.prompt_tokens)b.push('<span class="pill" title="prompt tokens served from the model server’s prefix cache">'+Math.round(100*x.cached_tokens/x.prompt_tokens)+'% cache</span>');
   let tip=[];if(x.ttft_ms!=null)tip.push("ttft "+(x.ttft_ms/1000).toFixed(2)+"s");if(x.prompt_tokens!=null)tip.push("prompt "+fmtNum(x.prompt_tokens)+" tok");
   return '<div class="meta" title="'+esc(tip.join(" · "))+'">'+b.join("")+'</div>';
 }
@@ -4283,7 +5407,7 @@ function msgEl(m,i){
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span>'+sibNav(m)+'<span class="tm">'+esc(fmtTime(m.ts)+edited)+'</span>'+mark+'</div>'+
     reason+attsHtml(m)+body+metaLine(m)+
     '<div class="actions"><button data-act="copy">copy</button>'+
-    (m.role==="assistant"?'<button data-act="raw">raw</button><button data-act="continue" title="keep generating from the end of this message (prefill)">continue</button><button data-act="regen">regenerate</button>'+rateBtns:'')+
+    (m.role==="assistant"?'<button data-act="raw">raw</button><button data-act="continue" title="keep generating from the end of this message (prefill)">continue</button><button data-act="regen">regenerate</button><button data-act="regenwith" title="regenerate this reply with a different model (for side-by-side comparison via the branch switcher)">model&#8230;</button>'+rateBtns:'')+
     '<button data-act="edit">edit</button><button data-act="del" class="danger">delete</button></div>';
   d.querySelectorAll(".actions button").forEach(b=>b.onclick=()=>handleAction(b.dataset.act,m,d,b));
   d.querySelectorAll("[data-sib]").forEach(b=>b.onclick=()=>{if(b.disabled)return;switchSibling(m.siblings[m.sib_index+(b.dataset.sib==="next"?1:-1)]);});
@@ -4301,6 +5425,7 @@ function handleAction(act,m,d,btn){
   if(act==="raw"){const b=d.querySelector(".bubble");if(b.classList.contains("raw")){b.classList.remove("raw");b.innerHTML=md(m.content);addCodeCopy(d);btn.textContent="raw";}else{b.classList.add("raw");b.textContent=m.content;btn.textContent="markdown";}return;}
   if(act==="edit"){startEdit(m,d);return;}
   if(act==="regen"){regenerate(m);return;}
+  if(act==="regenwith"){regenWithModel(m);return;}
   if(act==="continue"){continueMsg(m);return;}
   if(act==="up"){rate(m,(m.rating>0)?0:1);return;}
   if(act==="down"){rate(m,(m.rating<0)?0:-1);return;}
@@ -4331,7 +5456,7 @@ function fmtK(n){n=Math.round(n||0);if(n<1000)return ""+n;if(n<10000)return (n/1
 function estTok(s){return Math.max(1,Math.round((s||"").length/4));}
 function stripTC(s){return (s||"").replace(/<tool_call>[\s\S]*?<\/tool_call>/g,"").replace(/<tool_call>[\s\S]*$/,"").trim();}
 function fileToB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(",")[1]||"");r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(file);});}
-function pendingReady(){return pendingAtt.filter(a=>!a.busy&&!a.error&&a.text);}
+function pendingReady(){return pendingAtt.filter(a=>!a.busy&&!a.error&&(a.text||a.image));}
 function clearPending(){pendingAtt=[];renderPending();}
 function renderPending(){
   const box=$("#pending");if(!box)return;box.innerHTML="";
@@ -4347,6 +5472,16 @@ function renderPending(){
 async function uploadFiles(files){
   for(const f of files){
     const item={name:f.name,busy:true};pendingAtt.push(item);renderPending();
+    if(/^image\//.test(f.type||"")){
+      try{
+        if(f.size>6*1024*1024)throw new Error("image over 6 MB");
+        const url=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result));r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(f);});
+        Object.assign(item,{busy:false,image:url,tokens_est:1024});
+        const vm=CFG.vision_models||[];
+        if(current&&vm.indexOf(current.model)<0)toast("note: "+(current.model||"this model")+" isn\u2019t marked vision-capable \u2014 the image will only be mentioned by name",6000);
+      }catch(e){item.busy=false;item.error=(e.message||"failed").slice(0,40);toast(f.name+": "+(e.message||"failed"));}
+      renderPending();continue;
+    }
     try{
       const data=await fileToB64(f);
       const r=await api("POST","/api/extract",{name:f.name,data});
@@ -4380,7 +5515,9 @@ function updateCtx(){
 }
 function attsHtml(m){
   if(!m.attachments||!m.attachments.length)return "";
-  return '<div class="atts">'+m.attachments.map(a=>{const tx=a.text||"";return '<details><summary>&#9636; '+esc(a.name)+' <span style="color:var(--faint)">~'+fmtK(estTok(tx))+' tok</span></summary><pre class="atxt">'+esc(tx.slice(0,20000))+(tx.length>20000?"\n…":"")+'</pre></details>';}).join("")+'</div>';
+  return '<div class="atts">'+m.attachments.map(a=>{
+    if(a.image)return '<img class="attimg" src="'+esc(a.image)+'" alt="'+esc(a.name||"image")+'" title="'+esc(a.name||"")+'">';
+    const tx=a.text||"";return '<details><summary>&#9636; '+esc(a.name)+' <span style="color:var(--faint)">~'+fmtK(estTok(tx))+' tok</span></summary><pre class="atxt">'+esc(tx.slice(0,20000))+(tx.length>20000?"\n…":"")+'</pre></details>';}).join("")+'</div>';
 }
 function toolResultEl(m){
   const t=m.tool||{},ui=t.ui||{},ok=ui.ok!==false;
@@ -4395,7 +5532,7 @@ function liveWrap(){let w=$("#log").querySelector(".wrap");if(!w){const l=$("#lo
 function appendLive(){
   const stick=autoScroll;const wrap=liveWrap();
   const ch=charById(current.character_id);const role=ch?ch.name:"oracle";
-  const d=document.createElement("div");d.className="msg assistant";
+  const d=document.createElement("div");d.className="msg assistant tmpnode";
   // reasoning streams into a real <details>, open, in its finished italic-quote form; it auto-collapses
   // when the answer begins (still re-expandable).
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div>'+
@@ -4405,18 +5542,18 @@ function appendLive(){
   return {bubble:d.querySelector(".bubble"),reasonBox:d.querySelector(".reason"),reason:d.querySelector(".rbody"),started:false,reasonCollapsed:false};
 }
 function appendThinking(){
-  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking";
+  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking tmpnode";
   d.innerHTML='<div class="thinkrow"><span class="thinkdot"></span><span class="tlabel">thinking…</span></div>';
   w.appendChild(d);if(autoScroll)scrollDown();return d;
 }
 function showNotice(msg){
   // non-fatal context-window warning, shown inline just above the incoming reply
   const w=liveWrap();let n=w.querySelector(".ctx-notice");
-  if(!n){n=document.createElement("div");n.className="ctx-notice";}
+  if(!n){n=document.createElement("div");n.className="ctx-notice tmpnode";}
   n.textContent="⚠ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
 }
 function appendToolStep(tc){
-  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant";
+  const w=liveWrap();const d=document.createElement("div");d.className="msg assistant tmpnode";
   const url=(tc.args&&tc.args.url)?tc.args.url:"";
   d.innerHTML='<div class="toolstep"><div class="summary" style="padding:8px 11px;display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--accent2)"><span class="toolspin"></span> <span class="tlabel">'+esc(tc.name||"tool")+(url?" "+esc(url):"")+'…</span></div></div>';
   w.appendChild(d);return d;
@@ -4447,6 +5584,31 @@ async function streamRequest(path,body,handlers,signal){
   if(errMsg){const ex=new Error(errMsg);ex.convo=result&&result.convo;throw ex;}
   return result;
 }
+// Throttled live-markdown: re-render the accumulating reply as markdown every ~250ms (backing off
+// for very long replies) instead of once at the end. Raw text nodes stream in between renders
+// until the first render lands, so nothing ever looks stalled.
+function scheduleMd(L){
+  if(L._mdT)return;
+  const wait=(L.acc&&L.acc.length>30000)?900:250;
+  L._mdT=setTimeout(()=>{L._mdT=null;
+    try{L.bubble.innerHTML=md(stripTC(L.acc||""));L._mdDone=true;}
+    catch(_){L.bubble.textContent=stripTC(L.acc||"");}
+    scheduleScroll();},wait);
+}
+function maybeAskNotif(){
+  if(!("Notification" in window))return;
+  if(Notification.permission==="default"&&!localStorage.getItem("oracle_notif_asked")){
+    localStorage.setItem("oracle_notif_asked","1");
+    try{Notification.requestPermission();}catch(_){}
+  }
+}
+function notifyDone(ok){
+  if(!("Notification" in window)||Notification.permission!=="granted"||!document.hidden)return;
+  try{
+    const n=new Notification("ORACLE",{body:ok?((current&&current.title)||"reply finished"):"generation failed",tag:"oracle-done"});
+    n.onclick=()=>{try{window.focus();}catch(_){}n.close();};
+  }catch(_){}
+}
 async function streamTurn(body){
   let live=null,think=null,racc="";const toolEls={};
   function clearThink(){if(think){think.remove();think=null;}}
@@ -4461,11 +5623,10 @@ async function streamTurn(body){
       onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;
           if(L.reasonBox&&racc&&!L.reasonCollapsed){L.reasonBox.open=false;L.reasonCollapsed=true;}}  // answer began -> fold the reasoning
         L.acc=(L.acc||"")+d;
-        // append just the new text instead of re-assigning the whole reply each token (O(n) not O(n²));
-        // the full rewrite only happens in the rare case a <tool_call> tag must be stripped out
+        // cheap per-token append keeps latency flat; the markdown re-render is throttled separately
         if(L.acc.indexOf("<tool_call>")>=0)L.bubble.textContent=stripTC(L.acc);
-        else L.bubble.appendChild(document.createTextNode(d));
-        scheduleScroll();},
+        else if(!L._mdDone)L.bubble.appendChild(document.createTextNode(d));
+        scheduleMd(L);scheduleScroll();},
       onReason:r=>{const L=bubble();racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}
         if(L.reason)L.reason.appendChild(document.createTextNode(r));
         scheduleScroll();},
@@ -4492,17 +5653,48 @@ function showStreamError(msg){
   const w=liveWrap();const n=document.createElement("div");n.className="ctx-notice";
   n.textContent="✕ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
 }
+function appendFinal(){
+  const wrap=$("#log").querySelector(".wrap");
+  if(!wrap){renderConvo();return;}
+  wrap.querySelectorAll('.tmpnode,[data-id="tmp"]').forEach(n=>n.remove());
+  const have=new Set(Array.from(wrap.querySelectorAll("[data-id]")).map(n=>n.dataset.id));
+  let added=false;
+  (current.messages||[]).forEach((m,i)=>{
+    if(!["user","assistant","tool"].includes(m.role)||have.has(m.id))return;
+    wrap.appendChild(msgEl(m,i));added=true;
+  });
+  if(added)addCodeCopy(wrap);
+  syncBar();
+  if(autoScroll)scrollDown();
+}
 async function runStream(body,optimistic,restore){
   if(busy||!current)return;setBusy(true);
+  maybeAskNotif();
   if(optimistic)optimistic();
   try{const {res,stopped}=await streamTurn(body);
-    if(res&&res.convo){current=res.convo;renderConvo();}else await openConvo(current.id);
+    if(res&&res.convo){
+      current=res.convo;
+      // plain sends append in place instead of rebuilding the whole DOM (matters on long chats);
+      // branch-structure changes (regen/edit/continue) still re-render fully
+      const plain=!body.regenerate_id&&!body.edit_user_id&&!body.continue_id&&!body.regenerate;
+      if(plain)appendFinal();else renderConvo();
+    }else await openConvo(current.id);
+    if(!stopped)notifyDone(true);
     refreshList();
+    // the server generates the real title in the background after `done` on a first exchange —
+    // poll it in shortly (twice, in case the title model is cold) instead of blocking the stream
+    if(res&&res.convo&&(res.convo.messages||[]).filter(m=>m.role==="assistant").length===1){
+      const tcid=res.convo.id;
+      const pickup=async()=>{try{const c2=await api("GET","/api/conversations/"+tcid);
+        if(current&&current.id===tcid&&c2.title!==current.title){current.title=c2.title;syncBar();}refreshList();}catch(_){}};
+      setTimeout(pickup,4000);setTimeout(pickup,15000);
+    }
   }catch(e){
     const kept=!!e.convo;   // server persisted the turn (incl. any partial reply) before failing
     if(kept){current=e.convo;renderConvo({stick:false});}
     else{try{await openConvo(current.id);}catch(_){}}
     showStreamError(e.message||"stream failed");
+    notifyDone(false);
     if(!kept&&restore)restore();   // nothing saved server-side -> put the draft back
     toast(e.message||"stream failed",4000,'err');
     refreshList();
@@ -4519,8 +5711,8 @@ async function send(){
     catch(e){toast(e.message,4000,'err');return;}
     finally{send._creating=false;}
   }
-  $("#input").value="";$("#input").style.height="auto";
-  const sendAtts=atts.map(a=>({name:a.name,text:a.text}));
+  $("#input").value="";$("#input").style.height="auto";saveDraft();
+  const sendAtts=atts.map(a=>a.image?{name:a.name,image:a.image}:{name:a.name,text:a.text});
   const restorable=pendingAtt.slice();
   clearPending();
   runStream({content:text,attachments:sendAtts},
@@ -4530,6 +5722,15 @@ async function send(){
 function regenerate(m){
   const idx=current.messages.findIndex(x=>x.id===m.id);
   runStream({regenerate_id:m.id},()=>{if(idx>=0)current.messages=current.messages.slice(0,idx);renderConvo({stick:true});});
+}
+async function regenWithModel(m){
+  // one-off model override: the reply forks as a sibling branch, so the switcher becomes an A/B view
+  const models=(CFG.models||[]).filter(Boolean);
+  if(!models.length){toast("no models available");return;}
+  const pick=await uiSelect("Regenerate this reply with:",models.map(v=>({value:v,label:v+(v===current.model?"  (current)":"")})),{title:"Regenerate with model"});
+  if(!pick)return;
+  const idx=current.messages.findIndex(x=>x.id===m.id);
+  runStream({regenerate_id:m.id,model:pick},()=>{if(idx>=0)current.messages=current.messages.slice(0,idx);renderConvo({stick:true});});
 }
 function continueMsg(m){
   // resume generation from the end of this assistant message; the server appends to it in place
@@ -4542,7 +5743,21 @@ function resendEdited(mid,newContent){
   runStream({edit_user_id:mid,content:newContent},()=>{if(idx>=0){current.messages=current.messages.slice(0,idx);current.messages.push({id:"tmp",role:"user",content:newContent,ts:new Date().toISOString()});}renderConvo({stick:true});});
 }
 
-async function openConvo(id){current=await api("GET","/api/conversations/"+id);renderConvo({stick:true});renderTree();}
+// per-conversation composer drafts (this browser only, capped at the 20 most recent)
+let draftCid=null,_draftT=null;
+function saveDraft(){
+  if(!draftCid)return;
+  try{const d=JSON.parse(localStorage.getItem("oracle_drafts")||"{}");const t=$("#input").value;
+    if(t&&t.trim())d[draftCid]=t;else delete d[draftCid];
+    const ks=Object.keys(d);while(ks.length>20)delete d[ks.shift()];
+    localStorage.setItem("oracle_drafts",JSON.stringify(d));}catch(_){}
+}
+function loadDraft(cid){
+  draftCid=cid;
+  try{const d=JSON.parse(localStorage.getItem("oracle_drafts")||"{}");
+    const inp=$("#input");if(inp.value!==(d[cid]||"")){inp.value=d[cid]||"";inp.style.height="auto";inp.dispatchEvent(new Event("input"));}}catch(_){}
+}
+async function openConvo(id){saveDraft();current=await api("GET","/api/conversations/"+id);loadDraft(id);renderConvo({stick:true});renderTree();}
 async function newChat(){
   // reuse an existing empty conversation instead of stacking blank rows in the sidebar
   const empty=convoCache.find(c=>!c.turns&&!c.character_id);
@@ -4711,6 +5926,13 @@ async function openDrawer(){
   $("#d_tools").onchange=()=>applyDrawer({tools:$("#d_tools").checked});
   $("#d_think").onchange=()=>{const v=$("#d_think").value;applyDrawer({think:v===""?null:(v==="1"?1:0)});};
   syncThinkRow();
+  // rolling context summary: only shown once compression has produced one for this chat
+  const sw=$("#d_summary_wrap");
+  if(current.ctx_summary){sw.style.display="block";$("#d_summary").value=current.ctx_summary;}
+  else sw.style.display="none";
+  $("#d_summary_save").onclick=async()=>{try{current=await api("POST","/api/conversations/"+current.id+"/settings",{ctx_summary:$("#d_summary").value});toast("summary saved");}catch(e){toast(e.message);}};
+  $("#d_summary_clear").onclick=async()=>{if(!await uiConfirm("Clear the rolling summary? The model will re-summarize from scratch next time the window overflows.",{ok:"Clear"}))return;
+    try{current=await api("POST","/api/conversations/"+current.id+"/settings",{ctx_summary:""});$("#d_summary").value="";sw.style.display="none";toast("summary cleared");}catch(e){toast(e.message);}};
   buildParamsGrid($("#d_params"),current.params||{});
   buildPresetSelect();
   showOverlay($("#drawer"));
@@ -4776,7 +5998,7 @@ PAGE_JS3 = r"""
 // ---------------- settings modal
 function buildTabs(){
   const tabs=[{id:"account",t:"account"},{id:"appearance",t:"appearance"},{id:"characters",t:"characters"}];
-  if(isAdmin())tabs.push({id:"models",t:"user models"},{id:"endpoints",t:"endpoints"},{id:"defaults",t:"defaults"},{id:"users",t:"users"});
+  if(isAdmin())tabs.push({id:"models",t:"user models"},{id:"endpoints",t:"endpoints"},{id:"defaults",t:"defaults"},{id:"users",t:"users"},{id:"stats",t:"stats"});
   $("#tabs").innerHTML=tabs.map((x,i)=>'<button data-tab="'+x.id+'"'+(i===0?' class="active"':'')+'>'+x.t+'</button>').join("");
   $$("#tabs button").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
   $("#ch_sitewrap").style.display=isAdmin()?"flex":"none";
@@ -4787,11 +6009,25 @@ function switchTab(name){
   $("#settings-save").style.display=["models","endpoints","defaults"].includes(name)?"block":"none";
   $("#settings-note").textContent="";
   if(name==="users"){loadUsers();loadInvites();}
+  if(name==="stats")loadStats();
+}
+async function loadStats(){
+  const el=$("#stats-body");el.innerHTML='<div class="hintbox">loading…</div>';
+  try{
+    const s=await api("GET","/api/stats");
+    if(!s.models.length){el.innerHTML='<div class="hintbox">no replies recorded yet</div>';return;}
+    let h='<table class="stats-table"><tr><th>model</th><th>replies</th><th>tokens</th><th>30d replies</th><th>tok/s</th><th>ttft</th><th>cache</th></tr>';
+    s.models.forEach(m=>{h+='<tr><td class="mono">'+esc(m.model)+'</td><td>'+fmtNum(m.replies)+'</td><td>'+fmtNum(m.tokens)+'</td><td>'+fmtNum(m.replies_30d)+'</td>'+
+      '<td>'+(m.avg_tps!=null?m.avg_tps:"–")+'</td><td>'+(m.avg_ttft_ms!=null?(m.avg_ttft_ms/1000).toFixed(1)+"s":"–")+'</td>'+
+      '<td>'+(m.avg_cache_pct!=null?m.avg_cache_pct+"%":"–")+'</td></tr>';});
+    h+='</table><div class="hintbox" style="margin-top:10px;">'+fmtNum(s.totals.replies)+' replies · '+fmtNum(s.totals.tokens)+' completion tokens all-time. Averages cover replies that reported the metric.</div>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='<div class="hintbox">'+esc(e.message)+'</div>';}
 }
 function openSettings(tab){
   renderCharacters();
-  applyTheme(curTheme());applyFont(curFont());if($("#fs_range"))$("#fs_range").value=curFS();if($("#cw_range"))$("#cw_range").value=curCW();
-  if(isAdmin()){renderEndpoints();$("#def_model").value=CFG.settings.default_model||"";$("#def_system").value=CFG.settings.default_system||"";buildParamsGrid($("#def_params"),CFG.settings.default_params||{});renderUserModels();renderThinkingModels();}
+  applyTheme(curTheme());applyPalette(curPalette());applyFont(curFont());syncTotpUI();syncPushUI();if($("#fs_range"))$("#fs_range").value=curFS();if($("#cw_range"))$("#cw_range").value=curCW();
+  if(isAdmin()){renderEndpoints();$("#def_model").value=CFG.settings.default_model||"";$("#def_system").value=CFG.settings.default_system||"";$("#def_search").value=CFG.settings.search_url||"";$("#def_utility").value=CFG.settings.utility_model||"";$("#def_embed").value=CFG.settings.embed_model||"";buildParamsGrid($("#def_params"),CFG.settings.default_params||{});renderUserModels();renderThinkingModels();renderVisionModels();}
   switchTab(tab||"account");showModal();
 }
 // characters
@@ -4811,7 +6047,23 @@ function editCharacter(c){c=c||{id:"",name:"",avatar:"",model:"",system:"",scope
   const ms=$("#ch_model");ms.innerHTML='<option value="">(keep the chat\'s model)</option>';
   (CFG.all_models||CFG.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;ms.appendChild(o);});
   $("#ch_id").value=c.id||"";$("#ch_name").value=c.name||"";$("#ch_avatar").value=c.avatar||"";ms.value=c.model||"";$("#ch_system").value=c.system||"";$("#ch_site").checked=c.scope==="site";
+  renderKnowledge(c);
   $("#char-edit").style.display="block";$("#ch_name").focus();}
+let editingCharId=null;
+function renderKnowledge(c){
+  editingCharId=(c&&c.id)||null;
+  const wrap=$("#ch_klist");if(!wrap)return;wrap.innerHTML="";
+  if(!editingCharId){wrap.innerHTML='<div class="hintbox">save the character first, then add documents</div>';$("#ch_kadd").disabled=true;return;}
+  $("#ch_kadd").disabled=false;
+  const items=c.knowledge||[];
+  if(!items.length){wrap.innerHTML='<div class="hintbox">no documents yet — txt, md, pdf, csv…</div>';return;}
+  items.forEach(k=>{
+    const row=document.createElement("div");row.className="krow";
+    row.innerHTML='<span class="kn">'+esc(k.name)+'</span><span class="kc">'+fmtNum(k.chars)+' chars</span><button class="mini danger" type="button">remove</button>';
+    row.querySelector("button").onclick=async()=>{
+      try{const r=await api("DELETE","/api/characters/"+c.id+"/knowledge/"+k.id);c.knowledge=r.knowledge;renderKnowledge(c);}catch(e){toast(e.message);}};
+    wrap.appendChild(row);});
+}
 async function saveCharacter(){
   const ch={id:$("#ch_id").value||undefined,name:$("#ch_name").value.trim()||"Untitled",avatar:$("#ch_avatar").value.trim(),model:$("#ch_model").value.trim()||null,system:$("#ch_system").value,scope:(isAdmin()&&$("#ch_site").checked)?"site":"private"};
   try{const r=await api("POST","/api/characters",{character:ch});CFG.characters=r.characters;$("#char-edit").style.display="none";renderCharacters();toast("saved");}catch(e){toast(e.message);}}
@@ -4823,6 +6075,8 @@ async function applyCharacter(c){
 function renderUserModels(){const wrap=$("#um_pick");wrap.innerHTML="";const wl=new Set(CFG.settings.user_models||[]);
   (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(wl.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
 function renderThinkingModels(){const wrap=$("#tm_pick");if(!wrap)return;wrap.innerHTML="";const wl=new Set(CFG.settings.thinking_models||[]);
+  (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(wl.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
+function renderVisionModels(){const wrap=$("#vm_pick");if(!wrap)return;wrap.innerHTML="";const wl=new Set(CFG.settings.vision_models||[]);
   (CFG.all_models||CFG.models||[]).forEach(m=>wrap.insertAdjacentHTML("beforeend",'<label><input type="checkbox" value="'+esc(m)+'" '+(wl.has(m)?"checked":"")+'>'+esc(m)+'</label>'));}
 function readModelPick(wrap){return Array.from(wrap.querySelectorAll("input:checked")).map(i=>i.value);}
 // endpoints
@@ -4849,7 +6103,9 @@ async function saveSettings(){
   const body={endpoints:CFG.settings.endpoints,active_endpoint:CFG.settings.active_endpoint,
     default_model:$("#def_model").value.trim(),default_system:$("#def_system").value,
     default_params:readParamsGrid($("#def_params")),user_models:readModelPick($("#um_pick")),
-    thinking_models:readModelPick($("#tm_pick"))};
+    thinking_models:readModelPick($("#tm_pick")),vision_models:readModelPick($("#vm_pick")),
+    search_url:$("#def_search").value.trim(),utility_model:$("#def_utility").value.trim(),
+    embed_model:$("#def_embed").value.trim()};
   try{const r=await api("POST","/api/settings",body);CFG.settings=r.settings;CFG.all_models=r.all_models;
     CFG.default_model=r.settings.default_model;CFG.default_system=r.settings.default_system;CFG.default_params=r.settings.default_params;
     $("#settings-note").textContent="saved";toast("settings saved");}catch(e){toast(e.message);}}
@@ -5035,6 +6291,130 @@ $("#settings-save").onclick=saveSettings;
 $("#char-add").onclick=()=>editCharacter(null);
 $("#ch_save").onclick=saveCharacter;
 $("#ch_cancel").onclick=()=>$("#char-edit").style.display="none";
+// ---------------- TOTP 2FA
+function syncTotpUI(){
+  const on=!!(CFG.me&&CFG.me.totp);
+  $("#totp_off").style.display=on?"none":"block";
+  $("#totp_on").style.display=on?"block":"none";
+  $("#totp_setup").style.display="none";
+}
+$("#totp_enable").onclick=async()=>{
+  try{const r=await api("POST","/api/account/totp/setup",{});
+    $("#totp_secret").textContent=r.secret;$("#totp_setup").dataset.secret=r.secret;
+    $("#totp_off").style.display="none";$("#totp_setup").style.display="block";$("#totp_code").focus();
+  }catch(e){toast(e.message);}};
+$("#totp_cancel").onclick=()=>syncTotpUI();
+$("#totp_confirm").onclick=async()=>{
+  try{const r=await api("POST","/api/account/totp/confirm",{secret:$("#totp_setup").dataset.secret,code:$("#totp_code").value});
+    CFG.me=r.me;$("#totp_code").value="";syncTotpUI();toast("two-factor enabled");
+  }catch(e){toast(e.message,5000,'err');}};
+$("#totp_disable").onclick=async()=>{
+  try{const r=await api("POST","/api/account/totp/disable",{password:$("#totp_pw").value});
+    CFG.me=r.me;$("#totp_pw").value="";syncTotpUI();toast("two-factor disabled");
+  }catch(e){toast(e.message,5000,'err');}};
+// ---------------- web push
+function b64uToU8(s){s=s.replace(/-/g,"+").replace(/_/g,"/");s+="=".repeat((4-s.length%4)%4);
+  const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
+async function syncPushUI(){
+  const wrap=$("#push_wrap"),t=$("#push_toggle");
+  if(!("serviceWorker" in navigator)||!("PushManager" in window)){wrap.style.display="none";return;}
+  try{
+    const k=await api("GET","/api/push/key");
+    if(!k.key){wrap.style.display="none";return;}
+    wrap.dataset.key=k.key;
+    const reg=await navigator.serviceWorker.ready;
+    t.checked=!!(await reg.pushManager.getSubscription());
+  }catch(_){wrap.style.display="none";}
+}
+$("#push_toggle").onchange=async()=>{
+  const t=$("#push_toggle");
+  try{
+    const reg=await navigator.serviceWorker.ready;
+    if(t.checked){
+      if(Notification.permission==="denied")throw new Error("notifications are blocked for this site in the browser");
+      const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64uToU8($("#push_wrap").dataset.key)});
+      await api("POST","/api/push/subscribe",{subscription:sub.toJSON()});toast("push enabled on this device");
+    }else{
+      const sub=await reg.pushManager.getSubscription();
+      if(sub){await api("POST","/api/push/unsubscribe",{endpoint:sub.endpoint});await sub.unsubscribe();}
+      toast("push disabled");
+    }
+  }catch(e){t.checked=!t.checked;toast(e.message,5000,'err');}
+};
+$("#ch_kadd").onclick=()=>$("#ch_kfile").click();
+$("#ch_kfile").onchange=async e=>{
+  const c=(CFG.characters||[]).find(x=>x.id===editingCharId);
+  if(!c){e.target.value="";return;}
+  for(const f of Array.from(e.target.files)){
+    if(f.size>12*1024*1024){toast(f.name+": over the 12 MB limit",4000,'err');continue;}
+    const data=await new Promise(res=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(",")[1]);r.readAsDataURL(f);});
+    try{const r=await api("POST","/api/characters/"+c.id+"/knowledge",{name:f.name,data});c.knowledge=r.knowledge;renderKnowledge(c);toast("added "+f.name);}
+    catch(err){toast(f.name+": "+err.message,5000,'err');}
+  }
+  e.target.value="";
+};
+// ---------------- chat import (ChatGPT export / SillyTavern jsonl / generic {messages})
+function parseImportFile(name,txt){
+  const convs=[];
+  if(name.endsWith(".jsonl")){          // SillyTavern chat log
+    const msgs=[];let title=null;
+    for(const line of txt.split("\n")){
+      if(!line.trim())continue;
+      let o;try{o=JSON.parse(line);}catch(_){continue;}
+      if(o.user_name!==undefined&&o.character_name!==undefined){title=o.character_name;continue;}
+      if(o.mes!==undefined)msgs.push({role:o.is_user?"user":"assistant",content:String(o.mes)});
+    }
+    if(msgs.length)convs.push({title:title||name.replace(/\.jsonl$/,""),messages:msgs});
+    return convs;
+  }
+  const data=JSON.parse(txt);
+  const fromMapping=c=>{                // ChatGPT export: walk current_node -> parent chain
+    const msgs=[];let node=c.current_node;
+    while(node&&c.mapping&&c.mapping[node]){
+      const n=c.mapping[node],m=n.message;
+      if(m&&m.author&&["user","assistant","system"].includes(m.author.role)&&m.content&&Array.isArray(m.content.parts)){
+        const t=m.content.parts.filter(p=>typeof p==="string").join("\n").trim();
+        if(t&&!(m.metadata&&m.metadata.is_visually_hidden_from_conversation))msgs.push({role:m.author.role,content:t});
+      }
+      node=n.parent;
+    }
+    msgs.reverse();
+    return msgs.length?{title:c.title||"imported",messages:msgs}:null;
+  };
+  if(Array.isArray(data)){
+    for(const c of data){
+      if(c&&c.mapping){const v=fromMapping(c);if(v)convs.push(v);}
+      else if(c&&Array.isArray(c.messages))convs.push({title:c.title,messages:c.messages.map(m=>({role:m.role,content:String(m.content||"")}))});
+    }
+  }else if(data&&data.mapping){const v=fromMapping(data);if(v)convs.push(v);}
+  else if(data&&Array.isArray(data.conversations)){
+    for(const c of data.conversations)if(c&&Array.isArray(c.messages))convs.push({title:c.title,messages:c.messages.map(m=>({role:m.role,content:String(m.content||"")}))});
+  }else if(data&&Array.isArray(data.messages)){
+    convs.push({title:data.title,messages:data.messages.map(m=>({role:m.role,content:String(m.content||m.mes||"")}))});
+  }
+  return convs;
+}
+$("#imp_btn").onclick=()=>$("#imp_file").click();
+$("#imp_file").onchange=async e=>{
+  let convs=[];
+  for(const f of Array.from(e.target.files)){
+    try{convs=convs.concat(parseImportFile(f.name,await f.text()));}
+    catch(err){toast(f.name+": "+(err.message||"could not parse"),5000,'err');}
+  }
+  e.target.value="";
+  convs=convs.filter(c=>c&&c.messages&&c.messages.some(m=>["user","assistant"].includes(m.role)&&(m.content||"").trim()));
+  if(!convs.length){toast("no conversations found in the file",4000,'err');return;}
+  if(!await uiConfirm("Import "+convs.length+" conversation"+(convs.length>1?"s":"")+"?",{ok:"Import"}))return;
+  let done=0;
+  try{
+    for(let i=0;i<convs.length;i+=20){   // batches keep each request under the body-size cap
+      const r=await api("POST","/api/import",{conversations:convs.slice(i,i+20)});
+      done+=r.imported||0;
+    }
+  }catch(err){toast(err.message,5000,'err');}
+  toast("imported "+done+" conversation"+(done===1?"":"s"));
+  refreshList();
+};
 $("#def_defaults").onclick=()=>fillDefaults($("#def_params"));
 $("#def_clear").onclick=()=>buildParamsGrid($("#def_params"),{});
 $("#user-add").onclick=()=>editUser(null);
@@ -5048,6 +6428,12 @@ $("#ac_persona_save").onclick=savePersona;
 $("#acctdel").onclick=deleteAccount;
 $("#exportall").onclick=()=>{const a=document.createElement("a");a.href="/api/export";a.click();toast("exporting…");};
 $$("#themeseg button").forEach(b=>b.onclick=()=>applyTheme(b.dataset.th));
+$$("#palseg button").forEach(b=>b.onclick=()=>applyPalette(b.dataset.pal));
+["cp_bg","cp_text","cp_accent"].forEach(id=>{const el=$("#"+id);if(el)el.oninput=()=>{
+  const c=getCustom();c[id.slice(3)]=el.value;
+  try{localStorage.setItem("oracle_custom",JSON.stringify(c));}catch(_){}
+  applyCustom();};});
+if($("#cp_reset"))$("#cp_reset").onclick=()=>{localStorage.removeItem("oracle_custom");localStorage.removeItem("oracle_custom_vars");applyPalette("custom");};
 $$("#fontseg button").forEach(b=>b.onclick=()=>applyFont(b.dataset.f));
 $("#fs_range").addEventListener("input",e=>applyFS(parseFloat(e.target.value)));
 $("#fs_minus").onclick=()=>applyFS(curFS()-0.05);
@@ -5100,14 +6486,18 @@ document.addEventListener("keydown",e=>{
 
 (async function init(){
   applyTheme(localStorage.getItem("oracle_theme")||"dark");
+  applyPalette(curPalette());
   applyFont(curFont());
+  if("serviceWorker" in navigator){try{navigator.serviceWorker.register("/sw.js");}catch(_){}}
+  $("#input").addEventListener("input",()=>{clearTimeout(_draftT);_draftT=setTimeout(saveDraft,400);});
   applyFS(parseFloat(localStorage.getItem("oracle_fs"))||1);
   applyCW(parseInt(localStorage.getItem("oracle_cw"))||840);
   applySidebar();initResize();
   try{await loadConfig();}catch(e){
     $("#log").innerHTML='<div class="wrap"><div class="empty"><div class="glyph">!</div><h2>could not load</h2>'+
       '<p>'+esc(e.message||"network error")+'</p>'+
-      '<p style="margin-top:14px;"><button class="btn-ghost" onclick="location.reload()">retry</button></p></div></div>';
+      '<p style="margin-top:14px;"><button class="btn-ghost" id="retrybtn">retry</button></p></div></div>';
+    const rb=$("#retrybtn");if(rb)rb.onclick=()=>location.reload();
     return;
   }
   if(!CFG.models.length)toast("model endpoint unreachable — check Settings → Endpoints",6000,'err');
@@ -5122,6 +6512,7 @@ PAGE = PAGE_HEAD + PAGE_BODY + PAGE_JS1 + PAGE_JS2 + PAGE_JS3
 PAGE_BYTES = PAGE.encode("utf-8")
 PAGE_GZ = gzip.compress(PAGE_BYTES, 9)
 PAGE_ETAG = '"' + hashlib.sha1(PAGE_BYTES).hexdigest() + '"'
+PAGE_CSP = csp_for(PAGE)   # hash-based script-src, computed once (page is static)
 
 
 # ---------------------------------------------------------------- public share viewer
