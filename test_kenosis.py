@@ -465,6 +465,43 @@ class TestStatsAndBackup(_ConvoBase):
             k.BACKUP_DIR = old
 
 
+class TestPushEndpointAllowlist(unittest.TestCase):
+    def test_real_push_services_allowed(self):
+        for url in ("https://fcm.googleapis.com/fcm/send/abc",
+                    "https://updates.push.services.mozilla.com/wpush/v2/x",
+                    "https://web.push.apple.com/QOaZ",
+                    "https://db5p.notify.windows.com/w/?token=x"):
+            self.assertTrue(k.push_endpoint_allowed(url), url)
+
+    def test_ssrf_targets_rejected(self):
+        for url in ("https://192.168.1.1/admin", "https://localhost:8000/v1",
+                    "https://evil.example.com/", "https://fcm.googleapis.com.evil.com/",
+                    "https://user@fcm.googleapis.com@evil.com/", "http://fcm.googleapis.com/x", ""):
+            # http:// is stopped by the https prefix check at the endpoint; the helper itself
+            # must still refuse everything not on a known push-provider host
+            if url.startswith("http://"):
+                continue
+            self.assertFalse(k.push_endpoint_allowed(url), url)
+
+
+class TestShareCSP(unittest.TestCase):
+    def test_share_csp_from_template_not_rendered_page(self):
+        # a hostile <script> smuggled into share data must NOT gain a hash in the served CSP
+        sh = {"data": json.dumps({"title": "t", "messages": [
+                  {"role": "user", "content": "<script>alert(1)</script>"}]}),
+              "title": "t"}
+        page = k.render_share_page(sh)
+        # every EXECUTABLE script in the rendered page is covered by the precomputed template CSP
+        import re as _re
+        for attrs, body in _re.findall(r"<script([^>]*)>(.*?)</script>", page, _re.S):
+            if "application/json" in attrs or not body.strip():
+                continue
+            h = "'sha256-" + k.base64.b64encode(k.hashlib.sha256(body.encode()).digest()).decode() + "'"
+            self.assertIn(h, k.SHARE_CSP)
+        # and the injected payload is neutralized in the data island (no raw <script in the page)
+        self.assertNotIn("<script>alert", page)
+
+
 class TestCSP(unittest.TestCase):
     def test_hashes_not_unsafe_inline(self):
         csp = k.csp_for("<html><script>var a=1;</script></html>")

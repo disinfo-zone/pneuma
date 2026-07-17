@@ -93,10 +93,18 @@ CSP_TMPL = ("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ances
 
 @_functools.lru_cache(maxsize=64)
 def csp_for(html):
-    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
-    hashes = " ".join("'sha256-%s'" % base64.b64encode(hashlib.sha256(s.encode("utf-8")).digest()).decode("ascii")
-                      for s in scripts if s.strip())
-    return CSP_TMPL % (hashes or "'none'")
+    """CSP with script hashes. MUST only ever be called on static templates/constants — never on
+    HTML containing user data, or an injected <script> would be hashed and thereby allowed.
+    Non-executable script elements (e.g. type="application/json" data islands) are skipped, so a
+    template's CSP stays valid for rendered pages whose data island varies."""
+    hashes = []
+    for attrs, body in re.findall(r"<script([^>]*)>(.*?)</script>", html, re.S):
+        mtype = re.search(r'type\s*=\s*["\']([^"\']+)', attrs)
+        if mtype and mtype.group(1).strip().lower() not in ("text/javascript", "module", "application/javascript"):
+            continue   # data island, not executable
+        if body.strip():
+            hashes.append("'sha256-%s'" % base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii"))
+    return CSP_TMPL % (" ".join(hashes) or "'none'")
 
 # Attachments (uploaded files folded into a user turn) and the web-fetch tool.
 DEFAULT_CONTEXT = 8192               # fallback context window when /v1/models doesn't report one
@@ -1514,6 +1522,25 @@ def vapid_keys():
     return kp["private"], kp["public"]
 
 
+# Hosts the big browser engines actually use for Web Push. The server POSTs to whatever endpoint
+# a client registers, so anything outside this list is refused at subscribe time (SSRF guard).
+_PUSH_HOST_SUFFIXES = (
+    "fcm.googleapis.com",                  # Chrome / Chromium / Brave / Edge (new)
+    "updates.push.services.mozilla.com",   # Firefox
+    "push.services.mozilla.com",
+    "web.push.apple.com",                  # Safari
+    "notify.windows.com",                  # Edge (WNS)
+)
+
+
+def push_endpoint_allowed(endpoint):
+    try:
+        host = (urlparse(endpoint).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return bool(host) and any(host == s or host.endswith("." + s) for s in _PUSH_HOST_SUFFIXES)
+
+
 def push_notify(user_id, title, body, cid=None):
     """Send a web-push to every subscription of a user; dead subscriptions are pruned. Runs in a
     background thread — never on the request path."""
@@ -1525,6 +1552,10 @@ def push_notify(user_id, title, body, cid=None):
         subs = db().execute("SELECT endpoint, sub FROM push_subs WHERE user_id=?", (user_id,)).fetchall()
         payload = json.dumps({"title": title, "body": (body or "")[:160], "cid": cid})
         for row in subs:
+            if not push_endpoint_allowed(row["endpoint"]):   # also covers rows stored pre-allowlist
+                with db():
+                    db().execute("DELETE FROM push_subs WHERE endpoint=?", (row["endpoint"],))
+                continue
             try:
                 webpush(subscription_info=json.loads(row["sub"]), data=payload,
                         vapid_private_key=priv, vapid_claims={"sub": "mailto:admin@" + urlparse(PUBLIC_URL).netloc},
@@ -2547,9 +2578,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     db().execute("UPDATE shares SET views=views+1 WHERE token=?", (sh["token"],))
             except Exception:
                 log.exception("share view-count update failed")
-            page = render_share_page(sh)
-            return self._send(200, "text/html; charset=utf-8", page,
-                              [("Content-Security-Policy", csp_for(page)), ("X-Robots-Tag", "noindex, nofollow")])
+            # CSP comes from the static TEMPLATE, never the rendered page: hashing rendered output
+            # would auto-allow any script an attacker managed to inject into share content
+            return self._send(200, "text/html; charset=utf-8", render_share_page(sh),
+                              [("Content-Security-Policy", SHARE_CSP), ("X-Robots-Tag", "noindex, nofollow")])
 
         u = self.current_user()
         if path == "/":
@@ -2893,8 +2925,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ---- web-push subscriptions (per browser, per user)
         if path == "/api/push/subscribe":
             sub = payload.get("subscription")
-            if not (isinstance(sub, dict) and sub.get("endpoint", "").startswith("https://")):
+            if not (isinstance(sub, dict) and str(sub.get("endpoint", "")).startswith("https://")):
                 return self._json(400, {"error": "bad subscription"})
+            if not push_endpoint_allowed(sub["endpoint"]):
+                # SSRF guard: the server later POSTs to this URL, so only real browser push
+                # services are accepted — never arbitrary (or internal) hosts
+                return self._json(400, {"error": "unrecognized push service"})
             with db():
                 db().execute("INSERT INTO push_subs(endpoint,user_id,sub,created) VALUES(?,?,?,?)"
                              " ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, sub=excluded.sub",
@@ -6705,6 +6741,11 @@ font-size:12px;margin-bottom:14px;} .b p{font-size:14px;line-height:1.7;} .b a{c
 @media (prefers-color-scheme:light){html,body{background:#f4ecda;color:#6a5c43;}}
 </style></head><body><div class="b"><b>Oracle</b><p>This shared link has expired or was never here.<br>
 <a href="/">return to the oracle &rsaquo;</a></p></div></body></html>""")
+
+# Computed from the static template (whose executable scripts are placeholder-free), so injected
+# scripts in share data are never hashed into the policy. The per-share JSON data island is
+# non-executable and excluded from hashing, keeping this constant valid for every rendered share.
+SHARE_CSP = csp_for(SHARE_PAGE_TMPL)
 
 
 def render_share_page(sh):
