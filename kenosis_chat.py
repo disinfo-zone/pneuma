@@ -1333,13 +1333,26 @@ def resolve_request(convo):
     return ep, model, convo.get("system", ""), effective_params(convo)
 
 
+def _model_post(url, headers, body, stream):
+    """POST to the model server with a (connect, read) timeout split and connect-phase retries.
+    The split makes a dead endpoint fail in seconds instead of holding the request for the full
+    generation budget. The retries matter because a busy single-process model server (oMLX swapping
+    models under memory pressure) can stall its accept queue for tens of seconds — a connect failure
+    there is transient, and since nothing has been sent yet, retrying is always safe."""
+    for wait in (4, 12):
+        try:
+            return requests.post(url, headers=headers, json=body, stream=stream, timeout=(10, REQUEST_TIMEOUT))
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
+            log.warning("connect to %s failed (%s); retrying in %ss", url, type(e).__name__, wait)
+            time.sleep(wait)
+    return requests.post(url, headers=headers, json=body, stream=stream, timeout=(10, REQUEST_TIMEOUT))
+
+
 def _open_stream(ep, body):
     headers = {"Content-Type": "application/json"}
     if ep.get("key"):
         headers["Authorization"] = "Bearer " + ep["key"]
-    # (connect, read) split: a dead/unreachable endpoint fails in seconds instead of holding the
-    # request for the full generation budget; the read half still allows long gaps between tokens.
-    return requests.post(ep["url"], headers=headers, json=body, stream=True, timeout=(10, REQUEST_TIMEOUT))
+    return _model_post(ep["url"], headers, body, stream=True)
 
 
 def stream_model(ep, model, system, messages, params, tools=None, extra=None, tool_choice="auto", vision=False):
@@ -1439,7 +1452,7 @@ def call_model_nonstream(ep, model, system, messages, params, tools, vision=Fals
     headers = {"Content-Type": "application/json"}
     if ep.get("key"):
         headers["Authorization"] = "Bearer " + ep["key"]
-    r = requests.post(ep["url"], headers=headers, json=body, timeout=(10, REQUEST_TIMEOUT))
+    r = _model_post(ep["url"], headers, body, stream=False)
     r.raise_for_status()
     d = r.json()
     ch = (d.get("choices") or [{}])[0]
