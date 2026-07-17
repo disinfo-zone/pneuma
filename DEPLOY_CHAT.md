@@ -90,3 +90,33 @@ directly via `sqlite3 chat.db`.
 
 The model endpoints themselves (URLs + API keys) are configured in-app under Settings → Endpoints,
 not via env, so they live in the database with the rest of the state.
+
+## Backups: verify & restore
+
+Backups are written by `VACUUM INTO` every `KENOSIS_BACKUP_HOURS` (default 24h) to
+`KENOSIS_BACKUP_DIR`, and every copy is verified at write time (`PRAGMA integrity_check`
+plus a sanity check that it contains users) — a copy that fails verification is deleted
+and logged as an ERROR, so watch the logs for `backup verification FAILED`.
+
+To restore:
+
+```bash
+# 1. stop the app so nothing writes to the live DB
+docker compose stop kenosis-chat
+
+# 2. move the damaged DB aside (keep it for forensics)
+mv data/chat.db data/chat.db.broken
+rm -f data/chat.db-wal data/chat.db-shm     # stale WAL/SHM must not outlive the main file
+
+# 3. copy the chosen backup into place (backups are plain SQLite files)
+cp backups/chat-YYYYMMDD-HHMMSS.db data/chat.db
+sudo chown 10001:10001 data/chat.db
+
+# 4. start again — migrations and the FTS index rebuild automatically if needed
+docker compose start kenosis-chat
+```
+
+Everything lives in that one file (accounts, chats, settings, knowledge, push
+subscriptions). Sessions survive a restore as long as `KENOSIS_SESSION_SECRET` is
+unchanged. If a user enabled TOTP and lost their authenticator, clear it manually:
+`sqlite3 data/chat.db "UPDATE users SET totp_secret=NULL WHERE username='NAME'"`.
