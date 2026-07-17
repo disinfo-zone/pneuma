@@ -293,5 +293,190 @@ class TestContextTrim(unittest.TestCase):
         self.assertAlmostEqual(k.tok_factor("tm2"), 1.2, places=3)
 
 
+class TestCalculator(unittest.TestCase):
+    def test_arithmetic(self):
+        self.assertEqual(k.safe_calc("2+2*3"), 8)
+        self.assertEqual(k.safe_calc("2^10"), 1024)          # ^ alias for **
+        self.assertAlmostEqual(k.safe_calc("sqrt(2)**2"), 2, places=9)
+        self.assertEqual(k.safe_calc("max(3, min(7, 5))"), 5)
+        self.assertAlmostEqual(k.safe_calc("-pi"), -3.14159265, places=6)
+
+    def test_rejects_abuse(self):
+        for evil in ('__import__("os")', '().__class__', '"a"*9', 'open("x")',
+                     '9**9**9', 'lambda: 1', '[1,2]', 'x', 'factorial(99999)'):
+            with self.assertRaises(Exception, msg=evil):
+                k.safe_calc(evil)
+
+    def test_tool_dispatch(self):
+        text, ui = k.execute_tool("calculate", {"expression": "6*7"})
+        self.assertTrue(ui["ok"])
+        self.assertIn("42", text)
+        _, ui = k.execute_tool("calc", {"expression": "__import__"})
+        self.assertFalse(ui["ok"])
+
+
+class TestSearchHelpers(unittest.TestCase):
+    def test_fts_query_and(self):
+        self.assertEqual(k._fts_match_query("hello world"), '"hello" "world"*')
+        self.assertIsNone(k._fts_match_query("!!!"))
+
+    def test_fts_query_or_drops_short_terms(self):
+        q = k._fts_match_query("go to the harbor", all_terms=False)
+        self.assertIn('"harbor"', q)
+        self.assertNotIn('"go"', q)
+
+    def test_chunk_text(self):
+        chunks = k._chunk_text(("word " * 100 + "\n\n") * 20, target=600)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 1200 for c in chunks))
+        self.assertEqual(k._chunk_text(""), [])
+
+
+class TestTOTP(unittest.TestCase):
+    SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"   # RFC 6238 test key ("12345678901234567890")
+
+    def test_rfc6238_vector(self):
+        self.assertEqual(k.totp_code(self.SECRET, t=59), "287082")
+
+    def test_verify_window_and_reject(self):
+        now = time.time()
+        good = k.totp_code(self.SECRET, t=now - 30)   # previous step still accepted
+        self.assertTrue(k.totp_verify(self.SECRET, good))
+        self.assertFalse(k.totp_verify(self.SECRET, "000000") and
+                         k.totp_verify(self.SECRET, "999999"))
+        self.assertFalse(k.totp_verify(self.SECRET, ""))
+        self.assertFalse(k.totp_verify("", "287082"))
+
+
+class TestChunkedBody(unittest.TestCase):
+    @staticmethod
+    def _handler(body, te="chunked", clen=None):
+        import io
+        import email.message
+        h = k.Handler.__new__(k.Handler)
+        h.rfile = io.BytesIO(body)
+        m = email.message.Message()
+        if te:
+            m["Transfer-Encoding"] = te
+        if clen is not None:
+            m["Content-Length"] = str(clen)
+        h.headers = m
+        h.close_connection = False
+        return h
+
+    @staticmethod
+    def _chunked(raw, size=7):
+        out = b""
+        for i in range(0, len(raw), size):
+            piece = raw[i:i + size]
+            out += ("%x\r\n" % len(piece)).encode() + piece + b"\r\n"
+        return out + b"0\r\n\r\n"
+
+    def test_decodes_chunked_json(self):
+        raw = json.dumps({"model": "kenosis-v2", "n": 1}).encode()
+        h = self._handler(self._chunked(raw))
+        self.assertEqual(h._read(), {"model": "kenosis-v2", "n": 1})
+        self.assertEqual(h.rfile.read(), b"")   # body fully consumed -> keep-alive stays clean
+
+    def test_oversize_chunk_raises(self):
+        h = self._handler(("%x\r\n" % (k.MAX_BODY_BYTES + 1)).encode() + b"x")
+        with self.assertRaises(k._BodyTooLarge):
+            h._read()
+
+    def test_malformed_closes_connection(self):
+        h = self._handler(b"nonsense\r\n")
+        self.assertEqual(h._read(), {})
+        self.assertTrue(h.close_connection)
+
+    def test_content_length_still_works(self):
+        raw = json.dumps({"a": 1}).encode()
+        h = self._handler(raw, te=None, clen=len(raw))
+        self.assertEqual(h._read(), {"a": 1})
+
+
+class TestCompressionAnchor(_ConvoBase):
+    def _mkconvo(self, n_msgs):
+        cid = "cc1"
+        c = k.db()
+        with c:
+            c.execute("INSERT OR REPLACE INTO conversations(id,owner_id,title,created,updated) VALUES(?,?,?,?,?)",
+                      (cid, 1, "t", k._now(), k._now()))
+        prev = None
+        ids = []
+        for i in range(n_msgs):
+            with c:
+                prev = k.insert_message(cid, prev, "user" if i % 2 == 0 else "assistant", "m%d" % i)
+            ids.append(prev)
+        return cid, ids
+
+    def test_ensure_summary_incremental_and_rebuild(self):
+        cid, ids = self._mkconvo(6)
+        convo = {"id": cid, "ctx_summary": None, "ctx_summary_upto": None}
+        dropped = [{"id": i, "role": "user", "content": "x"} for i in ids[:3]]
+        calls = []
+        real = k.summarize_dropped
+        k.summarize_dropped = lambda ep, m, prior, msgs: calls.append((prior, len(msgs))) or "SUM1"
+        try:
+            s = k.ensure_summary(convo, {}, "m", dropped)
+            self.assertEqual(s, "SUM1")
+            self.assertEqual(calls[-1], (None, 3))          # fresh build over all dropped
+            row = k.db().execute("SELECT ctx_summary, ctx_summary_upto FROM conversations WHERE id=?", (cid,)).fetchone()
+            self.assertEqual((row[0], row[1]), ("SUM1", ids[2]))
+
+            # same dropped prefix again -> stored summary reused, NO new model call
+            convo = {"id": cid, "ctx_summary": "SUM1", "ctx_summary_upto": ids[2]}
+            n = len(calls)
+            self.assertEqual(k.ensure_summary(convo, {}, "m", dropped), "SUM1")
+            self.assertEqual(len(calls), n)
+
+            # boundary advanced by one message -> incremental fold of just the new tail
+            k.summarize_dropped = lambda ep, m, prior, msgs: calls.append((prior, len(msgs))) or "SUM2"
+            dropped2 = dropped + [{"id": ids[3], "role": "assistant", "content": "y"}]
+            self.assertEqual(k.ensure_summary(convo, {}, "m", dropped2), "SUM2")
+            self.assertEqual(calls[-1], ("SUM1", 1))
+        finally:
+            k.summarize_dropped = real
+
+
+class TestStatsAndBackup(_ConvoBase):
+    def test_usage_stats_aggregates(self):
+        cid = "st1"
+        c = k.db()
+        with c:
+            c.execute("INSERT OR REPLACE INTO conversations(id,owner_id,title,created,updated) VALUES(?,?,?,?,?)",
+                      (cid, 1, "t", k._now(), k._now()))
+            k.insert_message(cid, None, "assistant", "hi", model="test-model",
+                             meta={"completion_tokens": 50, "tps": 10.0, "ttft_ms": 500,
+                                   "prompt_tokens": 100, "cached_tokens": 80})
+        s = k.usage_stats()
+        row = next(m for m in s["models"] if m["model"] == "test-model")
+        self.assertEqual(row["tokens"], 50)
+        self.assertEqual(row["avg_cache_pct"], 80)
+
+    def test_backup_verifies(self):
+        if k.user_count() == 0:   # verification refuses userless backups by design
+            k.create_user("bk-user", "password123")
+        old = k.BACKUP_DIR
+        k.BACKUP_DIR = tempfile.mkdtemp(prefix="kbk-")
+        try:
+            dest = k.backup_db()
+            self.assertTrue(os.path.exists(dest))
+        finally:
+            k.BACKUP_DIR = old
+
+
+class TestCSP(unittest.TestCase):
+    def test_hashes_not_unsafe_inline(self):
+        csp = k.csp_for("<html><script>var a=1;</script></html>")
+        self.assertIn("script-src 'self' 'sha256-", csp)
+        script_src = [p for p in csp.split(";") if "script-src" in p][0]
+        self.assertNotIn("unsafe-inline", script_src)
+
+    def test_page_csp_covers_all_scripts(self):
+        import re as _re
+        n_scripts = len([s for s in _re.findall(r"<script[^>]*>(.*?)</script>", k.PAGE, _re.S) if s.strip()])
+        self.assertEqual(k.PAGE_CSP.count("'sha256-"), n_scripts)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
