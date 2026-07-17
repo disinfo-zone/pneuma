@@ -139,8 +139,9 @@ SEED_ENDPOINT = {
 DEFAULT_MODEL = "kenosistron"
 
 # Per-request sampler params the MLX server accepts. 'default' = the server's own default
-# (what the per-param reset clears toward). top_k / repetition_penalty are file-only on the
-# server (need a model reload) so they are intentionally NOT exposed here.
+# (what the per-param reset clears toward). top_k remains file-only on the server; repetition_penalty
+# is accepted per-request by current oMLX (verified: no reload, applied at inference time) and matters
+# a lot: model files that bake one in will progressively starve function words on long outputs.
 PARAM_SPECS = [
     {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 4,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
      "tip": "Controls randomness. Higher values (e.g. 1.2) make replies more creative and varied; lower values (e.g. 0.7) make them more focused and predictable. 0 always picks the single most likely token."},
@@ -156,6 +157,8 @@ PARAM_SPECS = [
      "tip": "Penalizes tokens by how many times they have already appeared, discouraging the model from repeating the same words. Positive values reduce repetition; negative values encourage it. Range -2 to 2."},
     {"key": "presence_penalty",  "label": "presence_penalty",  "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.6,
      "tip": "Penalizes tokens that have appeared at all (regardless of how often), nudging the model toward new words and topics. Positive values increase novelty; negative values keep it on-topic. Range -2 to 2."},
+    {"key": "repetition_penalty", "label": "repetition_penalty", "type": "float", "min": 0.8, "max": 2, "step": 0.01, "ph": "server default", "slider": True, "default": 1.0,
+     "tip": "Multiplicative penalty on every token that already appeared, applied over the whole output. Values above 1 suppress loops — but on long generations they also starve common words (articles, prepositions), degrading grammar toward the end. 1.0 disables it, overriding any penalty baked into the model file. Prefer frequency_penalty for gentler repetition control."},
     {"key": "max_tokens",        "label": "max_tokens",        "type": "int",   "min": 1,             "step": 1,    "ph": str(MAX_TOKENS),  "slider": False, "default": MAX_TOKENS,
      "tip": "The maximum number of tokens to generate in a single reply. Generation stops here even if the model is not finished. This does not limit the length of the prompt or conversation."},
 ]
