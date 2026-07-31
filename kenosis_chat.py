@@ -136,7 +136,15 @@ SEED_ENDPOINT = {
     "models_url": os.environ.get("KENOSIS_SEED_MODELS_URL", ""),
     "key": os.environ.get("KENOSIS_SEED_KEY", ""),
 }
-DEFAULT_MODEL = "kenosistron"
+DEFAULT_MODEL = "kenosisling"
+
+# The model server's own sampler defaults (X_105): the groupchat-voice winner at coherence 8.78.
+# Mirrored below as each spec's 'default' and seeded as default_params so a fresh DB matches live.
+SERVER_DEFAULT_PARAMS = {
+    "temperature": 1.05, "top_p": 0.99, "min_p": 0.03,
+    "xtc_probability": 0.4, "xtc_threshold": 0.1,
+    "frequency_penalty": 0.4, "presence_penalty": 0.4,
+}
 
 # Per-request sampler params. 'default' = the server's own default (what the per-param reset
 # clears toward). repetition_penalty is accepted per-request by current oMLX (verified: no reload,
@@ -146,19 +154,19 @@ DEFAULT_MODEL = "kenosistron"
 PARAM_SPECS = [
     {"key": "temperature",       "label": "temperature",       "type": "float", "min": 0,  "max": 4,  "step": 0.05, "ph": "server default", "slider": True,  "default": 1.05,
      "tip": "Controls randomness. Higher values (e.g. 1.2) make replies more creative and varied; lower values (e.g. 0.7) make them more focused and predictable. 0 always picks the single most likely token."},
-    {"key": "top_p",             "label": "top_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.98,
+    {"key": "top_p",             "label": "top_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.99,
      "tip": "Nucleus sampling. Each step only considers the most likely tokens whose probabilities add up to this fraction. 0.9 keeps the top 90% of the probability mass; lower means more focused. Often tuned instead of temperature."},
-    {"key": "min_p",             "label": "min_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.04,
+    {"key": "min_p",             "label": "min_p",             "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.03,
      "tip": "Minimum probability, relative to the top token. Discards any token less likely than this fraction of the most likely one. Higher values (e.g. 0.1) prune unlikely tokens harder, keeping output coherent even at high temperature."},
     {"key": "top_k",             "label": "top_k",             "type": "int",   "min": 0,  "max": 200, "step": 1,   "ph": "server default", "slider": True,  "default": 0,
      "tip": "Each step only considers the K most likely tokens. 0 disables the cap. A blunter cousin of top_p/min_p — mostly useful as a hard safety rail at very high temperatures. Note: some backends (older oMLX) ignore this per-request."},
-    {"key": "xtc_probability",   "label": "xtc_probability",   "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.6,
+    {"key": "xtc_probability",   "label": "xtc_probability",   "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.4,
      "tip": "Exclude Top Choices: the chance, per token, of applying XTC. XTC removes the most-probable tokens (those above the threshold), always leaving at least one, to reduce clichés and boost creativity. 0 disables it."},
     {"key": "xtc_threshold",     "label": "xtc_threshold",     "type": "float", "min": 0,  "max": 1,  "step": 0.01, "ph": "server default", "slider": True,  "default": 0.1,
      "tip": "Exclude Top Choices threshold. Only tokens more probable than this are eligible to be dropped by XTC. Lower thresholds let XTC act on more tokens; a typical value is around 0.1."},
-    {"key": "frequency_penalty", "label": "frequency_penalty", "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.7,
+    {"key": "frequency_penalty", "label": "frequency_penalty", "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.4,
      "tip": "Penalizes tokens by how many times they have already appeared, discouraging the model from repeating the same words. Positive values reduce repetition; negative values encourage it. Range -2 to 2."},
-    {"key": "presence_penalty",  "label": "presence_penalty",  "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.6,
+    {"key": "presence_penalty",  "label": "presence_penalty",  "type": "float", "min": -2, "max": 2,  "step": 0.05, "ph": "server default", "slider": True,  "default": 0.4,
      "tip": "Penalizes tokens that have appeared at all (regardless of how often), nudging the model toward new words and topics. Positive values increase novelty; negative values keep it on-topic. Range -2 to 2."},
     {"key": "repetition_penalty", "label": "repetition_penalty", "type": "float", "min": 0.8, "max": 2, "step": 0.01, "ph": "server default", "slider": True, "default": 1.0,
      "tip": "Multiplicative penalty on every token that already appeared, applied over the whole output. Values above 1 suppress loops — but on long generations they also starve common words (articles, prepositions), degrading grammar toward the end. 1.0 disables it, overriding any penalty baked into the model file. Prefer frequency_penalty for gentler repetition control."},
@@ -399,7 +407,7 @@ def seed_settings():
     defaults = {
         "endpoints": [dict(SEED_ENDPOINT)], "active_endpoint": SEED_ENDPOINT["id"],
         "default_model": DEFAULT_MODEL, "default_system": DEFAULT_SYSTEM,
-        "default_params": {}, "user_models": [DEFAULT_MODEL], "thinking_models": [],
+        "default_params": dict(SERVER_DEFAULT_PARAMS), "user_models": [DEFAULT_MODEL], "thinking_models": [],
         "search_url": "", "utility_model": "", "vision_models": [], "embed_model": "",
     }
     for k, v in defaults.items():
@@ -1775,7 +1783,7 @@ def fetch_models(ep, ttl=60):
             return list(ent[1])
     try:
         ids = [m["id"] for m in _models_data(ep)]
-        ids.sort(key=lambda x: (not x.startswith("kenosistron"), x))
+        ids.sort(key=lambda x: (x != DEFAULT_MODEL, not x.startswith("kenosis"), x))
     except Exception as e:
         log.warning("model list fetch failed for %s: %s", key, e)
         ids = list(ent[1]) if ent else []
