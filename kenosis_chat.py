@@ -4516,6 +4516,15 @@ PAGE_HEAD = r"""<!doctype html>
   .typing i{width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.4;animation:blink 1.2s infinite;}
   .typing i:nth-child(2){animation-delay:.2s;} .typing i:nth-child(3){animation-delay:.4s;}
   @keyframes blink{0%,80%,100%{opacity:.25;}40%{opacity:1;}}
+  /* live reply: settled markdown blocks (.mds) + the block still being written (.mdt). The pair is
+     one bubble, so restore the inter-block margin the :first/:last-child rules zero at the seam. */
+  .tmpnode{overflow-anchor:none;}   /* scroll anchoring must not fight the autoscroll */
+  .bubble .mds:not(:empty)>p:last-child{margin-bottom:.7em;}
+  .bubble .mds:not(:empty)+.mdt>p:first-child{margin-top:.7em;}
+  .caret{display:inline-block;width:.42em;height:1.02em;margin-left:1px;vertical-align:-.16em;
+    background:var(--accent);opacity:.6;border-radius:1px;animation:caret 1.05s steps(1) infinite;}
+  @keyframes caret{0%,55%{opacity:.6;}56%,100%{opacity:0;}}
+  @media (prefers-reduced-motion:reduce){.caret{animation:none;}}
   .empty{text-align:center;margin-top:16vh;color:var(--faint);}
   .empty .glyph{font-family:var(--mono);font-size:30px;color:var(--accent);opacity:.7;}
   .empty h2{font-family:var(--serif);font-weight:500;color:var(--muted);font-size:22px;margin:14px 0 4px;}
@@ -5399,12 +5408,6 @@ function syncBar(){
 }
 function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clientHeight<40;}
 function scrollDown(){const l=$("#log");l.scrollTop=l.scrollHeight;}
-let _scrollQueued=false;
-function scheduleScroll(){   // rAF-coalesced autoscroll: one layout per frame however fast tokens arrive
-  if(!autoScroll||_scrollQueued)return;
-  _scrollQueued=true;
-  requestAnimationFrame(()=>{_scrollQueued=false;if(autoScroll)scrollDown();});
-}
 function renderConvo(opts){
   opts=opts||{};
   const stick=(opts.stick!==undefined)?opts.stick:autoScroll;
@@ -5600,9 +5603,11 @@ function appendLive(){
   // when the answer begins (still re-expandable).
   d.innerHTML='<div class="head"><span class="role">'+esc(role)+'</span><span class="tm"></span></div>'+
     '<details class="reason" open style="display:none"><summary>reasoning</summary><div class="rbody"></div></details>'+
-    '<div class="bubble raw"><span class="typing"><i></i><i></i><i></i></span></div>';
+    '<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>';
   wrap.appendChild(d);if(stick)scrollDown();
-  return {bubble:d.querySelector(".bubble"),reasonBox:d.querySelector(".reason"),reason:d.querySelector(".rbody"),started:false,reasonCollapsed:false};
+  return {bubble:d.querySelector(".bubble"),reasonBox:d.querySelector(".reason"),reason:d.querySelector(".rbody"),
+          started:false,reasonCollapsed:false,
+          acc:"",text:"",shown:0,hasTC:false,racc:"",rshown:0,stableLen:0,ended:false};
 }
 function appendThinking(){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant thinking tmpnode";
@@ -5647,16 +5652,81 @@ async function streamRequest(path,body,handlers,signal){
   if(errMsg){const ex=new Error(errMsg);ex.convo=result&&result.convo;throw ex;}
   return result;
 }
-// Throttled live-markdown: re-render the accumulating reply as markdown every ~250ms (backing off
-// for very long replies) instead of once at the end. Raw text nodes stream in between renders
-// until the first render lands, so nothing ever looks stalled.
-function scheduleMd(L){
-  if(L._mdT)return;
-  const wait=(L.acc&&L.acc.length>30000)?900:250;
-  L._mdT=setTimeout(()=>{L._mdT=null;
-    try{L.bubble.innerHTML=md(stripTC(L.acc||""));L._mdDone=true;}
-    catch(_){L.bubble.textContent=stripTC(L.acc||"");}
-    scheduleScroll();},wait);
+// ---------------- paced live rendering
+// Tokens land in bursts (sampler jitter, then network chunking), so painting each delta the moment
+// it arrives looks jittery. Everything received goes into an accumulator and a single rAF loop
+// reveals it at a smoothed rate — the buffer drains exponentially, so the text keeps flowing at a
+// near-constant pace through a stall and speeds up (never falls behind) when a burst lands.
+// The markdown is rendered in two pieces: blocks that can no longer change are rendered once into
+// .mds and left alone, and only the block still being written is re-parsed each frame (.mdt). Long
+// replies therefore stay at a flat cost per frame, and settled text never blinks or reflows.
+function liveMd(s){   // close an unterminated fence so a half-written code block reads as code
+  if(((s.match(/```/g)||[]).length)%2)s+="```";   // no newline: it would push the caret to a new line
+  try{return md(s);}catch(_){return "<p>"+esc(s)+"</p>";}
+}
+function liveCaret(L){
+  const host=L.tail.lastElementChild;
+  if(!host){L.tail.appendChild(L.caret);return;}
+  if(host.tagName==="UL"||host.tagName==="OL")(host.lastElementChild||host).appendChild(L.caret);
+  else if(host.tagName==="PRE")(host.querySelector("code")||host).appendChild(L.caret);
+  else host.appendChild(L.caret);
+}
+function liveSettle(L,txt){
+  // Settle everything up to the last blank line — but never inside a fence, and never where the
+  // next block would continue a list or quote (splitting one would restart the <ul> and shift the
+  // layout). A very long unsettleable tail is settled anyway: one small shift beats dropped frames.
+  // Only the newly-settled segment is parsed and appended, so already-settled DOM is never touched.
+  const force=txt.length-L.stableLen>8000;
+  let idx=txt.lastIndexOf("\n\n");
+  while(idx>=L.stableLen){
+    const seg=txt.slice(L.stableLen,idx+2),rest=txt.slice(idx+2);
+    if(rest.trim()&&((seg.match(/```/g)||[]).length%2===0)&&
+       (force||!/^\s*(?:[-*+]\s|\d+[.)]\s|>)/.test(rest))){
+      L.stableLen=idx+2;L.stable.insertAdjacentHTML("beforeend",liveMd(seg));return;
+    }
+    idx=txt.lastIndexOf("\n\n",idx-1);
+  }
+}
+function liveRender(L){
+  if(!L.stable){   // first painted character: swap the typing dots for the two render slots
+    L.bubble.innerHTML='<div class="mds"></div><div class="mdt"></div>';
+    L.stable=L.bubble.querySelector(".mds");L.tail=L.bubble.querySelector(".mdt");
+    L.caret=document.createElement("span");L.caret.className="caret";
+  }
+  const txt=L.text.slice(0,L.shown);
+  liveSettle(L,txt);
+  L.tail.innerHTML=liveMd(txt.slice(L.stableLen));
+  if(!L.ended)liveCaret(L);
+}
+let _pacer=null,_pacerRaf=0,_pacerT=0;
+function pacerStop(){if(_pacerRaf)cancelAnimationFrame(_pacerRaf);_pacerRaf=0;_pacer=null;_pacerT=0;}
+function pacerStart(L){if(_pacer===L&&_pacerRaf)return;_pacer=L;_pacerT=0;
+  if(!_pacerRaf)_pacerRaf=requestAnimationFrame(pacerTick);}
+function pacerTick(ts){
+  _pacerRaf=0;const L=_pacer;if(!L)return;
+  let dt=_pacerT?ts-_pacerT:16;_pacerT=ts;
+  if(dt>250)dt=250;   // hidden tab / long task: catch up in one step rather than crawling for ages
+  let drew=false;
+  const take=(pending)=>L.ended?pending:Math.min(pending,Math.max(1,Math.ceil(pending*dt/110)));
+  const rp=L.racc.length-L.rshown;
+  if(rp>0){const n=take(rp);
+    if(L.reason)L.reason.appendChild(document.createTextNode(L.racc.substr(L.rshown,n)));
+    L.rshown+=n;drew=true;}
+  const p=L.text.length-L.shown;
+  if(p>0){L.shown+=take(p);liveRender(L);drew=true;}
+  else if(L.shown>L.text.length){L.shown=L.text.length;liveRender(L);drew=true;}   // stripTC shrank it
+  if(drew&&autoScroll)scrollDown();   // inline: scheduling another frame would always lag one behind
+  if(L.ended&&L.shown>=L.text.length&&L.rshown>=L.racc.length){pacerStop();return;}
+  _pacerRaf=requestAnimationFrame(pacerTick);
+}
+function liveFinish(L){   // stream over: paint the remainder at once and drop the caret
+  if(!L){pacerStop();return;}
+  L.ended=true;
+  L.rshown=L.racc.length;L.shown=L.text.length;
+  if(L.reason&&L.racc)L.reason.textContent=L.racc;
+  if(L.started)liveRender(L);
+  pacerStop();
+  if(autoScroll)scrollDown();
 }
 function maybeAskNotif(){
   if(!("Notification" in window))return;
@@ -5673,34 +5743,37 @@ function notifyDone(ok){
   }catch(_){}
 }
 async function streamTurn(body){
-  let live=null,think=null,racc="";const toolEls={};
+  let live=null,think=null;const toolEls={};
   function clearThink(){if(think){think.remove();think=null;}}
   function showThink(t){if(live)return;if(!think)think=appendThinking();const l=think.querySelector(".tlabel");if(l&&t)l.textContent=t;if(autoScroll)scrollDown();}
   function bubble(){clearThink();if(!live)live=appendLive();return live;}
   // continue/prefill: seed the live bubble with the existing text so generation visibly resumes from it
-  if(body.continue_id){const L=bubble();L.started=true;L.acc=body.prefix||"";L.bubble.textContent=stripTC(L.acc);if(autoScroll)scrollDown();}
+  if(body.continue_id){const L=bubble();L.started=true;
+    // acc is re-seeded from the stripped text: deltas extend it directly, so a trimmed prefix must
+    // not leave `shown` pointing past the end and briefly un-paint the tail
+    L.acc=L.text=stripTC(body.prefix||"");L.shown=L.text.length;liveRender(L);if(autoScroll)scrollDown();}
   else showThink("thinking…");
   const c=new AbortController();activeController=c;
   try{const res=await streamRequest("/api/conversations/"+current.id+"/stream",body,{
       onStatus:s=>{if(!s){clearThink();return;}showThink(s);},
-      onDelta:d=>{const L=bubble();if(!L.started){L.bubble.textContent="";L.acc="";L.started=true;
-          if(L.reasonBox&&racc&&!L.reasonCollapsed){L.reasonBox.open=false;L.reasonCollapsed=true;}}  // answer began -> fold the reasoning
-        L.acc=(L.acc||"")+d;
-        // cheap per-token append keeps latency flat; the markdown re-render is throttled separately
-        if(L.acc.indexOf("<tool_call>")>=0)L.bubble.textContent=stripTC(L.acc);
-        else if(!L._mdDone)L.bubble.appendChild(document.createTextNode(d));
-        scheduleMd(L);scheduleScroll();},
-      onReason:r=>{const L=bubble();racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}
-        if(L.reason)L.reason.appendChild(document.createTextNode(r));
-        scheduleScroll();},
-      onToolCall:tc=>{clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;racc="";if(autoScroll)scrollDown();},
+      onDelta:d=>{const L=bubble();if(!L.started){L.started=true;
+          if(L.reasonBox&&L.racc&&!L.reasonCollapsed){L.reasonBox.open=false;L.reasonCollapsed=true;}}  // answer began -> fold the reasoning
+        L.acc+=d;
+        // a tool call the server didn't intercept must not show as markup; scanning only the new
+        // tail keeps this O(delta) instead of O(reply) per token
+        if(!L.hasTC&&L.acc.slice(-(d.length+11)).indexOf("<tool_call>")>=0)L.hasTC=true;
+        L.text=L.hasTC?stripTC(L.acc):L.acc;
+        pacerStart(L);},
+      onReason:r=>{const L=bubble();L.racc+=r;if(L.reasonBox){L.reasonBox.style.display="";}
+        pacerStart(L);},
+      onToolCall:tc=>{liveFinish(live);clearThink();const el=appendToolStep(tc);if(tc.id)toolEls[tc.id]=el;live=null;if(autoScroll)scrollDown();},
       onToolResult:tr=>{updateToolStep(toolEls[tr.id],tr);if(autoScroll)scrollDown();},
       onNotice:msg=>{showNotice(msg);toast("context window reached",6000);}
     },c.signal);
-    clearThink();
+    clearThink();liveFinish(live);
     return {res,stopped:false};
-  }catch(e){clearThink();if(e.name==="AbortError")return {res:null,stopped:true};throw e;}
-  finally{activeController=null;clearTimeout(_stopFallback);}
+  }catch(e){clearThink();liveFinish(live);if(e.name==="AbortError")return {res:null,stopped:true};throw e;}
+  finally{activeController=null;clearTimeout(_stopFallback);pacerStop();}
 }
 function setBusy(b){busy=b;const s=$("#send");s.classList.toggle("stop",b);s.innerHTML=b?ICON_STOP:ICON_SEND;s.title=b?"stop":"send";}
 let _stopFallback=null;
