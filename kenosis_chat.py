@@ -136,7 +136,7 @@ SEED_ENDPOINT = {
     "models_url": os.environ.get("KENOSIS_SEED_MODELS_URL", ""),
     "key": os.environ.get("KENOSIS_SEED_KEY", ""),
 }
-DEFAULT_MODEL = "kenosisling"
+DEFAULT_MODEL = "kenosislight"
 
 # The model server's own sampler defaults (X_105): the groupchat-voice winner at coherence 8.78.
 # Mirrored below as each spec's 'default' and seeded as default_params so a fresh DB matches live.
