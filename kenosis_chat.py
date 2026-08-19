@@ -245,7 +245,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS conversations(
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, folder_id TEXT, title TEXT,
                 system TEXT, model TEXT, endpoint_id TEXT, params TEXT, character_id TEXT,
-                active_leaf_id TEXT, tools INTEGER NOT NULL DEFAULT 0, think INTEGER, created TEXT NOT NULL, updated TEXT NOT NULL);
+                active_leaf_id TEXT, tools INTEGER NOT NULL DEFAULT 0, think INTEGER, mode TEXT, created TEXT NOT NULL, updated TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages(
                 id TEXT PRIMARY KEY, convo_id TEXT NOT NULL, parent_id TEXT, position INTEGER NOT NULL,
                 role TEXT NOT NULL, content TEXT, reasoning TEXT, model TEXT, meta TEXT, ts TEXT, edited TEXT,
@@ -289,6 +289,8 @@ def init_db():
             c.execute("ALTER TABLE conversations ADD COLUMN tools INTEGER NOT NULL DEFAULT 0")
         if "think" not in ccols:   # NULL = model default; 1 = thinking on; 0 = thinking off
             c.execute("ALTER TABLE conversations ADD COLUMN think INTEGER")
+        if "mode" not in ccols:    # NULL/'chat' = a normal conversation; 'compose' = one continuable text
+            c.execute("ALTER TABLE conversations ADD COLUMN mode TEXT")
         ucols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
         if "persona" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN persona TEXT")
@@ -409,6 +411,10 @@ def seed_settings():
         "default_model": DEFAULT_MODEL, "default_system": DEFAULT_SYSTEM,
         "default_params": dict(SERVER_DEFAULT_PARAMS), "user_models": [DEFAULT_MODEL], "thinking_models": [],
         "search_url": "", "utility_model": "", "vision_models": [], "embed_model": "",
+        # {model: params} layered between default_params and the conversation's own params; a model
+        # with no entry behaves exactly as it did before this existed. Seeded empty because the
+        # values are per-checkpoint and come from the sweeps, not from source.
+        "model_defaults": {},
     }
     for k, v in defaults.items():
         if get_setting(k) is None:
@@ -445,7 +451,8 @@ def restore_endpoint_keys(eps):
 def admin_settings():
     s = {k: get_setting(k) for k in
          ("endpoints", "active_endpoint", "default_model", "default_system", "default_params",
-          "user_models", "thinking_models", "search_url", "utility_model", "vision_models", "embed_model")}
+          "model_defaults", "user_models", "thinking_models", "search_url", "utility_model",
+          "vision_models", "embed_model")}
     s["endpoints"] = redacted_endpoints()
     return s
 
@@ -793,7 +800,7 @@ def list_folders(u):
 
 def list_convos(u):
     rows = db().execute(
-        "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,"
+        "SELECT c.id,c.title,c.updated,c.created,c.model,c.character_id,c.folder_id,c.mode,"
         "(SELECT COUNT(*) FROM messages m WHERE m.convo_id=c.id AND m.role IN('user','assistant')) turns "
         "FROM conversations c WHERE c.owner_id=? ORDER BY c.updated DESC", (u["id"],)).fetchall()
     return [dict(r) for r in rows]
@@ -935,6 +942,7 @@ def get_convo(cid, u=None):
             "endpoint_id": r["endpoint_id"], "params": json.loads(r["params"]) if r["params"] else {},
             "character_id": r["character_id"], "active_leaf_id": r["active_leaf_id"],
             "tools": bool(r["tools"]), "think": r["think"],
+            "mode": (r["mode"] if "mode" in r.keys() else None) or "chat",
             "ctx_summary": r["ctx_summary"] if "ctx_summary" in r.keys() else None,
             "ctx_summary_upto": r["ctx_summary_upto"] if "ctx_summary_upto" in r.keys() else None,
             "created": r["created"], "updated": r["updated"],
@@ -1333,18 +1341,41 @@ def compose_system(system, tools_on):
     return "\n\n".join(parts)
 
 
-def effective_params(convo):
+def model_for(convo, model_override=None):
+    return model_override or convo.get("model") or get_setting("default_model") or DEFAULT_MODEL
+
+
+def effective_params(convo, model=None):
+    """Sampler params for a request, layered global -> per-model -> per-conversation.
+
+    The middle layer is `model_defaults`, a {model: params} map, and it exists because a good
+    sampler config is a property of the checkpoint, not of the site: the sweeps put centostron1's
+    best all-round settings at t0.95/xtc 0.50 and centosbolt2's at t0.70, and no single global can
+    be right for both. A conversation that has never touched the tune drawer carries `params: {}`,
+    so before this layer existed it got the global config whatever model it was pointed at.
+
+    Each layer MERGES over the one below rather than replacing it, which is what keeps the older,
+    partially-specified presets behaving as they always have -- their unset keys still fall through
+    to the same global values they fell through to before. A model entry only has to state the keys
+    where that checkpoint differs, though the entries written from a full sweep state all of them so
+    nothing leaks in from the global.
+    """
     merged = dict(get_setting("default_params") or {})
+    merged.update((get_setting("model_defaults") or {}).get(model_for(convo, model)) or {})
     merged.update(convo.get("params") or {})
     out = {k: v for k, v in merged.items() if k in PARAM_KEYS and v not in (None, "")}
     out.setdefault("max_tokens", MAX_TOKENS)
     return out
 
 
-def resolve_request(convo):
+def resolve_request(convo, model_override=None):
+    """The model override is applied BEFORE the params are computed, not after. Once defaults are
+    per-model, resolving params against the conversation's model and then swapping the model out
+    would send one checkpoint's sampler settings to a different one -- which is exactly what
+    'regenerate with...' does."""
     ep = endpoint_by_id(convo.get("endpoint_id")) if convo.get("endpoint_id") else active_endpoint()
-    model = convo.get("model") or get_setting("default_model") or DEFAULT_MODEL
-    return ep, model, convo.get("system", ""), effective_params(convo)
+    model = model_for(convo, model_override)
+    return ep, model, convo.get("system", ""), effective_params(convo, model)
 
 
 def _model_post(url, headers, body, stream):
@@ -2536,6 +2567,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "folders": list_folders(u), "param_specs": PARAM_SPECS, "max_tokens": MAX_TOKENS,
             "default_system": get_setting("default_system", DEFAULT_SYSTEM),
             "default_params": get_setting("default_params", {}),
+            "model_defaults": get_setting("model_defaults", {}),
             "default_model": get_setting("default_model", DEFAULT_MODEL),
             "model_contexts": _ctx_data(active_endpoint()),
             "default_context": DEFAULT_CONTEXT,
@@ -3032,13 +3064,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not model_allowed(u, model):
                 return self._json(403, {"error": "model not permitted"})
             cid = _cid()
+            # tools/think are accepted here, not just in /settings, so a new chat can be created with
+            # the whole drawer state in one request — the client carries the current chat's setup
+            # forward and would otherwise need a follow-up write to reinstate these two.
+            think = payload.get("think")
+            mode = "compose" if payload.get("mode") == "compose" else "chat"
+            # compose mode is seeded at creation: the whole document is one assistant message that
+            # "continue" extends, so the conversation is only worth creating once there is text.
+            seed = payload.get("seed") if mode == "compose" else None
             with db():
-                db().execute("INSERT INTO conversations(id,owner_id,folder_id,title,system,model,endpoint_id,params,character_id,active_leaf_id,created,updated)"
-                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                db().execute("INSERT INTO conversations(id,owner_id,folder_id,title,system,model,endpoint_id,params,character_id,active_leaf_id,tools,think,mode,created,updated)"
+                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                              (cid, u["id"], payload.get("folder_id"), payload.get("title", ""),
                               payload.get("system", get_setting("default_system", DEFAULT_SYSTEM)), model,
                               payload.get("endpoint_id") if u["role"] == "admin" else None,
-                              json.dumps(payload.get("params") or {}), payload.get("character_id"), None, _now(), _now()))
+                              json.dumps(payload.get("params") or {}), payload.get("character_id"), None,
+                              1 if payload.get("tools") else 0,
+                              None if think is None else (1 if think else 0), mode, _now(), _now()))
+                if seed is not None:
+                    set_leaf(cid, insert_message(cid, None, "assistant", str(seed)))
+                    # maybe_title() only ever looks at user messages, and a composition has none
+                    if not payload.get("title"):
+                        db().execute("UPDATE conversations SET title=? WHERE id=?", (title_from(str(seed)), cid))
             return self._json(200, get_convo(cid, u))
 
         if path == "/api/folders":
@@ -3186,8 +3233,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "endpoints" in payload:
                 set_setting("endpoints", restore_endpoint_keys(payload["endpoints"]))
             for k in ("active_endpoint", "default_model", "default_system", "default_params",
-                      "user_models", "thinking_models", "search_url", "utility_model",
-                      "vision_models", "embed_model"):
+                      "model_defaults", "user_models", "thinking_models", "search_url",
+                      "utility_model", "vision_models", "embed_model"):
                 if k in payload:
                     set_setting(k, payload[k])
             return self._json(200, {"settings": admin_settings(), "all_models": fetch_models(active_endpoint(), ttl=0)})
@@ -3353,9 +3400,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         convo = get_convo(cid, u)
         if convo is None:
             return self._json(404, {"error": "not found"})
-        ep, model, system, params = resolve_request(convo)
-        if payload.get("model"):   # per-turn override ("regenerate with…"); the message records the real model
-            model = str(payload["model"])
+        # the per-turn override ("regenerate with…") goes in here, not after: params are per-model
+        ep, model, system, params = resolve_request(
+            convo, str(payload["model"]) if payload.get("model") else None)
         if not model_allowed(u, model):
             return self._json(403, {"error": "model not permitted"})
         self.close_connection = True   # the ndjson stream has no Content-Length, so it can't be kept alive
@@ -3372,6 +3419,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         regenerate_id = payload.get("regenerate_id")
         edit_user_id = payload.get("edit_user_id")
         continue_id = payload.get("continue_id")
+        # branch: keep the message being continued and write the continuation to a *sibling* of it
+        # instead of extending it in place, so one prefix can carry several alternative endings and
+        # the existing ‹ 1/2 › switcher navigates them.
+        cont_branch = bool(payload.get("branch")) and bool(continue_id)
         cont_prefix = None   # set in continue mode: the existing text we resume from
 
         # mode -> (parent node, ctx sent to model, optional leading user message, whether to title)
@@ -3382,7 +3433,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tc = by.get(continue_id)
             if tc is None or tc["role"] != "assistant":
                 return self._json(400, {"error": "can only continue an assistant message"})
-            cont_prefix = content if payload.get("content") is not None else (tc["content"] or "")
+            # NOT the stripped `content`: a continuation resumes at the exact character the text
+            # ends on, and stripping the trailing newline would restart mid-paragraph.
+            cont_prefix = payload["content"] if payload.get("content") is not None else (tc["content"] or "")
             parent = tc["parent_id"]
             ctx = chain_content(cid, parent, by) + [{"role": "assistant", "content": cont_prefix}]
             lead, title_after = None, False
@@ -3400,9 +3453,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if tu is None or tu["role"] != "user":
                 return self._json(400, {"error": "cannot edit/resend that message"})
             new_content = content or tu["content"]
+            # Branching an edited message carries its attachments over. The edit UI sends content
+            # only, so without this the pasted text / files / images that the original turn was
+            # built around silently vanish from the new branch — the model would answer the same
+            # question with the evidence removed. Absent key = inherit; an explicit [] still clears.
+            edit_atts = attachments
+            if payload.get("attachments") is None and tu["attachments"]:
+                edit_atts = json.loads(tu["attachments"])   # stored as TEXT; insert_message re-encodes
             parent = tu["parent_id"]
-            ctx = chain_content(cid, parent, by) + [{"role": "user", "content": new_content, "attachments": attachments or None}]
-            lead, title_after = ("user", new_content, attachments), True
+            ctx = chain_content(cid, parent, by) + [{"role": "user", "content": new_content, "attachments": edit_atts or None}]
+            lead, title_after = ("user", new_content, edit_atts), True
         else:
             if not content and not attachments:
                 return self._json(400, {"error": "empty message"})
@@ -3528,16 +3588,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         def persist(collected, reply, reasoning, meta, allow_empty=True):
             with db():
                 if continue_id:
-                    # append the continuation to the existing assistant message, in place
                     row = by.get(continue_id)
                     new_content = (cont_prefix or "") + (reply or "")
                     old_reason = (row["reasoning"] if row else "") or ""
                     merged_reason = (old_reason + reasoning) if reasoning else (old_reason or None)
-                    db().execute("UPDATE messages SET content=?, reasoning=?, model=?, meta=?, edited=? WHERE id=? AND convo_id=?",
-                                 (new_content, merged_reason, model,
-                                  json.dumps(meta) if meta else (row["meta"] if row else None), _now(), continue_id, cid))
-                    _, _, kids2 = _tree(cid)
-                    set_leaf(cid, _default_leaf(continue_id, kids2))
+                    if cont_branch:
+                        # sibling: a second ending for the same prefix, left alongside the original
+                        set_leaf(cid, insert_message(cid, parent, "assistant", new_content,
+                                                     merged_reason, model, meta))
+                    else:
+                        # append the continuation to the existing assistant message, in place
+                        db().execute("UPDATE messages SET content=?, reasoning=?, model=?, meta=?, edited=? WHERE id=? AND convo_id=?",
+                                     (new_content, merged_reason, model,
+                                      json.dumps(meta) if meta else (row["meta"] if row else None), _now(), continue_id, cid))
+                        _, _, kids2 = _tree(cid)
+                        set_leaf(cid, _default_leaf(continue_id, kids2))
                     touch_convo(cid)
                     return
                 node = parent
@@ -3579,16 +3644,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         collected = []
         reply, reasoning, usage = "", "", None
         t0 = time.time(); t_first = [0.0]
-        # Per-request body extras (dropped by stream_model's fallback if a server rejects them):
-        #  - continuation hints so vLLM/llama.cpp extend the trailing assistant message
-        #  - enable_thinking, only for models an admin has marked thinking-capable site-wide
-        cont_extra = {}
+        # Per-request body extras (dropped by stream_model's fallback if a server rejects them).
+        # Everything here rides in ONE chat_template_kwargs dict because that is the only channel
+        # the server feeds to apply_chat_template. The continuation hints used to be sent as
+        # top-level body fields, where they were silently ignored: the trailing assistant message
+        # was then rendered as a *finished* turn with a fresh generation prompt after it, so
+        # "continue" glued a brand-new reply (with its own thinking block) onto the old text
+        # instead of extending it. Setting them as two keys on separate dicts is equally broken —
+        # the second assignment would drop the first, which is why they are merged, not stacked.
+        ctk = {}
         if continue_id:
-            cont_extra.update({"add_generation_prompt": False, "continue_final_message": True})
+            ctk.update({"add_generation_prompt": False, "continue_final_message": True})
         if model in set(get_setting("thinking_models", []) or []) and convo.get("think") is not None:
             # tri-state: NULL = model default (send nothing); 1/0 = explicit per-chat on/off
-            cont_extra["chat_template_kwargs"] = {"enable_thinking": convo.get("think") == 1}
-        cont_extra = cont_extra or None
+            ctk["enable_thinking"] = convo.get("think") == 1
+        cont_extra = {"chat_template_kwargs": ctk} if ctk else None
 
         seg_state = {}   # live buffers of the current run_stream pass, for partial-persist on error
 
@@ -4762,7 +4832,22 @@ PAGE_HEAD = r"""<!doctype html>
     .msg.revealed>.bubble{box-shadow:-3px 0 0 var(--accent-weak);}
     .convo .cmenu,.folder-head .fmenu{opacity:1;}
   }
+  /* compose mode: one continuable document, edited raw in place (a loom, not a chat) */
+  .compose{max-width:var(--cw);margin:0 auto;padding:0 28px 20px;display:flex;flex-direction:column;height:100%;gap:10px;}
+  .cbar{display:flex;align-items:center;gap:12px;color:var(--faint);font-family:var(--mono);font-size:11px;flex:0 0 auto;}
+  .cbar .grow{flex:1;}
+  #ctext{flex:1;min-height:240px;width:100%;resize:none;background:var(--surface);color:var(--text);border:none;border-radius:12px;
+         padding:18px 20px;font-family:var(--mono);font-size:13.5px;line-height:1.75;tab-size:2;}
+  #ctext:focus{outline:2px solid var(--accent-weak);outline-offset:-1px;}
+  .crow{display:flex;align-items:center;gap:8px;flex:0 0 auto;}
+  .crow button{background:var(--surface);border:none;color:var(--muted);border-radius:9px;padding:9px 16px;
+               font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;}
+  .crow button:hover{background:var(--surface2);color:var(--text);}
+  .crow button.pri{background:var(--accent-weak);color:var(--accent);font-weight:600;}
+  .crow button.pri:hover{background:var(--accent);color:var(--on-accent);}
+  .crow .chint{color:var(--faint);font-family:var(--mono);font-size:10.5px;margin-left:auto;}
   @media (max-width:560px){
+    .compose{padding:0 12px 12px;} .crow .chint{display:none;}
     .params-grid{grid-template-columns:1fr;} .barbtn .t{display:none;}
     #composer .wrap{gap:6px;}
     #scrolltop{bottom:86px;right:12px;}
@@ -4783,7 +4868,7 @@ PAGE_BODY = r"""
       <div class="side-act">
         <button id="newbtn">+ new conversation</button>
         <div class="searchwrap"><input id="searchbox" placeholder="search…"><button id="searchclear" type="button" title="clear search" aria-label="clear search">&times;</button></div>
-        <div class="row"><button id="foldernew" title="new folder">+ folder</button><button id="selbtn" title="select multiple">select</button></div>
+        <div class="row"><button id="composebtn" title="a single continuable text — paste something and the model keeps writing it">+ composition</button><button id="foldernew" title="new folder">+ folder</button><button id="selbtn" title="select multiple">select</button></div>
       </div>
       <div id="selbar"><span class="cnt" id="selcnt">0 selected</span><button id="selmove">move</button><button id="seldel" class="danger">delete</button><button id="seldone">done</button></div>
       <div id="tree"></div>
@@ -5267,7 +5352,7 @@ function convoRow(c){
   d.className="convo"+(current&&c.id===current.id?" active":"")+(selected.has(c.id)?" checked":"");
   d.dataset.id=c.id;d.draggable=!selMode;
   const ch=charById(c.character_id);
-  d.innerHTML='<span class="sel"></span><div class="ct">'+esc(c.title||"untitled")+'</div><div class="cm">'+
+  d.innerHTML='<span class="sel"></span><div class="ct">'+(c.mode==="compose"?'✎ ':'')+esc(c.title||"untitled")+'</div><div class="cm">'+
     (ch?esc((ch.avatar?ch.avatar+" ":"")+ch.name)+' · ':'')+esc(c.model||"")+' · '+relTime(c.updated)+'</div><button class="cmenu">&#8943;</button>';
   d.onclick=e=>{if(e.target.classList.contains("cmenu"))return;
     if(selMode){toggleSel(c.id,d);return;}openConvo(c.id);closeSidebar();};
@@ -5403,6 +5488,7 @@ function syncBar(){
   if(isAdmin()&&current.endpoint_id){const e=endpointName(current.endpoint_id);if(e)bits.push(e.name);}
   const np=Object.keys(current.params||{}).length;if(np)bits.push(np+" param"+(np>1?"s":""));
   if(current.tools)bits.push("◇ tools");
+  if(current.mode==="compose")bits.push("✎ composition");
   $("#submeta").textContent=bits.join("  ·  ");
   updateCtx();
 }
@@ -5410,6 +5496,8 @@ function nearBottom(){const l=$("#log");return l.scrollHeight-l.scrollTop-l.clie
 function scrollDown(){const l=$("#log");l.scrollTop=l.scrollHeight;}
 function renderConvo(opts){
   opts=opts||{};
+  if(current&&current.mode==="compose"){renderCompose();return;}
+  $("#composer").style.display="";
   const stick=(opts.stick!==undefined)?opts.stick:autoScroll;
   const prev=$("#log").scrollTop;syncBar();
   const log=$("#log");log.innerHTML="";
@@ -5876,7 +5964,8 @@ function continueMsg(m){
 }
 function resendEdited(mid,newContent){
   const idx=current.messages.findIndex(x=>x.id===mid);
-  runStream({edit_user_id:mid,content:newContent},()=>{if(idx>=0){current.messages=current.messages.slice(0,idx);current.messages.push({id:"tmp",role:"user",content:newContent,ts:new Date().toISOString()});}renderConvo({stick:true});});
+  const atts=(idx>=0?current.messages[idx].attachments:null)||null;   // the server carries these over; show them too
+  runStream({edit_user_id:mid,content:newContent},()=>{if(idx>=0){current.messages=current.messages.slice(0,idx);current.messages.push({id:"tmp",role:"user",content:newContent,attachments:atts,ts:new Date().toISOString()});}renderConvo({stick:true});});
 }
 
 // per-conversation composer drafts (this browser only, capped at the 20 most recent)
@@ -5893,13 +5982,139 @@ function loadDraft(cid){
   try{const d=JSON.parse(localStorage.getItem("oracle_drafts")||"{}");
     const inp=$("#input");if(inp.value!==(d[cid]||"")){inp.value=d[cid]||"";inp.style.height="auto";inp.dispatchEvent(new Event("input"));}}catch(_){}
 }
-async function openConvo(id){saveDraft();current=await api("GET","/api/conversations/"+id);loadDraft(id);renderConvo({stick:true});renderTree();}
+async function openConvo(id){saveDraft();composeNew=false;current=await api("GET","/api/conversations/"+id);loadDraft(id);renderConvo({stick:true});renderTree();}
+// The setup a new chat inherits from the one you are in: dialling in a model, character, prompt or
+// sampler values and then hitting "new chat" used to throw all of it away and snap back to the site
+// defaults. With no chat open (fresh load) there is nothing to carry, so the defaults still apply.
+function carrySettings(){
+  if(!current)return {system:CFG.default_system,model:CFG.default_model,character_id:null,params:{},tools:false,think:null};
+  const c={system:current.system||"",model:current.model,character_id:current.character_id||null,
+           params:current.params||{},tools:!!current.tools,
+           think:current.think===undefined?null:current.think};
+  if(isAdmin())c.endpoint_id=current.endpoint_id||null;
+  return c;
+}
 async function newChat(){
-  // reuse an existing empty conversation instead of stacking blank rows in the sidebar
-  const empty=convoCache.find(c=>!c.turns&&!c.character_id);
-  if(empty){await openConvo(empty.id);$("#input").focus();closeSidebar();return;}
-  current=await api("POST","/api/conversations",{system:CFG.default_system,model:CFG.default_model});
+  const carry=carrySettings();
+  // Reuse an existing empty conversation instead of stacking blank rows in the sidebar, but only one
+  // already on the character being carried — repurposing a blank chat that belongs to a different
+  // character (or to none) would quietly rewrite it.
+  const empty=convoCache.find(c=>!c.turns&&(c.character_id||null)===carry.character_id);
+  if(empty){
+    await openConvo(empty.id);
+    // That shell kept whatever settings it was made with, so bring it in line with the carried setup.
+    // Skipped when it already matches, so reusing a blank chat doesn't bump it up the sidebar.
+    const stale=Object.keys(carry).some(k=>JSON.stringify(carry[k]??null)!==JSON.stringify(current[k]??null));
+    if(stale){try{current=await api("POST","/api/conversations/"+current.id+"/settings",carry);renderConvo();refreshList();}catch(e){toast(e.message);}}
+    $("#input").focus();closeSidebar();return;
+  }
+  current=await api("POST","/api/conversations",carry);
   renderConvo();refreshList();$("#input").focus();closeSidebar();
+}
+
+// ---------------- compose mode (a loom, not a chat)
+// A composition is a conversation whose whole body is ONE assistant message. You paste or write
+// text; the model resumes it from the exact character it ends on (the same prefill the "continue"
+// button uses, which only works at all because the continuation hints ride in chat_template_kwargs
+// — see _stream). "branch" writes the continuation to a *sibling* of that message instead of
+// extending it, so one prefix carries several endings and the ‹ 1/2 › switcher walks them.
+// The optional steering instruction is just the conversation's system prompt — no new field.
+let composeNew=false;
+// Set on the pointerdown that starts a "branch". Branching a loom means trimming the text back to
+// the point you want to diverge at and forking from *there* — so the blur that click causes must
+// not first write the trimmed text over the branch you are forking away from, which would destroy
+// the very continuation you were keeping.
+let composeForking=false;
+function composeMsg(){return current?(current.messages||[]).filter(m=>m.role==="assistant").pop():null;}
+function newComposition(){
+  composeNew=true;current=null;draftCid=null;
+  renderCompose();renderTree();closeSidebar();
+  const t=$("#ctext");if(t)t.focus();
+}
+function composeCount(){
+  const ta=$("#ctext"),n=$(".cbar .cn");if(!ta||!n)return;
+  const v=ta.value;
+  n.textContent=v?(fmtNum(v.length)+" chars  ·  ~"+fmtK(estTok(v))+" tok"):"";
+}
+function composeBusy(b){
+  const go=document.querySelector('.crow [data-c="continue"]');if(!go)return;
+  go.textContent=b?"stop":"continue";
+  const br=document.querySelector('.crow [data-c="branch"]');if(br)br.disabled=b||!composeMsg();
+}
+async function composeSave(){   // an edit that is never continued still has to survive leaving the page
+  const ta=$("#ctext"),m=composeMsg();
+  if(!ta||!m||busy||ta.value===(m.content||""))return;
+  if(composeForking){composeForking=false;return;}
+  // blur fires on the mousedown that starts a run, i.e. *before* busy is set, so this patch can
+  // still be in flight while the stream is going. It therefore updates the message in place and
+  // never reassigns `current` — swapping in a pre-stream convo here would wipe the continuation.
+  m.content=ta.value;
+  try{await api("POST","/api/conversations/"+current.id+"/messages/"+m.id,{content:m.content});refreshList();}
+  catch(e){toast(e.message,4000,'err');}
+}
+function renderCompose(){
+  $("#composer").style.display="none";
+  const m=composeMsg();
+  if(current)syncBar();
+  else{$("#title").textContent="new composition";$("#submeta").textContent="✎ composition";$("#ctxmeter").style.display="none";}
+  const log=$("#log");log.innerHTML="";
+  const el=document.createElement("div");el.className="compose";
+  el.innerHTML='<div class="cbar">'+(m?sibNav(m):"")+'<span class="grow"></span><span class="cn"></span></div>'+
+    '<textarea id="ctext" spellcheck="false" placeholder="paste or write the text to continue…"></textarea>'+
+    '<div class="crow"><button class="pri" data-c="continue" title="keep writing from the end of this text">continue</button>'+
+    '<button data-c="branch"'+(m?"":" disabled")+' title="write this continuation to a new branch, leaving the current one intact">branch</button>'+
+    '<span class="chint">steer it with the system prompt in <b>tune</b></span></div>';
+  log.appendChild(el);
+  const ta=el.querySelector("#ctext");
+  ta.value=m?(m.content||""):"";
+  ta.scrollTop=ta.scrollHeight;
+  el.querySelectorAll("[data-sib]").forEach(b=>b.onclick=()=>{if(b.disabled)return;switchSibling(m.siblings[m.sib_index+(b.dataset.sib==="next"?1:-1)]);});
+  el.querySelector('[data-c="continue"]').onclick=()=>{if(busy)stopStream();else composeRun(false);};
+  const br=el.querySelector('[data-c="branch"]');
+  br.addEventListener("pointerdown",()=>{composeForking=true;});
+  br.onclick=()=>{if(!busy)composeRun(true);};
+  ta.addEventListener("input",composeCount);
+  ta.addEventListener("blur",composeSave);
+  composeCount();composeBusy(busy);
+}
+async function composeRun(branch){
+  const ta=$("#ctext");if(busy||!ta)return;
+  const text=ta.value;
+  if(!text.trim()){toast("paste or write something to continue from");return;}
+  setBusy(true);composeBusy(true);maybeAskNotif();
+  // follow the tail only while the caret is already at the end, so streaming can't yank the view
+  // away from a spot the writer scrolled back to
+  const follow=ta.scrollTop+ta.clientHeight>=ta.scrollHeight-24;
+  const c=new AbortController();activeController=c;
+  try{
+    if(!current){
+      current=await api("POST","/api/conversations",Object.assign(carrySettings(),{mode:"compose",seed:text}));
+      composeNew=false;draftCid=current.id;refreshList();
+    }
+    const m=composeMsg();
+    if(!m)throw new Error("nothing to continue");
+    const res=await streamRequest("/api/conversations/"+current.id+"/stream",
+      {continue_id:m.id,content:text,branch:!!branch},
+      {onDelta:d=>{ta.value+=d;if(follow)ta.scrollTop=ta.scrollHeight;composeCount();},
+       onReason:()=>{},                       // prefill resumes past the thinking block; nothing to show
+       onNotice:msg=>toast(msg,6000)},c.signal);
+    if(res&&res.convo)current=res.convo;else current=await api("GET","/api/conversations/"+current.id);
+    notifyDone(true);
+  }catch(e){
+    // a stop (abort) still leaves the partial persisted server-side, so re-read either way
+    if(e.name!=="AbortError"){
+      // a prefill that ends on a finished sentence makes the model emit nothing at all; in a chat
+      // that is a glitch, here it is just "this text is done" and the fix is to trim and retry
+      const done=/empty response/.test(e.message||"");
+      toast(done?"the model ended the text there — trim the last sentence and try again":(e.message||"stream failed"),5000,'err');
+      notifyDone(false);
+    }
+    if(current&&current.id){try{current=await api("GET","/api/conversations/"+current.id);}catch(_){}}
+  }
+  finally{
+    activeController=null;clearTimeout(_stopFallback);composeForking=false;setBusy(false);
+    renderCompose();refreshList();
+  }
 }
 
 function editTitle(){
@@ -6389,6 +6604,7 @@ function closeAll(){$("#drawer").classList.remove("show");closeModal();$("#peekm
 
 // ---------------- wire up
 $("#newbtn").onclick=newChat;
+$("#composebtn").onclick=newComposition;
 $("#menubtn").onclick=openSidebar;
 $("#revealbtn").onclick=()=>toggleCollapse(false);
 $("#collapsebtn").onclick=()=>toggleCollapse(true);

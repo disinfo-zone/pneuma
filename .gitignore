@@ -11,6 +11,11 @@ HANDOFF.md
 __pycache__/
 *.pyc
 
+# node (playwright-core, used only to drive the UI in a throwaway container)
+node_modules/
+package.json
+package-lock.json
+
 # editor / dropbox / runtime cruft
 *.bak
 *.tmp.*
