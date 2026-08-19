@@ -5706,7 +5706,7 @@ function showNotice(msg){
   // non-fatal context-window warning, shown inline just above the incoming reply
   const w=liveWrap();let n=w.querySelector(".ctx-notice");
   if(!n){n=document.createElement("div");n.className="ctx-notice tmpnode";}
-  n.textContent="⚠ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
+  n.textContent="△ "+msg;w.appendChild(n);if(autoScroll)scrollDown();
 }
 function appendToolStep(tc){
   const w=liveWrap();const d=document.createElement("div");d.className="msg assistant tmpnode";
