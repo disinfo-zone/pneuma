@@ -5352,7 +5352,7 @@ function convoRow(c){
   d.className="convo"+(current&&c.id===current.id?" active":"")+(selected.has(c.id)?" checked":"");
   d.dataset.id=c.id;d.draggable=!selMode;
   const ch=charById(c.character_id);
-  d.innerHTML='<span class="sel"></span><div class="ct">'+(c.mode==="compose"?'✎ ':'')+esc(c.title||"untitled")+'</div><div class="cm">'+
+  d.innerHTML='<span class="sel"></span><div class="ct">'+(c.mode==="compose"?'¶ ':'')+esc(c.title||"untitled")+'</div><div class="cm">'+
     (ch?esc((ch.avatar?ch.avatar+" ":"")+ch.name)+' · ':'')+esc(c.model||"")+' · '+relTime(c.updated)+'</div><button class="cmenu">&#8943;</button>';
   d.onclick=e=>{if(e.target.classList.contains("cmenu"))return;
     if(selMode){toggleSel(c.id,d);return;}openConvo(c.id);closeSidebar();};
@@ -5488,7 +5488,7 @@ function syncBar(){
   if(isAdmin()&&current.endpoint_id){const e=endpointName(current.endpoint_id);if(e)bits.push(e.name);}
   const np=Object.keys(current.params||{}).length;if(np)bits.push(np+" param"+(np>1?"s":""));
   if(current.tools)bits.push("◇ tools");
-  if(current.mode==="compose")bits.push("✎ composition");
+  if(current.mode==="compose")bits.push("¶ composition");
   $("#submeta").textContent=bits.join("  ·  ");
   updateCtx();
 }
@@ -6027,7 +6027,7 @@ let composeNew=false;
 let composeForking=false;
 function composeMsg(){return current?(current.messages||[]).filter(m=>m.role==="assistant").pop():null;}
 function newComposition(){
-  composeNew=true;current=null;draftCid=null;
+  composeNew=true;composeGen++;current=null;draftCid=null;
   renderCompose();renderTree();closeSidebar();
   const t=$("#ctext");if(t)t.focus();
 }
@@ -6041,10 +6041,33 @@ function composeBusy(b){
   go.textContent=b?"stop":"continue";
   const br=document.querySelector('.crow [data-c="branch"]');if(br)br.disabled=b||!composeMsg();
 }
-async function composeSave(){   // an edit that is never continued still has to survive leaving the page
-  const ta=$("#ctext"),m=composeMsg();
-  if(!ta||!m||busy||ta.value===(m.content||""))return;
+// A composition is an ordinary conversation, so it reopens from the sidebar like a chat — but its
+// row is only worth creating once there is text to put in it. Both the blur-save and a run come
+// through here and share one in-flight create, so blurring the textarea and immediately hitting
+// continue cannot turn one document into two conversations. composeGen guards the other direction:
+// if the writer starts a *different* composition while a create is still in flight, the result is
+// dropped rather than swapped in under them.
+let composeCreating=null,composeGen=0;
+function composeEnsure(text){
+  if(current)return Promise.resolve(current);
+  const gen=composeGen;
+  if(!composeCreating)composeCreating=api("POST","/api/conversations",Object.assign(carrySettings(),{mode:"compose",seed:text}))
+    .then(c=>{if(gen===composeGen){current=c;composeNew=false;draftCid=c.id;}refreshList();renderTree();return c;})
+    .finally(()=>{composeCreating=null;});
+  return composeCreating;
+}
+async function composeSave(){   // text left behind without ever running must still be there later
+  const ta=$("#ctext");
+  if(!ta||busy)return;
   if(composeForking){composeForking=false;return;}
+  const m=composeMsg();
+  if(!m){   // never run: without this, pasting and then clicking away would drop the whole document
+    if(!ta.value.trim())return;
+    try{await composeEnsure(ta.value);toast("composition saved — reopen it from the sidebar");}
+    catch(e){toast(e.message,4000,'err');}
+    return;
+  }
+  if(ta.value===(m.content||""))return;
   // blur fires on the mousedown that starts a run, i.e. *before* busy is set, so this patch can
   // still be in flight while the stream is going. It therefore updates the message in place and
   // never reassigns `current` — swapping in a pre-stream convo here would wipe the continuation.
@@ -6056,7 +6079,7 @@ function renderCompose(){
   $("#composer").style.display="none";
   const m=composeMsg();
   if(current)syncBar();
-  else{$("#title").textContent="new composition";$("#submeta").textContent="✎ composition";$("#ctxmeter").style.display="none";}
+  else{$("#title").textContent="new composition";$("#submeta").textContent="¶ composition";$("#ctxmeter").style.display="none";}
   const log=$("#log");log.innerHTML="";
   const el=document.createElement("div");el.className="compose";
   el.innerHTML='<div class="cbar">'+(m?sibNav(m):"")+'<span class="grow"></span><span class="cn"></span></div>'+
@@ -6087,10 +6110,7 @@ async function composeRun(branch){
   const follow=ta.scrollTop+ta.clientHeight>=ta.scrollHeight-24;
   const c=new AbortController();activeController=c;
   try{
-    if(!current){
-      current=await api("POST","/api/conversations",Object.assign(carrySettings(),{mode:"compose",seed:text}));
-      composeNew=false;draftCid=current.id;refreshList();
-    }
+    await composeEnsure(text);
     const m=composeMsg();
     if(!m)throw new Error("nothing to continue");
     const res=await streamRequest("/api/conversations/"+current.id+"/stream",
