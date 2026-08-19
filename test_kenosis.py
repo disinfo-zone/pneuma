@@ -6,6 +6,7 @@ Run:  python -m pytest test_kenosis.py    (or)    python -m unittest test_kenosi
 Uses a throwaway SQLite file per run; never touches a real chat.db.
 """
 
+import io
 import json
 import os
 import sqlite3
@@ -242,6 +243,71 @@ class TestHelpers(unittest.TestCase):
         block = k._attach_block([{"name": 'a"b.txt', "text": "BODY"}])
         self.assertIn("<file name=\"a'b.txt\">", block)
         self.assertIn("BODY", block)
+
+
+class TestModelDefaults(unittest.TestCase):
+    """Sampler params layer global -> per-model -> per-conversation."""
+
+    def setUp(self):
+        self._saved = {kk: k.get_setting(kk) for kk in ("default_params", "model_defaults",
+                                                        "default_model")}
+        k.set_setting("default_params", {"temperature": 1.05, "top_p": 0.99, "min_p": 0.03,
+                                         "xtc_probability": 0.4})
+        k.set_setting("model_defaults", {
+            "centostron1": {"temperature": 0.95, "min_p": 0.05, "xtc_probability": 0.5,
+                            "repetition_penalty": 1.03},
+            "partialmodel": {"temperature": 0.7},
+        })
+        k.set_setting("default_model", "fallbackmodel")
+
+    def tearDown(self):
+        for kk, v in self._saved.items():
+            k.set_setting(kk, v)
+
+    def test_model_without_entry_is_unchanged(self):
+        p = k.effective_params({"model": "othermodel", "params": {}})
+        self.assertEqual(p["temperature"], 1.05)
+        self.assertEqual(p["xtc_probability"], 0.4)
+
+    def test_model_entry_overrides_global(self):
+        p = k.effective_params({"model": "centostron1", "params": {}})
+        self.assertEqual(p["temperature"], 0.95)
+        self.assertEqual(p["min_p"], 0.05)
+        self.assertEqual(p["xtc_probability"], 0.5)
+        self.assertEqual(p["repetition_penalty"], 1.03)
+
+    def test_model_entry_merges_over_global_rather_than_replacing(self):
+        # top_p is stated only globally; a partial model entry must not drop it
+        p = k.effective_params({"model": "partialmodel", "params": {}})
+        self.assertEqual(p["temperature"], 0.7)
+        self.assertEqual(p["top_p"], 0.99)
+        self.assertEqual(p["xtc_probability"], 0.4)
+
+    def test_conversation_params_beat_the_model_entry(self):
+        p = k.effective_params({"model": "centostron1", "params": {"temperature": 1.4}})
+        self.assertEqual(p["temperature"], 1.4)
+        self.assertEqual(p["min_p"], 0.05)   # untouched keys still come from the model entry
+
+    def test_zero_valued_model_defaults_survive_the_filter(self):
+        k.set_setting("model_defaults", {"m0": {"top_k": 0, "xtc_probability": 0.0}})
+        p = k.effective_params({"model": "m0", "params": {}})
+        self.assertEqual(p["top_k"], 0)
+        self.assertEqual(p["xtc_probability"], 0.0)
+
+    def test_model_falls_back_to_default_model_setting(self):
+        k.set_setting("model_defaults", {"fallbackmodel": {"temperature": 0.5}})
+        p = k.effective_params({"params": {}})
+        self.assertEqual(p["temperature"], 0.5)
+
+    def test_override_selects_that_models_defaults(self):
+        convo = {"model": "othermodel", "params": {}, "system": ""}
+        _, model, _, params = k.resolve_request(convo, "centostron1")
+        self.assertEqual(model, "centostron1")
+        self.assertEqual(params["temperature"], 0.95)
+        # and without the override the conversation's own model still decides
+        _, model, _, params = k.resolve_request(convo)
+        self.assertEqual(model, "othermodel")
+        self.assertEqual(params["temperature"], 1.05)
 
 
 class TestMigration(unittest.TestCase):
@@ -513,6 +579,184 @@ class TestCSP(unittest.TestCase):
         import re as _re
         n_scripts = len([s for s in _re.findall(r"<script[^>]*>(.*?)</script>", k.PAGE, _re.S) if s.strip()])
         self.assertEqual(k.PAGE_CSP.count("'sha256-"), n_scripts)
+
+
+class _StreamBase(unittest.TestCase):
+    """Drives Handler._stream against a stubbed model server.
+
+    The three things it guards all live inside that one method and are invisible from any smaller
+    unit: the continuation hints have to reach the model server, an edited-and-branched user turn
+    has to keep its attachments, and `branch` has to write a sibling instead of overwriting.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        k.set_setting("endpoints", [{"id": "t", "name": "t", "url": "http://127.0.0.1:1/v1/chat/completions"}])
+        k.set_setting("active_endpoint", "t")
+        k.set_setting("thinking_models", ["m"])
+        cls.uid = k.user_by_name("streamer") or k.create_user("streamer", "pw", role="admin")
+        cls.u = k.user_by_name("streamer")
+
+    def setUp(self):
+        self.sent = []          # one dict per stream_model call: the kwargs we care about
+        self.reply = "TAIL"
+
+        def fake_stream_model(ep, model, system, messages, params, tools=None, extra=None,
+                              tool_choice="auto", vision=False):
+            self.sent.append({"messages": [dict(m) for m in messages], "extra": extra, "tools": tools})
+            yield {"delta": self.reply}
+            yield {"finish": "stop"}
+
+        self._real = k.stream_model
+        k.stream_model = fake_stream_model
+        self.addCleanup(lambda: setattr(k, "stream_model", self._real))
+
+    def _mk(self, **cols):
+        cid = k._cid()
+        fields = dict(owner_id=self.u["id"], title="", system="sys", model="m", params="{}",
+                      created=k._now(), updated=k._now())
+        fields.update(cols)
+        keys = ",".join(["id"] + list(fields))
+        with k.db():
+            k.db().execute("INSERT INTO conversations(%s) VALUES(%s)" % (keys, ",".join("?" * (len(fields) + 1))),
+                           [cid] + list(fields.values()))
+        return cid
+
+    def _stream(self, cid, payload):
+        h = _FakeHandler()
+        k.Handler._stream(h, cid, payload, self.u)
+        return h
+
+
+class _FakeHandler(k.Handler):
+    """Just enough of BaseHTTPRequestHandler for _stream to write into. Subclasses the real Handler
+    (without its socket-driven __init__) so the helpers _stream calls on self are the real ones."""
+    close_connection = False
+
+    def __init__(self):   # deliberately does not call super(): that would try to serve a request
+        self.wfile = io.BytesIO()
+        self.error = None
+
+    def _json(self, code, obj, extra=None):
+        self.error = (code, obj)
+
+    def send_response(self, code):
+        pass
+
+    def send_header(self, *a):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def events(self):
+        return [json.loads(l) for l in self.wfile.getvalue().decode().splitlines() if l.strip()]
+
+
+class TestContinuePrefill(_StreamBase):
+    def test_hints_ride_in_chat_template_kwargs_with_thinking(self):
+        """The regression that made 'continue' produce a whole new reply glued onto the old one.
+
+        Sent as top-level body fields the hints were silently ignored, and assigning
+        chat_template_kwargs twice (once for the hints, once for enable_thinking) dropped whichever
+        came first -- which broke continue on exactly the thinking models it was used on most.
+        """
+        cid = self._mk(think=1)
+        with k.db():
+            a = k.insert_message(cid, None, "user", "q")
+            b = k.insert_message(cid, a, "assistant", "half a sentence")
+            k.set_leaf(cid, b)
+        self._stream(cid, {"continue_id": b})
+        ctk = self.sent[0]["extra"]["chat_template_kwargs"]
+        self.assertEqual(ctk["continue_final_message"], True)
+        self.assertEqual(ctk["add_generation_prompt"], False)
+        self.assertEqual(ctk["enable_thinking"], True)      # merged, not clobbered
+        self.assertIsNone(self.sent[0]["tools"])
+        # the partial reply is fed back as the trailing assistant turn for the model to extend
+        self.assertEqual(self.sent[0]["messages"][-1]["role"], "assistant")
+        self.assertEqual(self.sent[0]["messages"][-1]["content"], "half a sentence")
+
+    def test_prefix_keeps_trailing_whitespace(self):
+        """A continuation resumes at the exact character the text ends on; stripping the trailing
+        newline would restart the model mid-paragraph."""
+        cid = self._mk()
+        with k.db():
+            b = k.insert_message(cid, None, "assistant", "x")
+            k.set_leaf(cid, b)
+        self._stream(cid, {"continue_id": b, "content": "chapter one.\n\n"})
+        self.assertEqual(self.sent[0]["messages"][-1]["content"], "chapter one.\n\n")
+        row = k.db().execute("SELECT content FROM messages WHERE id=?", (b,)).fetchone()
+        self.assertEqual(row["content"], "chapter one.\n\nTAIL")
+
+    def test_continue_appends_in_place(self):
+        cid = self._mk()
+        with k.db():
+            b = k.insert_message(cid, None, "assistant", "head ")
+            k.set_leaf(cid, b)
+        self._stream(cid, {"continue_id": b})
+        rows = k.db().execute("SELECT content FROM messages WHERE convo_id=?", (cid,)).fetchall()
+        self.assertEqual([r["content"] for r in rows], ["head TAIL"])
+
+    def test_branch_writes_a_sibling_instead(self):
+        cid = self._mk()
+        with k.db():
+            b = k.insert_message(cid, None, "assistant", "head ")
+            k.set_leaf(cid, b)
+        self._stream(cid, {"continue_id": b, "branch": True})
+        rows = k.db().execute("SELECT id,parent_id,content FROM messages WHERE convo_id=? ORDER BY position",
+                              (cid,)).fetchall()
+        self.assertEqual([r["content"] for r in rows], ["head ", "head TAIL"])   # original untouched
+        self.assertIsNone(rows[1]["parent_id"])                                  # a sibling, not a child
+        leaf = k.db().execute("SELECT active_leaf_id FROM conversations WHERE id=?", (cid,)).fetchone()[0]
+        self.assertEqual(leaf, rows[1]["id"])
+        msgs = k.get_convo(cid, self.u)["messages"]
+        self.assertEqual(msgs[-1]["sib_count"], 2)   # the ‹ 1/2 › switcher walks the two endings
+
+
+class TestEditBranchAttachments(_StreamBase):
+    ATT = [{"name": "pasted text", "text": "the whole essay"}]
+
+    def test_branching_an_edited_message_keeps_its_attachments(self):
+        """The edit UI sends content only. Without inheritance the pasted text the question was
+        built around vanished from the new branch and the model answered with the evidence gone."""
+        cid = self._mk()
+        with k.db():
+            a = k.insert_message(cid, None, "user", "what do you make of this?", attachments=self.ATT)
+            b = k.insert_message(cid, a, "assistant", "well…")
+            k.set_leaf(cid, b)
+        self._stream(cid, {"edit_user_id": a, "content": "rate this out of ten"})
+        # stored on the new branch, decoded once (not double-encoded by insert_message)
+        new_user = k.db().execute(
+            "SELECT attachments FROM messages WHERE convo_id=? AND role='user' AND content=?",
+            (cid, "rate this out of ten")).fetchone()
+        self.assertEqual(json.loads(new_user["attachments"]), self.ATT)
+        # and actually sent to the model this turn
+        self.assertEqual(self.sent[0]["messages"][-1]["attachments"], self.ATT)
+
+    def test_explicit_empty_list_still_clears(self):
+        cid = self._mk()
+        with k.db():
+            a = k.insert_message(cid, None, "user", "q", attachments=self.ATT)
+            k.set_leaf(cid, a)
+        self._stream(cid, {"edit_user_id": a, "content": "q2", "attachments": []})
+        row = k.db().execute("SELECT attachments FROM messages WHERE convo_id=? AND content='q2'", (cid,)).fetchone()
+        self.assertIsNone(row["attachments"])
+
+
+class TestComposeMode(_StreamBase):
+    def test_seeded_composition_continues_from_a_bare_assistant_root(self):
+        """A composition has no user turn at all: the document is one assistant message that the
+        model extends. Nothing in the trim/context path may choke on the missing user turn."""
+        cid = self._mk(mode="compose")
+        with k.db():
+            root = k.insert_message(cid, None, "assistant", "It was a bright cold day in April, and ")
+            k.set_leaf(cid, root)
+        self._stream(cid, {"continue_id": root})
+        sent = self.sent[0]["messages"]
+        self.assertEqual([m["role"] for m in sent], ["assistant"])
+        self.assertEqual(k.get_convo(cid, self.u)["mode"], "compose")
+        row = k.db().execute("SELECT content FROM messages WHERE id=?", (root,)).fetchone()
+        self.assertEqual(row["content"], "It was a bright cold day in April, and TAIL")
 
 
 if __name__ == "__main__":
