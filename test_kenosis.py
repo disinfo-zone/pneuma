@@ -310,6 +310,79 @@ class TestModelDefaults(unittest.TestCase):
         self.assertEqual(params["temperature"], 1.05)
 
 
+class TestThinkingDetection(unittest.TestCase):
+    """Per-model thinking controls detected from /v1/models/status, plus the whitelist override."""
+
+    STATUS = {"models": [
+        {"id": "gpt-oss-20b", "config_model_type": "gpt_oss", "thinking_default": None},
+        {"id": "kenosislight-oq5e", "model_alias": "kenosislight",
+         "config_model_type": "nemotron_h", "thinking_default": None},
+        {"id": "weird-1", "config_model_type": "somethingnew", "thinking_default": True},
+        {"id": "plain-1", "config_model_type": "llama", "thinking_default": None},
+    ]}
+
+    def setUp(self):
+        self._saved = k.get_setting("thinking_models")
+        k.set_setting("thinking_models", ["plain-1"])
+        k._THINK_CACHE.clear()
+        self._get = k.requests.get
+        k.requests.get = lambda *a, **kw: _FakeResp(self.STATUS)
+        self.ep = {"id": "t", "url": "http://x/v1/chat/completions"}
+
+    def tearDown(self):
+        k.requests.get = self._get
+        k.set_setting("thinking_models", self._saved)
+        k._THINK_CACHE.clear()
+
+    def test_detected_modes(self):
+        specs = k.think_specs(self.ep)
+        self.assertEqual(specs["gpt-oss-20b"]["mode"], "levels")
+        self.assertEqual(specs["gpt-oss-20b"]["levels"], k.THINK_LEVELS)
+        self.assertEqual(specs["kenosislight"]["mode"], "toggle")   # keyed by the advertised alias
+        self.assertEqual(specs["weird-1"]["mode"], "toggle")        # unknown family, server default
+        self.assertEqual(specs["plain-1"]["mode"], "toggle")        # whitelist override
+        self.assertNotIn("no-such-model", specs)
+
+    def test_norm_think(self):
+        self.assertIsNone(k.norm_think(None))
+        self.assertIsNone(k.norm_think(""))
+        self.assertEqual(k.norm_think("high"), "high")
+        self.assertEqual(k.norm_think(0), 0)
+        self.assertEqual(k.norm_think("0"), 0)
+        self.assertEqual(k.norm_think(True), 1)
+
+    def test_request_extras(self):
+        off = k.think_extra(self.ep, "kenosislight", 0)
+        self.assertEqual(off["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(off["thinking_budget"], 0)          # for templates that ignore the switch
+        on = k.think_extra(self.ep, "kenosislight", 1)
+        self.assertEqual(on, {"chat_template_kwargs": {"enable_thinking": True}})
+        lvl = k.think_extra(self.ep, "gpt-oss-20b", "low")
+        self.assertEqual(lvl["reasoning_effort"], "low")
+        # a level on a toggle-only model is just "on", and a model with no control gets nothing
+        self.assertNotIn("reasoning_effort", k.think_extra(self.ep, "kenosislight", "low"))
+        self.assertEqual(k.think_extra(self.ep, "no-such-model", 0), {})
+        self.assertEqual(k.think_extra(self.ep, "gpt-oss-20b", None), {})
+
+    def test_unreachable_status_falls_back_to_whitelist(self):
+        k._THINK_CACHE.clear()
+        k.requests.get = lambda *a, **kw: (_ for _ in ()).throw(OSError("down"))
+        specs = k.think_specs(self.ep)
+        self.assertEqual(list(specs), ["plain-1"])
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+        self.status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._p
+
+
 class TestMigration(unittest.TestCase):
     def test_legacy_linear_db_migrates_to_tree(self):
         path = os.path.join(_TMP, "legacy.db")
@@ -675,6 +748,16 @@ class TestContinuePrefill(_StreamBase):
         # the partial reply is fed back as the trailing assistant turn for the model to extend
         self.assertEqual(self.sent[0]["messages"][-1]["role"], "assistant")
         self.assertEqual(self.sent[0]["messages"][-1]["content"], "half a sentence")
+
+    def test_effort_level_rides_top_level(self):
+        """A graded thinking setting travels as reasoning_effort next to the template kwargs."""
+        self.addCleanup(setattr, k, "think_specs", k.think_specs)
+        k.think_specs = lambda ep: {"m": {"mode": "levels", "levels": k.THINK_LEVELS}}
+        cid = self._mk(think="high")
+        self._stream(cid, {"content": "q"})
+        extra = self.sent[0]["extra"]
+        self.assertEqual(extra["reasoning_effort"], "high")
+        self.assertEqual(extra["chat_template_kwargs"], {"enable_thinking": True})
 
     def test_prefix_keeps_trailing_whitespace(self):
         """A continuation resumes at the exact character the text ends on; stripping the trailing
