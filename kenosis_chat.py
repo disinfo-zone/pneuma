@@ -1842,25 +1842,102 @@ def model_contexts(ep):
 
 _CTX_CACHE = {}      # endpoint id -> (fetched_at, {model: context_window}); 5-min TTL
 _CTX_LOCK = threading.Lock()
+_THINK_CACHE = {}    # endpoint id -> (fetched_at, {model: {"mode": ..., "levels": [...]}}); 5-min TTL
+_THINK_LOCK = threading.Lock()
+
+
+def _ep_cached(cache, lock, ep, build):
+    """Cached per-endpoint map, refreshed at most every 5 minutes. The staleness check happens
+    under the lock and stamps a placeholder, so concurrent requests don't all refetch (thundering
+    herd); a failed refresh keeps serving the last good map."""
+    key = ep.get("id") or ep.get("url") or "?"
+    now = time.time()
+    with lock:
+        ent = cache.get(key)
+        if ent and now - ent[0] < 300:
+            return ent[1]
+        cache[key] = (now, ent[1] if ent else {})   # this thread refreshes; others use the old map
+    try:
+        m = build(ep)
+    except Exception:
+        m = ent[1] if ent else {}
+    with lock:
+        cache[key] = (now, m)
+    return m
 
 
 def _ctx_data(ep):
-    """Cached model -> context-window map for an endpoint. The staleness check happens under the
-    lock and stamps a placeholder, so concurrent requests don't all refetch (thundering herd)."""
-    key = ep.get("id") or ep.get("url") or "?"
-    now = time.time()
-    with _CTX_LOCK:
-        ent = _CTX_CACHE.get(key)
-        if ent and now - ent[0] < 300:
-            return ent[1]
-        _CTX_CACHE[key] = (now, ent[1] if ent else {})   # this thread refreshes; others use the old map
-    try:
-        m = model_contexts(ep)
-    except Exception:
-        m = ent[1] if ent else {}
-    with _CTX_LOCK:
-        _CTX_CACHE[key] = (now, m)
-    return m
+    """Cached model -> context-window map for an endpoint."""
+    return _ep_cached(_CTX_CACHE, _CTX_LOCK, ep, model_contexts)
+
+
+# --- thinking controls, auto-detected per model ---------------------------------------------
+# oMLX's /v1/models/status reports each model's family (config_model_type) and any server-side
+# thinking default. Neither is a complete capability flag, so the family table is the primary
+# signal and the admin whitelist stays as a manual override for anything unrecognised.
+# Probed against the live endpoint: nemotron_h honours enable_thinking and ignores reasoning_effort;
+# glm5_next is the reverse (and its only reliable off switch is the server-enforced thinking_budget);
+# gpt-oss takes the documented low/medium/high efforts. Sending a key a template doesn't know is a
+# silent no-op, which is why "off" sends both switches.
+THINK_LEVELS = ["low", "medium", "high"]
+THINK_EFFORT_FAMILIES = {"gpt_oss"}
+THINK_TOGGLE_FAMILIES = {"nemotron_h", "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5_moe",
+                         "glm4_moe", "glm5_next", "deepseek_v3", "deepseek_v4", "minimax_m2",
+                         "seed_oss", "gemma4"}
+
+
+def model_think_specs(ep):
+    """model id -> {"mode": "levels"|"toggle"} for every model whose template takes a thinking
+    control, read from the endpoint's model status. Endpoints without that route yield {}."""
+    headers = {"Content-Type": "application/json"}
+    if ep.get("key"):
+        headers["Authorization"] = "Bearer " + ep["key"]
+    r = requests.get(models_url_for(ep).rstrip("/") + "/status", headers=headers, timeout=8)
+    r.raise_for_status()
+    out = {}
+    for m in r.json().get("models", []):
+        mid = m.get("model_alias") or m.get("id")     # the alias is what /v1/models advertises
+        fam = (m.get("config_model_type") or "").lower()
+        if not mid:
+            continue
+        if fam in THINK_EFFORT_FAMILIES:
+            out[mid] = {"mode": "levels", "levels": list(THINK_LEVELS)}
+        elif fam in THINK_TOGGLE_FAMILIES or m.get("thinking_default") is not None:
+            out[mid] = {"mode": "toggle"}
+    return out
+
+
+def think_specs(ep):
+    """Detected thinking controls for an endpoint, with the admin whitelist folded in."""
+    specs = dict(_ep_cached(_THINK_CACHE, _THINK_LOCK, ep, model_think_specs))
+    for m in get_setting("thinking_models", []) or []:
+        specs.setdefault(m, {"mode": "toggle"})
+    return specs
+
+
+def norm_think(v):
+    """Per-chat thinking setting: None = model default, 1/0 = on/off, or an effort level."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, str) and v.lower() in THINK_LEVELS:
+        return v.lower()
+    return 0 if v in (0, "0", False) else 1
+
+
+def think_extra(ep, model, value):
+    """Request-body fields for a chat's thinking setting, or {} when the model has no such control.
+    "off" sends the template switch *and* the server-enforced budget because different families
+    honour different ones; a level rides as reasoning_effort on top of thinking being on."""
+    spec = think_specs(ep).get(model)
+    value = norm_think(value)
+    if not spec or value is None:
+        return {}
+    if value == 0:
+        return {"chat_template_kwargs": {"enable_thinking": False}, "thinking_budget": 0}
+    out = {"chat_template_kwargs": {"enable_thinking": True}}
+    if value != 1 and spec.get("mode") == "levels":
+        out["reasoning_effort"] = value
+    return out
 
 
 def context_for(ep, model, default=DEFAULT_CONTEXT):
@@ -2571,7 +2648,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "default_model": get_setting("default_model", DEFAULT_MODEL),
             "model_contexts": _ctx_data(active_endpoint()),
             "default_context": DEFAULT_CONTEXT,
-            "thinking_models": get_setting("thinking_models", []),
+            "thinking_specs": think_specs(active_endpoint()),
             "vision_models": get_setting("vision_models", []),
         }
         if u["role"] == "admin":
@@ -3080,7 +3157,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               payload.get("endpoint_id") if u["role"] == "admin" else None,
                               json.dumps(payload.get("params") or {}), payload.get("character_id"), None,
                               1 if payload.get("tools") else 0,
-                              None if think is None else (1 if think else 0), mode, _now(), _now()))
+                              norm_think(think), mode, _now(), _now()))
                 if seed is not None:
                     set_leaf(cid, insert_message(cid, None, "assistant", str(seed)))
                     # maybe_title() only ever looks at user messages, and a composition has none
@@ -3361,8 +3438,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sets.append("endpoint_id=?"); args.append(payload["endpoint_id"])
             if "tools" in payload:
                 sets.append("tools=?"); args.append(1 if payload["tools"] else 0)
-            if "think" in payload:   # None -> model default; else 1/0
-                sets.append("think=?"); args.append(None if payload["think"] is None else (1 if payload["think"] else 0))
+            if "think" in payload:   # None -> model default; else 1/0 or an effort level
+                sets.append("think=?"); args.append(norm_think(payload["think"]))
             if "params" in payload:
                 sets.append("params=?"); args.append(json.dumps(payload["params"] or {}))
             if "ctx_summary" in payload:   # user-edited rolling summary; clearing resets the window anchor too
@@ -3655,10 +3732,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ctk = {}
         if continue_id:
             ctk.update({"add_generation_prompt": False, "continue_final_message": True})
-        if model in set(get_setting("thinking_models", []) or []) and convo.get("think") is not None:
-            # tri-state: NULL = model default (send nothing); 1/0 = explicit per-chat on/off
-            ctk["enable_thinking"] = convo.get("think") == 1
-        cont_extra = {"chat_template_kwargs": ctk} if ctk else None
+        # NULL = model default (send nothing); 1/0 = on/off; a level string = reasoning effort
+        body_extra = think_extra(ep, model, convo.get("think"))
+        ctk.update(body_extra.pop("chat_template_kwargs", {}))
+        if ctk:
+            body_extra["chat_template_kwargs"] = ctk
+        cont_extra = body_extra or None
 
         seg_state = {}   # live buffers of the current run_stream pass, for partial-persist on error
 
@@ -5032,8 +5111,8 @@ PAGE_BODY = r"""
           </div>
           <label class="fld"><span class="lab">web search endpoint <span class="sub">SearXNG base URL (JSON api enabled) · blank disables the web_search tool</span></span>
             <input type="text" id="def_search" placeholder="https://searx.example.com"></label>
-          <div class="fld"><span class="lab">thinking-capable models <span class="sub">show a per-chat thinking toggle for these</span></span>
-            <div class="hintbox" style="margin-top:6px;">Only enable for models whose chat template supports it (e.g. Qwen3, DeepSeek-R1). Sends <code>enable_thinking</code> to the endpoint.</div>
+          <div class="fld"><span class="lab">thinking-capable models <span class="sub">force the per-chat thinking control on for these</span></span>
+            <div class="hintbox" style="margin-top:6px;">Thinking-capable models are detected from the endpoint automatically (family + reported thinking default), and models with graded efforts offer their levels. Check a model here only to force the control on when detection misses it.</div>
             <div class="model-pick" id="tm_pick"></div>
           </div>
           <div class="fld"><span class="lab">vision-capable models <span class="sub">image attachments are sent as pixels to these; others get a text note</span></span>
@@ -6290,12 +6369,16 @@ async function openDrawer(){
     // leaves the current prompt intact (no cancel button now, so don't wipe it out from under them).
     if(c){$("#d_system").value=c.system||"";patch.system=c.system||"";if(c.model){rebuildModelSelect($("#d_model"),Array.from($("#d_model").options).map(o=>o.value),c.model);patch.model=c.model;}}
     buildPresetSelect();applyDrawer(patch,{rerender:true,relist:true});};
-  $("#d_model").onchange=()=>{buildPresetSelect();syncThinkRow();applyDrawer({model:$("#d_model").value},{relist:true});};
+  $("#d_model").onchange=async()=>{buildPresetSelect();
+    const m=$("#d_model").value,patch={model:m},vals=thinkOptions(m);
+    // 'on', or an effort level, means nothing on a model that has no such setting — drop it
+    if(current&&current.think!==null&&current.think!==undefined&&!(vals||[]).includes(String(current.think)))patch.think=null;
+    await applyDrawer(patch,{relist:true});syncThinkRow();};
   $("#d_system").value=current.system||"";
   $("#d_system").oninput=applySystem;
   $("#d_tools").checked=!!current.tools;
   $("#d_tools").onchange=()=>applyDrawer({tools:$("#d_tools").checked});
-  $("#d_think").onchange=()=>{const v=$("#d_think").value;applyDrawer({think:v===""?null:(v==="1"?1:0)});};
+  $("#d_think").onchange=()=>{const v=$("#d_think").value;applyDrawer({think:v===""?null:v});};
   syncThinkRow();
   // rolling context summary: only shown once compression has produced one for this chat
   const sw=$("#d_summary_wrap");
@@ -6308,12 +6391,21 @@ async function openDrawer(){
   buildPresetSelect();
   showOverlay($("#drawer"));
 }
+// The chat's thinking options come from the endpoint itself: models whose template takes a graded
+// reasoning effort get their levels, the rest a plain on/off, and models with no thinking control
+// get no row at all.
+function thinkOptions(model){const s=(CFG.thinking_specs||{})[model];if(!s)return null;
+  return s.mode==="levels"?(s.levels||[]).concat(["0"]):["1","0"];}
+function thinkLabel(v){return v==="1"?"on":v==="0"?"off":v;}
 function syncThinkRow(){
-  // only show the thinking control for models an admin has marked thinking-capable site-wide
   const model=($("#d_model").value)||(current&&current.model)||"";
-  const ok=(CFG.thinking_models||[]).includes(model);
-  $("#d_think_wrap").style.display=ok?"":"none";
-  if(ok)$("#d_think").value=(current&&current.think===1)?"1":(current&&current.think===0)?"0":"";   // tri-state
+  const vals=thinkOptions(model);
+  $("#d_think_wrap").style.display=vals?"":"none";
+  if(!vals)return;
+  $("#d_think").innerHTML='<option value="">model default</option>'
+    +vals.map(v=>'<option value="'+esc(v)+'">'+esc(thinkLabel(v))+'</option>').join("");
+  const cur=(current&&current.think!==null&&current.think!==undefined)?String(current.think):"";
+  $("#d_think").value=vals.includes(cur)?cur:"";   // a setting the new model has no option for -> model default
 }
 async function refreshDrawerModels(endpointId,value){
   let models=CFG.models;

@@ -30,7 +30,8 @@ Cloudflare tunnel) and share it with a few friends without exposing it to the wo
   attachments automatically), and optionally let the model `fetch_url` public pages
   (SSRF-guarded). **Sampler presets**, per-chat **prompt macros** (`{{user}}`, `{{date}}`,
   `{{roll:2d6}}`…), a context-window meter with sliding-window rollover, and a per-chat
-  thinking toggle for reasoning models.
+  thinking control for reasoning models (auto-detected per model - on/off, or the model's
+  own reasoning-effort levels).
 - **Thumbs up/down ratings** stored in the data and included in exports (handy for RLHF datasets).
 - **Export** a single chat (markdown, or full-tree JSON with branches/ratings/reasoning)
   or every chat you own (JSON). **Automated SQLite backups** with rotation.
